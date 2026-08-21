@@ -1,0 +1,10 @@
+# dsh-cost-meter bundle patch. The settings row owns the editable namespace;
+# the service row owns the Typert Remote API consumed by the browser dock.
+# The browser half is discovered through the package.json dsh.client manifest.
+- insert:
+    - id: cost-meter-settings
+      name: dsh-cost-meter/settings
+      config: {}
+    - id: cost-meter
+      name: dsh-cost-meter
+      config: {}
