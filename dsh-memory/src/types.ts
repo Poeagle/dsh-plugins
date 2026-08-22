@@ -1,0 +1,60 @@
+/**
+ * Shared vocabulary of the bounded curated memory stores. Field names mirror
+ * the model-visible JSON exactly, so tool-result text references like
+ * `current_entries below` match the keys the model actually sees.
+ * @module dsh-memory/types
+ */
+
+/** Which bounded store an entry lives in. */
+export type MemoryTarget = 'memory' | 'user'
+
+/** One mutating operation accepted by the `memory` tool. */
+export type MemoryAction = 'add' | 'replace' | 'remove'
+
+/**
+ * One item of the batch wire shape: `add` needs `content`, `replace` needs
+ * both `old_text` and `content`, `remove` needs `old_text`. `action` is an
+ * open string at this boundary — the tool schema pins the enum for model
+ * calls, but the store also serves direct programmatic callers and must
+ * reject unknown actions itself.
+ */
+export interface MemoryOperation {
+  /** The operation kind; anything outside add/replace/remove is rejected. */
+  readonly action?: string
+  /** Entry content for `add` and `replace`. */
+  readonly content?: string
+  /** Unique substring identifying the entry for `replace` and `remove`. */
+  readonly old_text?: string
+}
+
+/**
+ * The result dict every store mutation returns; tool responses are its JSON
+ * serialization. `current_entries` and `matches` only ride the error paths
+ * that need them for self-correction.
+ */
+export interface MemoryToolResult {
+  /** Whether the mutation landed. */
+  success: boolean
+  /** Terminal marker: do not re-issue this update. */
+  done?: boolean
+  /** The store acted on. */
+  target?: MemoryTarget
+  /** Human-readable capacity, e.g. `42% — 924/2,200 chars`. */
+  usage?: string
+  /** Entry count after the mutation. */
+  entry_count?: number
+  /** Outcome description on success paths. */
+  message?: string
+  /** Stop instruction appended to every success response. */
+  note?: string
+  /** Failure description on error paths. */
+  error?: string
+  /** Live entries shown on consolidation errors so the model can self-correct. */
+  current_entries?: readonly string[]
+  /** 80-char previews of ambiguous matches. */
+  matches?: readonly string[]
+  /** Absolute backup path when external drift was detected. */
+  drift_backup?: string
+  /** Operator instruction paired with a drift backup. */
+  remediation?: string
+}
