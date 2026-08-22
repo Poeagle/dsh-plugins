@@ -485,7 +485,7 @@ function CostDock(props: { sessionId: string; costMeter: CostMeterFace; interval
             React.createElement('tbody', null,
               ...state.hourly.map((row) => {
                 const sourceLabel = row.periodName ?? (row.pricingSource === 'model-period' ? '模型时段价' : row.pricingSource === 'model' ? '模型基准价' : row.pricingSource === 'default-period' ? '默认时段价' : row.pricingSource === 'default' ? '默认价格' : '-')
-                return React.createElement('tr', { key: row.hour, style: { borderBottom: '1px solid var(--dsw-alias-border-l2, #eee)' } },
+                return React.createElement('tr', { key: `${row.hour}|${row.provider ?? ''}|${row.model ?? ''}|${row.pricingSource ?? ''}|${row.periodName ?? ''}`, style: { borderBottom: '1px solid var(--dsw-alias-border-l2, #eee)' } },
                   React.createElement('td', { style: cellLeft }, row.hourLabel),
                   React.createElement('td', { style: cellBase }, row.inputTokens.toLocaleString('zh-CN')),
                   React.createElement('td', { style: cellBase }, `${symbol}${money(row.inputCost)}`),

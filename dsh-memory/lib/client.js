@@ -36,6 +36,14 @@ window.__ModuleLoader__.load({
 			if (bytes < 1048576) return `${(bytes / 1024).toFixed(1)} KB`;
 			return `${(bytes / 1048576).toFixed(1)} MB`;
 		};
+		const formatTime = (iso) => {
+			if (!iso) return "—";
+			try {
+				return new Date(iso).toLocaleString("zh-CN", { hour12: false });
+			} catch {
+				return iso;
+			}
+		};
 		const fetchStatus = async () => {
 			try {
 				const body = await (await fetch(`${MEMORY_ROUTE}/status`)).json();
@@ -49,6 +57,38 @@ window.__ModuleLoader__.load({
 				return await (await fetch(`${MEMORY_ROUTE}/entries?target=${target}`)).json();
 			} catch {
 				return null;
+			}
+		};
+		const fetchConfig = async () => {
+			try {
+				return await (await fetch(`${MEMORY_ROUTE}/config`)).json();
+			} catch {
+				return null;
+			}
+		};
+		const saveConfig = async (patch) => {
+			try {
+				return (await (await fetch(`${MEMORY_ROUTE}/config`, {
+					method: "POST",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify(patch)
+				})).json()).ok;
+			} catch {
+				return false;
+			}
+		};
+		const deleteEntries = async (target, indices) => {
+			try {
+				return (await (await fetch(`${MEMORY_ROUTE}/delete-entries`, {
+					method: "POST",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({
+						target,
+						indices
+					})
+				})).json()).ok;
+			} catch {
+				return false;
 			}
 		};
 		const resetMemory = async (target) => {
@@ -76,6 +116,11 @@ window.__ModuleLoader__.load({
 			...buttonStyle,
 			color: "var(--dsw-alias-label-error)",
 			borderColor: "var(--dsw-alias-label-error)"
+		};
+		const smallButtonStyle = {
+			...buttonStyle,
+			padding: "2px 6px",
+			fontSize: 11
 		};
 		function parseMemoryArgs(argsRaw) {
 			try {
@@ -108,9 +153,20 @@ window.__ModuleLoader__.load({
 			if (args.action === "remove") return `${target} · 删除`;
 			return `${target}`;
 		}
+		function parseMemoryResultFromContent(content) {
+			if (!Array.isArray(content)) return null;
+			const textBlock = content.find((b) => b?.type === "text");
+			if (!textBlock?.text) return null;
+			try {
+				return JSON.parse(textBlock.text);
+			} catch {
+				return null;
+			}
+		}
 		function MemoryRow(props) {
-			const argsRaw = ("kind" in props.block ? props.block.call?.argsRaw : props.block.argsRaw) ?? "";
-			const result = "kind" in props.block && props.block.kind === "settled" ? props.block.result : null;
+			const isSettled = props.block.kind === "tool-result";
+			const argsRaw = isSettled ? props.block.call?.argsRaw ?? "" : props.block.argsRaw ?? "";
+			const result = isSettled ? parseMemoryResultFromContent(props.block.content) : null;
 			const summary = summarizeMemoryCall(argsRaw, result);
 			const [expanded, setExpanded] = react.default.useState(false);
 			const state = result?.success === true ? "ok" : result?.success === false ? "error" : "running";
@@ -230,30 +286,19 @@ window.__ModuleLoader__.load({
 		}
 		function MemorySettingsCard(_props) {
 			const [status, setStatus] = react.default.useState(null);
-			const [entries, setEntries] = react.default.useState({
-				memory: [],
-				user: []
-			});
 			const [open, setOpen] = react.default.useState(false);
-			const [tab, setTab] = react.default.useState("memory");
 			const [resetting, setResetting] = react.default.useState(null);
 			const [toast, setToast] = react.default.useState(null);
-			const [loading, setLoading] = react.default.useState(true);
+			const [nudgeInterval, setNudgeInterval] = react.default.useState(10);
+			const [reviewEnabled, setReviewEnabled] = react.default.useState(true);
+			const [configLoading, setConfigLoading] = react.default.useState(false);
 			const loadAll = react.default.useCallback(async () => {
-				setLoading(true);
-				const [s, memEntries, userEntries] = await Promise.all([
-					fetchStatus(),
-					fetchEntries("memory"),
-					fetchEntries("user")
-				]);
+				const [s, cfg] = await Promise.all([fetchStatus(), fetchConfig()]);
 				if (s) setStatus(s);
-				const memVal = memEntries?.ok === true && memEntries.value?.entries ? memEntries.value.entries : [];
-				const userVal = userEntries?.ok === true && userEntries.value?.entries ? userEntries.value.entries : [];
-				setEntries({
-					memory: memVal,
-					user: userVal
-				});
-				setLoading(false);
+				if (cfg?.ok && cfg.value) {
+					setNudgeInterval(cfg.value.nudgeInterval);
+					setReviewEnabled(cfg.value.reviewEnabled);
+				}
 			}, []);
 			react.default.useEffect(() => {
 				loadAll();
@@ -273,14 +318,20 @@ window.__ModuleLoader__.load({
 					await loadAll();
 				} else setToast("重置失败");
 			};
-			const currentEntries = entries[tab];
-			const cellStyle = {
-				padding: "8px 12px",
-				fontSize: 12,
-				borderBottom: "1px solid var(--dsw-alias-border-l2)",
-				color: "var(--dsw-alias-label-primary)",
-				lineHeight: "1.5",
-				wordBreak: "break-word"
+			const handleSaveConfig = async () => {
+				setConfigLoading(true);
+				const ok = await saveConfig({
+					nudgeInterval,
+					reviewEnabled
+				});
+				setConfigLoading(false);
+				setToast(ok ? "配置已保存" : "保存配置失败");
+			};
+			const sectionCardStyle = {
+				border: "1px solid var(--dsw-alias-border-l2)",
+				borderRadius: 8,
+				background: "var(--dsw-alias-bg-layer-2)",
+				padding: 16
 			};
 			return react.default.createElement("li", { style: {
 				listStyle: "none",
@@ -335,42 +386,307 @@ window.__ModuleLoader__.load({
 				display: "grid",
 				gridTemplateColumns: "1fr 1fr",
 				gap: 12
-			} }, react.default.createElement("div", { style: {
-				padding: 10,
-				borderRadius: 6,
-				border: "1px solid var(--dsw-alias-border-l2)",
-				display: "flex",
-				flexDirection: "column",
-				gap: 4
-			} }, react.default.createElement("div", { style: {
+			} }, react.default.createElement("div", { style: sectionCardStyle }, react.default.createElement("div", { style: {
 				fontSize: 11,
-				color: "var(--dsw-alias-label-tertiary)"
+				color: "var(--dsw-alias-label-tertiary)",
+				marginBottom: 4
 			} }, "MEMORY.md"), react.default.createElement("div", { style: {
-				fontSize: 14,
+				fontSize: 18,
 				fontWeight: 600
 			} }, status ? formatBytes(status.memory.size) : "-"), react.default.createElement("div", { style: {
+				fontSize: 12,
+				color: "var(--dsw-alias-label-secondary)",
+				marginTop: 4
+			} }, status ? `${status.memory.entries} 条 · ${status.memory.usage}` : "")), react.default.createElement("div", { style: sectionCardStyle }, react.default.createElement("div", { style: {
 				fontSize: 11,
-				color: "var(--dsw-alias-label-tertiary)"
-			} }, status ? `${status.memory.entries} 条 · ${status.memory.usage}` : "")), react.default.createElement("div", { style: {
-				padding: 10,
-				borderRadius: 6,
-				border: "1px solid var(--dsw-alias-border-l2)",
-				display: "flex",
-				flexDirection: "column",
-				gap: 4
-			} }, react.default.createElement("div", { style: {
-				fontSize: 11,
-				color: "var(--dsw-alias-label-tertiary)"
+				color: "var(--dsw-alias-label-tertiary)",
+				marginBottom: 4
 			} }, "USER.md"), react.default.createElement("div", { style: {
-				fontSize: 14,
+				fontSize: 18,
 				fontWeight: 600
 			} }, status ? formatBytes(status.user.size) : "-"), react.default.createElement("div", { style: {
+				fontSize: 12,
+				color: "var(--dsw-alias-label-secondary)",
+				marginTop: 4
+			} }, status ? `${status.user.entries} 条 · ${status.user.usage}` : ""))), react.default.createElement("div", { style: sectionCardStyle }, react.default.createElement("div", { style: {
+				fontSize: 14,
+				fontWeight: 600,
+				marginBottom: 12
+			} }, "⚙️ 自动复盘设置"), react.default.createElement("div", { style: {
+				display: "flex",
+				flexDirection: "column",
+				gap: 12
+			} }, react.default.createElement("label", { style: {
+				display: "flex",
+				alignItems: "center",
+				gap: 8,
+				fontSize: 13,
+				cursor: "pointer"
+			} }, react.default.createElement("input", {
+				type: "checkbox",
+				checked: reviewEnabled,
+				onChange: (e) => setReviewEnabled(e.target.checked),
+				style: {
+					width: 16,
+					height: 16,
+					cursor: "pointer"
+				}
+			}), "启用自动复盘", react.default.createElement("span", { style: {
 				fontSize: 11,
-				color: "var(--dsw-alias-label-tertiary)"
-			} }, status ? `${status.user.entries} 条 · ${status.user.usage}` : ""))), react.default.createElement("div", { style: {
+				color: "var(--dsw-alias-label-tertiary)",
+				marginLeft: 4
+			} }, "（对话结束后由 AI 自动判断是否写入记忆）")), react.default.createElement("div", { style: {
+				display: "flex",
+				alignItems: "center",
+				gap: 8
+			} }, react.default.createElement("label", { style: {
+				fontSize: 13,
+				color: "var(--dsw-alias-label-secondary)",
+				whiteSpace: "nowrap"
+			} }, "每"), react.default.createElement("input", {
+				type: "number",
+				min: 1,
+				max: 100,
+				value: nudgeInterval,
+				disabled: !reviewEnabled,
+				onChange: (e) => setNudgeInterval(Math.max(1, parseInt(e.target.value) || 1)),
+				style: {
+					width: 60,
+					padding: "4px 8px",
+					border: "1px solid var(--dsw-alias-border-l2)",
+					borderRadius: 6,
+					background: "transparent",
+					color: "inherit",
+					fontSize: 13,
+					font: "inherit",
+					textAlign: "center"
+				}
+			}), react.default.createElement("span", { style: {
+				fontSize: 13,
+				color: "var(--dsw-alias-label-secondary)"
+			} }, "轮用户消息后自动复盘")), react.default.createElement("div", { style: {
+				display: "flex",
+				justifyContent: "flex-end",
+				marginTop: 4
+			} }, react.default.createElement("button", {
+				type: "button",
+				onClick: handleSaveConfig,
+				disabled: configLoading,
+				style: {
+					border: "none",
+					borderRadius: 6,
+					padding: "7px 16px",
+					background: "var(--dsw-alias-color-primary, #0066ff)",
+					color: "#fff",
+					fontSize: 13,
+					cursor: "pointer",
+					font: "inherit",
+					fontWeight: 500,
+					opacity: configLoading ? .6 : 1
+				}
+			}, configLoading ? "保存中…" : "保存配置")))), react.default.createElement("div", { style: {
+				...sectionCardStyle,
+				border: "1px solid var(--dsw-alias-color-error, #ef4444)"
+			} }, react.default.createElement("div", { style: {
+				fontSize: 14,
+				fontWeight: 600,
+				marginBottom: 12,
+				color: "var(--dsw-alias-label-error)"
+			} }, "⚠️ 危险操作"), react.default.createElement("div", { style: {
+				display: "flex",
+				gap: 8,
+				flexWrap: "wrap"
+			} }, react.default.createElement("button", {
+				type: "button",
+				style: {
+					...dangerButtonStyle,
+					padding: "7px 14px",
+					fontSize: 13
+				},
+				disabled: resetting !== null,
+				onClick: () => handleReset("memory")
+			}, resetting === "memory" ? "重置中…" : "重置 MEMORY.md"), react.default.createElement("button", {
+				type: "button",
+				style: {
+					...dangerButtonStyle,
+					padding: "7px 14px",
+					fontSize: 13
+				},
+				disabled: resetting !== null,
+				onClick: () => handleReset("user")
+			}, resetting === "user" ? "重置中…" : "重置 USER.md"), react.default.createElement("button", {
+				type: "button",
+				style: {
+					...dangerButtonStyle,
+					padding: "7px 14px",
+					fontSize: 13,
+					fontWeight: 600
+				},
+				disabled: resetting !== null,
+				onClick: () => handleReset("all")
+			}, resetting === "all" ? "重置中…" : "重置全部")))) : null);
+		}
+		function MemoryDock(_props) {
+			const [status, setStatus] = react.default.useState(null);
+			const [modalOpen, setModalOpen] = react.default.useState(false);
+			const [entries, setEntries] = react.default.useState({
+				memory: [],
+				user: []
+			});
+			const [tab, setTab] = react.default.useState("memory");
+			const [selected, setSelected] = react.default.useState(/* @__PURE__ */ new Set());
+			const [loading, setLoading] = react.default.useState(false);
+			const [toast, setToast] = react.default.useState(null);
+			react.default.useEffect(() => {
+				fetchStatus().then(setStatus);
+				const interval = setInterval(() => {
+					fetchStatus().then(setStatus);
+				}, 1e4);
+				return () => clearInterval(interval);
+			}, []);
+			react.default.useEffect(() => {
+				if (toast) {
+					const timer = setTimeout(() => setToast(null), 2e3);
+					return () => clearTimeout(timer);
+				}
+			}, [toast]);
+			react.default.useEffect(() => {
+				setSelected(/* @__PURE__ */ new Set());
+			}, [tab]);
+			const openModal = async () => {
+				setModalOpen(true);
+				setLoading(true);
+				const [memEntries, userEntries] = await Promise.all([fetchEntries("memory"), fetchEntries("user")]);
+				const memVal = memEntries?.ok === true && memEntries.value?.entries ? memEntries.value.entries : [];
+				const userVal = userEntries?.ok === true && userEntries.value?.entries ? userEntries.value.entries : [];
+				setEntries({
+					memory: memVal,
+					user: userVal
+				});
+				setLoading(false);
+			};
+			const closeModal = () => {
+				setModalOpen(false);
+				setSelected(/* @__PURE__ */ new Set());
+			};
+			const reloadEntries = async () => {
+				const [memEntries, userEntries] = await Promise.all([fetchEntries("memory"), fetchEntries("user")]);
+				const memVal = memEntries?.ok === true && memEntries.value?.entries ? memEntries.value.entries : [];
+				const userVal = userEntries?.ok === true && userEntries.value?.entries ? userEntries.value.entries : [];
+				setEntries({
+					memory: memVal,
+					user: userVal
+				});
+				const s = await fetchStatus();
+				if (s) setStatus(s);
+			};
+			const handleDeleteSelected = async () => {
+				const indices = [...selected].sort((a, b) => b - a);
+				if (indices.length === 0) return;
+				if (await deleteEntries(tab, indices)) {
+					setToast(`已删除 ${indices.length} 条`);
+					setSelected(/* @__PURE__ */ new Set());
+					await reloadEntries();
+				} else setToast("删除失败");
+			};
+			const handleDeleteSingle = async (index) => {
+				if (await deleteEntries(tab, [index])) {
+					setToast("已删除");
+					await reloadEntries();
+				} else setToast("删除失败");
+			};
+			const toggleSelected = (index) => {
+				setSelected((prev) => {
+					const next = new Set(prev);
+					if (next.has(index)) next.delete(index);
+					else next.add(index);
+					return next;
+				});
+			};
+			const currentEntries = entries[tab];
+			const cellStyle = {
+				padding: "6px 8px",
+				fontSize: 12,
+				borderBottom: "1px solid var(--dsw-alias-border-l2)",
+				color: "var(--dsw-alias-label-primary)",
+				lineHeight: "1.5",
+				wordBreak: "break-word",
+				verticalAlign: "top"
+			};
+			if (!status) return null;
+			return react.default.createElement(react.default.Fragment, null, react.default.createElement("div", {
+				style: {
+					textAlign: "center",
+					color: "var(--dsw-alias-label-tertiary)",
+					fontSize: 12,
+					lineHeight: "20px",
+					padding: "2px 16px 0",
+					cursor: "pointer"
+				},
+				onClick: openModal,
+				title: "点击查看记忆详情"
+			}, `📝 MEMORY: ${status.memory.entries} 条 · USER: ${status.user.entries} 条`), modalOpen ? react.default.createElement("div", {
+				key: "memory-modal-overlay",
+				style: {
+					position: "fixed",
+					top: 0,
+					left: 0,
+					right: 0,
+					bottom: 0,
+					background: "rgba(0,0,0,0.5)",
+					display: "flex",
+					alignItems: "center",
+					justifyContent: "center",
+					zIndex: 9999
+				},
+				onClick: (e) => {
+					if (e.target === e.currentTarget) closeModal();
+				}
+			}, react.default.createElement("div", {
+				style: {
+					background: "var(--dsw-alias-bg-layer-1, #fff)",
+					borderRadius: 12,
+					width: "80vw",
+					maxWidth: 800,
+					maxHeight: "80vh",
+					display: "flex",
+					flexDirection: "column",
+					boxShadow: "0 8px 32px rgba(0,0,0,0.2)"
+				},
+				onClick: (e) => e.stopPropagation()
+			}, react.default.createElement("div", { style: {
+				display: "flex",
+				alignItems: "center",
+				justifyContent: "space-between",
+				padding: "14px 16px",
+				borderBottom: "1px solid var(--dsw-alias-border-l2)"
+			} }, react.default.createElement("strong", { style: {
+				fontSize: 15,
+				fontWeight: 600
+			} }, "持久记忆"), react.default.createElement("button", {
+				type: "button",
+				onClick: closeModal,
+				style: {
+					border: 0,
+					background: "transparent",
+					color: "inherit",
+					fontSize: 18,
+					cursor: "pointer",
+					padding: "0 4px"
+				}
+			}, "✕")), toast ? react.default.createElement("div", { style: {
+				margin: "8px 16px 0",
+				padding: "6px 12px",
+				borderRadius: 6,
+				background: "var(--dsw-alias-color-success, #22c55e)",
+				color: "#fff",
+				fontSize: 12,
+				textAlign: "center"
+			} }, toast) : null, react.default.createElement("div", { style: {
 				display: "flex",
 				gap: 0,
-				borderBottom: "1px solid var(--dsw-alias-border-l2)"
+				borderBottom: "1px solid var(--dsw-alias-border-l2)",
+				padding: "0 16px"
 			} }, react.default.createElement("button", {
 				type: "button",
 				onClick: () => setTab("memory"),
@@ -385,7 +701,7 @@ window.__ModuleLoader__.load({
 					borderBottom: tab === "memory" ? "2px solid var(--dsw-alias-label-primary)" : "2px solid transparent",
 					fontWeight: tab === "memory" ? 600 : 400
 				}
-			}, "MEMORY.md"), react.default.createElement("button", {
+			}, `MEMORY.md (${entries.memory.length} 条)`), react.default.createElement("button", {
 				type: "button",
 				onClick: () => setTab("user"),
 				style: {
@@ -399,7 +715,26 @@ window.__ModuleLoader__.load({
 					borderBottom: tab === "user" ? "2px solid var(--dsw-alias-label-primary)" : "2px solid transparent",
 					fontWeight: tab === "user" ? 600 : 400
 				}
-			}, "USER.md")), loading ? react.default.createElement("div", { style: {
+			}, `USER.md (${entries.user.length} 条)`)), selected.size > 0 ? react.default.createElement("div", { style: {
+				display: "flex",
+				alignItems: "center",
+				gap: 8,
+				fontSize: 12,
+				padding: "8px 16px",
+				background: "var(--dsw-alias-bg-layer-2)"
+			} }, react.default.createElement("span", { style: { color: "var(--dsw-alias-label-secondary)" } }, `已选 ${selected.size} 条`), react.default.createElement("button", {
+				type: "button",
+				onClick: handleDeleteSelected,
+				style: dangerButtonStyle
+			}, "删除选中"), react.default.createElement("button", {
+				type: "button",
+				onClick: () => setSelected(/* @__PURE__ */ new Set()),
+				style: buttonStyle
+			}, "取消选择")) : null, react.default.createElement("div", { style: {
+				flex: 1,
+				overflow: "auto",
+				padding: "0 16px 16px"
+			} }, loading ? react.default.createElement("div", { style: {
 				fontSize: 12,
 				color: "var(--dsw-alias-label-tertiary)",
 				padding: 8
@@ -407,61 +742,60 @@ window.__ModuleLoader__.load({
 				fontSize: 12,
 				color: "var(--dsw-alias-label-tertiary)",
 				padding: 8
-			} }, "（空）") : react.default.createElement("div", { style: {
-				maxHeight: 300,
-				overflow: "auto",
-				border: "1px solid var(--dsw-alias-border-l2)",
-				borderRadius: 6
-			} }, currentEntries.map((entry, i) => react.default.createElement("div", {
+			} }, "（空）") : react.default.createElement("table", { style: {
+				width: "100%",
+				borderCollapse: "collapse",
+				tableLayout: "fixed",
+				marginTop: 8
+			} }, react.default.createElement("thead", { style: {
+				position: "sticky",
+				top: 0,
+				background: "var(--dsw-alias-bg-layer-1, #fff)",
+				zIndex: 1
+			} }, react.default.createElement("tr", null, react.default.createElement("th", { style: {
+				...cellStyle,
+				width: 32,
+				textAlign: "center",
+				fontWeight: 600
+			} }, ""), react.default.createElement("th", { style: {
+				...cellStyle,
+				fontWeight: 600,
+				width: 160
+			} }, "时间"), react.default.createElement("th", { style: {
+				...cellStyle,
+				fontWeight: 600
+			} }, "内容"), react.default.createElement("th", { style: {
+				...cellStyle,
+				width: 60,
+				textAlign: "center",
+				fontWeight: 600
+			} }, "操作"))), react.default.createElement("tbody", null, currentEntries.map((entry, i) => react.default.createElement("tr", {
 				key: i,
-				style: cellStyle
-			}, react.default.createElement("div", { style: {
+				style: { background: selected.has(i) ? "var(--dsw-alias-bg-layer-2, rgba(0,0,0,0.05))" : void 0 }
+			}, react.default.createElement("td", { style: {
+				...cellStyle,
+				textAlign: "center"
+			} }, react.default.createElement("input", {
+				type: "checkbox",
+				checked: selected.has(i),
+				onChange: () => toggleSelected(i)
+			})), react.default.createElement("td", { style: {
+				...cellStyle,
 				fontSize: 11,
-				color: "var(--dsw-alias-label-tertiary)",
-				marginBottom: 2
-			} }, `#${i + 1}`), entry))), react.default.createElement("div", { style: {
-				display: "flex",
-				gap: 8,
-				justifyContent: "flex-end",
-				borderTop: "1px solid var(--dsw-alias-border-l2)",
-				paddingTop: 12
+				color: "var(--dsw-alias-label-tertiary)"
+			} }, formatTime(entry.timestamp)), react.default.createElement("td", { style: cellStyle }, entry.content), react.default.createElement("td", { style: {
+				...cellStyle,
+				textAlign: "center"
 			} }, react.default.createElement("button", {
 				type: "button",
-				style: dangerButtonStyle,
-				disabled: resetting !== null,
-				onClick: () => handleReset("memory")
-			}, resetting === "memory" ? "重置中…" : "重置 MEMORY.md"), react.default.createElement("button", {
-				type: "button",
-				style: dangerButtonStyle,
-				disabled: resetting !== null,
-				onClick: () => handleReset("user")
-			}, resetting === "user" ? "重置中…" : "重置 USER.md"), react.default.createElement("button", {
-				type: "button",
+				onClick: () => handleDeleteSingle(i),
 				style: {
-					...dangerButtonStyle,
-					fontWeight: 600
+					...smallButtonStyle,
+					color: "var(--dsw-alias-label-error)",
+					borderColor: "var(--dsw-alias-label-error)"
 				},
-				disabled: resetting !== null,
-				onClick: () => handleReset("all")
-			}, resetting === "all" ? "重置中…" : "重置全部"))) : null);
-		}
-		function MemoryDock(_props) {
-			const [status, setStatus] = react.default.useState(null);
-			react.default.useEffect(() => {
-				fetchStatus().then(setStatus);
-				const interval = setInterval(() => {
-					fetchStatus().then(setStatus);
-				}, 1e4);
-				return () => clearInterval(interval);
-			}, []);
-			if (!status) return null;
-			return react.default.createElement("div", { style: {
-				textAlign: "center",
-				color: "var(--dsw-alias-label-tertiary)",
-				fontSize: 12,
-				lineHeight: "20px",
-				padding: "2px 16px 0"
-			} }, react.default.createElement("span", null, `📝 ${status.memory.entries + status.user.entries} 条记忆 · ${status.memory.usage}`));
+				title: "删除此条"
+			}, "删除"))))))))) : null);
 		}
 		async function apply(ctx) {
 			const slots = ctx.get("slots");

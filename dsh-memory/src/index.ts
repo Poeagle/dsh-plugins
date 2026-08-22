@@ -125,6 +125,25 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   })
   await store.loadFromDisk()
 
+  /**
+   * Resolve the effective nudge/review settings from the optional settings
+   * service, falling back to the composition config when the service is
+   * unavailable or the namespace is not registered.
+   */
+  function effectiveSettings(): { nudgeInterval: number; reviewEnabled: boolean } {
+    const settings = ctx.get('settings') as { get?(ns: string): unknown } | undefined
+    if (settings?.get) {
+      const raw = settings.get('memory') as Record<string, unknown> | undefined
+      if (raw !== undefined) {
+        return {
+          nudgeInterval: typeof raw.nudgeInterval === 'number' ? raw.nudgeInterval : config.nudgeInterval,
+          reviewEnabled: typeof raw.reviewEnabled === 'boolean' ? raw.reviewEnabled : config.reviewEnabled,
+        }
+      }
+    }
+    return { nudgeInterval: config.nudgeInterval, reviewEnabled: config.reviewEnabled }
+  }
+
   ctx.tools.register(defineTool({
     name: 'memory',
     description: MEMORY_TOOL_DESCRIPTION,
@@ -152,6 +171,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
 
   /** Sessions that have already received the memory context injection. */
   const injected = new Set<SessionId>()
+  /**
+   * Per-session lock to prevent concurrent injection from multiple agents
+   * sharing the same session (main agent + subagent in same conversation).
+   */
+  const injectionLocks = new Map<SessionId, Promise<void>>()
 
   ctx.on('agent/pre-step', async (
     { agent, messages, signal: _signal },
@@ -162,19 +186,51 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     if (text === '') return decision
     if (decision.kind !== 'enter') return decision
 
-    // Only inject once per session lifetime.
-    if (injected.has(agent.id)) return decision
-    injected.add(agent.id)
+    const sid = agent.session.id
 
-    const contextMessage = createUserMessage({
-      content: [{ type: 'text', text }],
-      source: { kind: 'plugin', plugin: name },
-    })
-    // Prepend the memory context at the same position as other context
-    // injections (after the user's claimed batch).
-    const lastClaimedIndex = (decision.messages as any[]).findLastIndex(m => messages.includes(m as any))
-    const entered = (decision.messages as any[]).toSpliced(lastClaimedIndex + 1, 0, contextMessage)
-    return { kind: 'enter', messages: entered }
+    // Atomically acquire a per-session lock. Two agents (main + subagent)
+    // may fire pre-step concurrently for the same session; only one may
+    // proceed to inject, the other waits and then skips.
+    let release: () => void
+    const existing = injectionLocks.get(sid)
+    if (existing !== undefined) {
+      // Another agent is already handling this session; wait for it.
+      await existing
+      // The log now has the injection; skip this one.
+      return decision
+    }
+    const lock = new Promise<void>(resolve => { release = resolve })
+    injectionLocks.set(sid, lock)
+
+    try {
+      // Fast path: already injected in an earlier turn.
+      if (injected.has(sid)) return decision
+
+      // After a restart the in-memory Set is empty, so check the session log.
+      const alreadyInLog = agent.session.events.some(e => {
+        if (e.type !== 'user/message') return false
+        const msg = e.data as { source?: { kind?: string; plugin?: string } }
+        return msg.source?.kind === 'plugin' && msg.source?.plugin === name
+      })
+      if (alreadyInLog) {
+        injected.add(sid)
+        return decision
+      }
+
+      injected.add(sid)
+      const contextMessage = createUserMessage({
+        content: [{ type: 'text', text }],
+        source: { kind: 'plugin', plugin: name },
+      })
+      // Prepend the memory context at the same position as other context
+      // injections (after the user's claimed batch).
+      const lastClaimedIndex = (decision.messages as any[]).findLastIndex(m => messages.includes(m as any))
+      const entered = (decision.messages as any[]).toSpliced(lastClaimedIndex + 1, 0, contextMessage)
+      return { kind: 'enter', messages: entered }
+    } finally {
+      release!()
+      injectionLocks.delete(sid)
+    }
   })
 
   /** Per-session nudge state, keyed by session id. */
@@ -217,9 +273,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         state.turnsSinceMemory = prior % config.nudgeInterval
       }
     }
-    if (config.nudgeInterval > 0 && config.reviewEnabled) {
+    const { nudgeInterval, reviewEnabled } = effectiveSettings()
+    if (nudgeInterval > 0 && reviewEnabled) {
       state.turnsSinceMemory += 1
-      if (state.turnsSinceMemory >= config.nudgeInterval) {
+      if (state.turnsSinceMemory >= nudgeInterval) {
         state.turnsSinceMemory = 0
         state.reviewPending = true
       }
@@ -259,5 +316,6 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     reviewing.delete(session.id)
     states.delete(session.id)
     injected.delete(session.id)
+    injectionLocks.delete(session.id)
   })
 }

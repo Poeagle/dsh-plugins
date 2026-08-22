@@ -1,4 +1,4 @@
-import { t as MemoryStore } from "./store-CW83JWIg.js";
+import { t as MemoryStore } from "./store-BcMNE9sl.js";
 import z from "@deepseek-ai/schemastery";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -40,7 +40,10 @@ const inject = ["settings"];
 /** Register the settings namespace and memory HTTP route for browser settings management. */
 function apply(ctx) {
 	const settings = ctx.get("settings");
-	if (settings !== void 0) settings.register(SETTINGS_NS, z.object({}), {
+	if (settings !== void 0) settings.register(SETTINGS_NS, z.object({
+		nudgeInterval: z.number().step(1).min(0).default(10),
+		reviewEnabled: z.boolean().default(true)
+	}), {
 		base: {},
 		validate: () => {}
 	});
@@ -98,13 +101,84 @@ function apply(ctx) {
 				if (method === "GET" && url.pathname === "/memory/api/entries") {
 					const target = url.searchParams.get("target") === "user" ? "user" : "memory";
 					await store.loadFromDisk();
+					const entries = store.entriesWithMeta(target);
 					send(res, 200, {
 						ok: true,
 						value: {
 							target,
-							entries: store.entriesFor(target),
+							entries: entries.map((e) => ({
+								content: e.content,
+								timestamp: e.timestamp
+							})),
 							usage: store.usageString(target)
 						}
+					});
+					return;
+				}
+				if (method === "GET" && url.pathname === "/memory/api/config") {
+					const settings = ctx.get("settings");
+					let nudgeInterval = 10;
+					let reviewEnabled = true;
+					if (settings?.get) {
+						const cfg = settings.get("memory");
+						if (cfg) {
+							nudgeInterval = cfg.nudgeInterval ?? 10;
+							reviewEnabled = cfg.reviewEnabled ?? true;
+						}
+					}
+					send(res, 200, {
+						ok: true,
+						value: {
+							nudgeInterval,
+							reviewEnabled
+						}
+					});
+					return;
+				}
+				if (method === "POST" && url.pathname === "/memory/api/config") {
+					let body = "";
+					for await (const chunk of req) body += chunk;
+					let parsed;
+					try {
+						parsed = JSON.parse(body);
+					} catch {
+						parsed = {};
+					}
+					const settings = ctx.get("settings");
+					if (settings?.update) {
+						const patch = {};
+						if (parsed.nudgeInterval !== void 0) patch.nudgeInterval = parsed.nudgeInterval;
+						if (parsed.reviewEnabled !== void 0) patch.reviewEnabled = parsed.reviewEnabled;
+						await settings.update("memory", patch);
+						send(res, 200, { ok: true });
+					} else send(res, 200, {
+						ok: true,
+						note: "Settings service not available; values will be used for this session only."
+					});
+					return;
+				}
+				if (method === "POST" && url.pathname === "/memory/api/delete-entries") {
+					let body = "";
+					for await (const chunk of req) body += chunk;
+					let parsed;
+					try {
+						parsed = JSON.parse(body);
+					} catch {
+						parsed = {};
+					}
+					const target = parsed.target === "user" ? "user" : "memory";
+					const indices = Array.isArray(parsed.indices) ? parsed.indices : [];
+					if (indices.length === 0) {
+						send(res, 400, {
+							ok: false,
+							error: "No indices provided."
+						});
+						return;
+					}
+					const result = await store.removeByIndices(target, indices);
+					send(res, result.success ? 200 : 400, {
+						ok: result.success,
+						value: result
 					});
 					return;
 				}

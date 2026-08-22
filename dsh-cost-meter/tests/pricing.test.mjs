@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { DEFAULT_PRICING, foldSession, resolvePricing, validatePricing } from '../lib/index.js'
+import { DEFAULT_PRICING, foldSession, normalizeUsage, resolvePricing, validatePricing } from '../lib/index.js'
 
 const config = structuredClone(DEFAULT_PRICING)
 config.default.periods = [{
@@ -22,6 +22,18 @@ test('resolves model, period, and default rates independently', () => {
   assert.deepEqual(nightFallback, {
     rates: { input: 0.5, cacheRead: 0.02, cacheWrite: 1, output: 1 },
     source: 'default-period', periodName: '默认低峰',
+  })
+})
+
+test('normalizes common provider usage formats', () => {
+  assert.deepEqual(normalizeUsage({ prompt_tokens: 16_000, completion_tokens: 500, prompt_tokens_details: { cached_tokens: 12_000 } }), {
+    inputTokens: 4_000, cacheReadTokens: 12_000, cacheWriteTokens: 0, outputTokens: 500,
+  })
+  assert.deepEqual(normalizeUsage({ input_tokens: 1200, output_tokens: 300, cache_read_input_tokens: 15_000, cache_creation_input_tokens: 8_000 }), {
+    inputTokens: 1200, cacheReadTokens: 15_000, cacheWriteTokens: 8_000, outputTokens: 300,
+  })
+  assert.deepEqual(normalizeUsage({ prompt_tokens: 14_297, prompt_cache_hit_tokens: 12_867, completion_tokens: 140 }), {
+    inputTokens: 1430, cacheReadTokens: 12_867, cacheWriteTokens: 0, outputTokens: 140,
   })
 })
 

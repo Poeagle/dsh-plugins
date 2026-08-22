@@ -6,13 +6,14 @@ import { TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import {
   DEFAULT_PRICING,
   foldSession,
+  normalizeUsage,
   resolvePricing,
   routeKey,
   validatePricing,
   type PricingConfig,
 } from './pricing.js'
 
-export { DEFAULT_PRICING, foldSession, resolvePricing, routeKey, validatePricing }
+export { DEFAULT_PRICING, foldSession, normalizeUsage, resolvePricing, routeKey, validatePricing }
 export type { CostDetail, CostFold, HourlyDetail, PartialTokenRates, PricingConfig, PricingPeriod, PricingPlan, TokenRates } from './pricing.js'
 
 const ratesSchema = z.object({

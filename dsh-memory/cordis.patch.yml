@@ -1,6 +1,6 @@
 # dsh-memory bundle patch. The settings row registers the HTTP route for memory
-# management; the index row is the existing memory tool + review fork.
-# The browser half is discovered through the package.json dsh.client manifest.
+# management. The main dsh-memory row is owned by the cordis-memory preset and
+# must not be mounted a second time by this profile patch.
 - insert:
     - id: memory-settings
       name: dsh-memory/settings

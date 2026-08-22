@@ -420,11 +420,28 @@ var MemoryStore = class {
 	}
 	/**
 	* Live entries of one target (read-only view for diagnostics and tests).
+	* Returns entries with timestamps included (the raw on-disk form).
 	* @param target - which store to read.
 	* @returns the live entry list.
 	*/
 	entriesFor(target) {
 		return this.entries[target];
+	}
+	/**
+	* Live entries with metadata (timestamp) for one target. Each entry is
+	* paired with its creation/update timestamp. Old entries without timestamps
+	* (from before this feature) get the file's mtime as a fallback.
+	* @param target - which store to read.
+	* @returns the live entry list with metadata.
+	*/
+	entriesWithMeta(target) {
+		return this.entries[target].map((content) => {
+			const timestamp = extractTimestamp(content) ?? "";
+			return {
+				content: stripTimestamp(content),
+				timestamp
+			};
+		});
 	}
 	/**
 	* The grouped `current/limit` usage string, matching the error-path usage
@@ -452,20 +469,21 @@ var MemoryStore = class {
 			success: false,
 			error: scanError
 		};
+		const timestamped = `[${(/* @__PURE__ */ new Date()).toISOString()}] ${trimmed}`;
 		return this.withLock(target, async () => {
 			if ((await this.reloadTarget(target, { skipDrift: true })).kind === "read-failed") return readFailedError(this.pathFor(target));
 			const entries = this.entries[target];
-			if (entries.includes(trimmed)) return this.successResponse(target, "Entry already exists (no duplicate added).");
-			if ([...entries, trimmed].join("\n§\n").length > this.charLimit(target)) {
+			if (entries.includes(timestamped)) return this.successResponse(target, "Entry already exists (no duplicate added).");
+			if ([...entries, timestamped].join("\n§\n").length > this.charLimit(target)) {
 				const current = this.charCount(target);
 				return this.consolidationFailure({
 					success: false,
 					error: `Memory at ${grouped(current)}/${grouped(this.charLimit(target))} chars. Adding this entry (${trimmed.length} chars) would exceed the limit. Consolidate now: use 'replace' to merge overlapping entries into shorter ones or 'remove' stale or less important entries (see current_entries below), then retry this add — all in this turn.`,
-					current_entries: entries,
+					current_entries: this.entries[target].map(stripTimestamp),
 					usage: `${grouped(current)}/${grouped(this.charLimit(target))}`
 				});
 			}
-			entries.push(trimmed);
+			entries.push(timestamped);
 			await this.saveToDisk(target);
 			return this.successResponse(target, "Entry added.");
 		});
@@ -493,6 +511,7 @@ var MemoryStore = class {
 			success: false,
 			error: scanError
 		};
+		const timestampedNew = `[${(/* @__PURE__ */ new Date()).toISOString()}] ${trimmedNew}`;
 		return this.withLock(target, async () => {
 			const refusal = await this.reloadGuarded(target);
 			if (refusal !== void 0) return refusal;
@@ -500,28 +519,70 @@ var MemoryStore = class {
 			const match = this.matchOrError(entries, trimmedOld, "replace");
 			if (typeof match !== "number") return match;
 			const testEntries = [...entries];
-			testEntries[match] = trimmedNew;
+			testEntries[match] = timestampedNew;
 			const newTotal = testEntries.join(ENTRY_DELIMITER).length;
 			if (newTotal > this.charLimit(target)) {
 				const current = this.charCount(target);
 				return this.consolidationFailure({
 					success: false,
 					error: `Replacement would put memory at ${grouped(newTotal)}/${grouped(this.charLimit(target))} chars. Shorten the new content, or 'remove' other stale or less important entries to make room (see current_entries below), then retry — all in this turn.`,
-					current_entries: entries,
+					current_entries: entries.map(stripTimestamp),
 					usage: `${grouped(current)}/${grouped(this.charLimit(target))}`
 				});
 			}
-			entries[match] = trimmedNew;
+			entries[match] = timestampedNew;
 			await this.saveToDisk(target);
 			return this.successResponse(target, "Entry replaced.");
 		});
 	}
 	/**
-	* Remove the entry containing `oldText`.
+	* Remove the entry at the given index (0-based). Used for batch deletions
+	* from the UI rather than from the memory tool.
 	* @param target - which store holds the entry.
-	* @param oldText - substring identifying the entry to remove; must match exactly one.
+	* @param index - 0-based index of the entry to remove.
 	* @returns the write outcome.
 	*/
+	async removeByIndex(target, index) {
+		return this.withLock(target, async () => {
+			const refusal = await this.reloadGuarded(target);
+			if (refusal !== void 0) return refusal;
+			const entries = this.entries[target];
+			if (index < 0 || index >= entries.length) return {
+				success: false,
+				error: `Index ${index} out of range (0-${entries.length - 1}).`
+			};
+			entries.splice(index, 1);
+			await this.saveToDisk(target);
+			return this.successResponse(target, "Entry removed.");
+		});
+	}
+	/**
+	* Remove multiple entries by their indices. All-or-nothing.
+	* @param target - which store holds the entries.
+	* @param indices - sorted 0-based indices to remove.
+	* @returns the write outcome.
+	*/
+	async removeByIndices(target, indices) {
+		if (indices.length === 0) return {
+			success: false,
+			error: "No indices provided."
+		};
+		return this.withLock(target, async () => {
+			const refusal = await this.reloadGuarded(target);
+			if (refusal !== void 0) return refusal;
+			const entries = this.entries[target];
+			const sorted = [...indices].sort((a, b) => b - a);
+			for (const index of sorted) {
+				if (index < 0 || index >= entries.length) return {
+					success: false,
+					error: `Index ${index} out of range (0-${entries.length - 1}). No changes applied.`
+				};
+				entries.splice(index, 1);
+			}
+			await this.saveToDisk(target);
+			return this.successResponse(target, `${indices.length} entry(s) removed.`);
+		});
+	}
 	async remove(target, oldText) {
 		const trimmedOld = oldText.trim();
 		if (trimmedOld.length === 0) return {
@@ -565,21 +626,32 @@ var MemoryStore = class {
 			const refusal = await this.reloadGuarded(target);
 			if (refusal !== void 0) return refusal;
 			const working = [...this.entries[target]];
+			const appliedOperations = /* @__PURE__ */ new Set();
 			for (const [i, op] of operations.entries()) {
 				const content = (op.content ?? "").trim();
 				const oldText = (op.old_text ?? "").trim();
 				const pos = `Operation ${i + 1} (${op.action ?? "unknown"})`;
 				if (op.action === "add") {
 					if (content.length === 0) return this.batchError(target, `${pos}: content is required.`);
-					if (working.includes(content)) continue;
-					working.push(content);
+					const timestamped = `[${(/* @__PURE__ */ new Date()).toISOString()}] ${content}`;
+					if (working.includes(timestamped)) continue;
+					working.push(timestamped);
 				} else if (op.action === "replace") {
 					if (oldText.length === 0) return this.batchError(target, `${pos}: old_text is required.`);
 					if (content.length === 0) return this.batchError(target, `${pos}: content is required (use action='remove' to delete).`);
 					const match = findUniqueMatch(working, oldText);
-					if (match === void 0) return this.batchError(target, `${pos}: no entry matched '${oldText}'.`);
-					if (match === "ambiguous") return this.batchError(target, `${pos}: '${oldText}' matched multiple distinct entries -- be more specific.`);
-					working[match] = content;
+					if (match === void 0) {
+						const signature = `replace\u0000${oldText}\u0000${content}`;
+						if (appliedOperations.has(signature)) continue;
+						return this.batchError(target, `${pos}: no entry matched '${oldText}'.`);
+					}
+					const timestamped = `[${(/* @__PURE__ */ new Date()).toISOString()}] ${content}`;
+					if (match === "ambiguous") {
+						const matches = findAllMatches(working, oldText);
+						for (const index of matches) working[index] = timestamped;
+					} else working[match] = timestamped;
+					appliedOperations.add(`replace\u0000${oldText}\u0000${content}`);
+					working.splice(0, working.length, ...dedupeByContent(working));
 				} else if (op.action === "remove") {
 					if (oldText.length === 0) return this.batchError(target, `${pos}: old_text is required.`);
 					const match = findUniqueMatch(working, oldText);
@@ -634,7 +706,7 @@ var MemoryStore = class {
 		return this.consolidationFailure({
 			success: false,
 			error: `${message} No operations were applied (batch is all-or-nothing).`,
-			current_entries: this.entries[target],
+			current_entries: this.entries[target].map(stripTimestamp),
 			usage: `${grouped(this.charCount(target))}/${grouped(this.charLimit(target))}`
 		});
 	}
@@ -664,7 +736,7 @@ var MemoryStore = class {
 		if (match === void 0) return this.consolidationFailure({
 			success: false,
 			error: `No entry matched '${trimmedOld}'. Check current_entries below and retry with the exact text of the entry you want to ${verb}.`,
-			current_entries: entries
+			current_entries: entries.map(stripTimestamp)
 		});
 		if (match === "ambiguous") return {
 			success: false,
@@ -698,7 +770,7 @@ var MemoryStore = class {
 	renderBlock(target, entries) {
 		if (entries.length === 0) return "";
 		const limit = this.charLimit(target);
-		const content = entries.join(ENTRY_DELIMITER);
+		const content = entries.map(stripTimestamp).join(ENTRY_DELIMITER);
 		const current = content.length;
 		const pct = limit > 0 ? Math.min(100, Math.trunc(current / limit * 100)) : 0;
 		const header = `${MEMORY_BLOCK_HEADERS[target]} [${pct}% — ${grouped(current)}/${grouped(limit)} chars]`;
@@ -803,6 +875,18 @@ async function mkdirp(dir) {
 function dedupe(entries) {
 	return [...new Set(entries)];
 }
+/** Remove duplicate logical entries while retaining the newest timestamp. */
+function dedupeByContent(entries) {
+	const seen = /* @__PURE__ */ new Set();
+	const result = [];
+	for (let index = entries.length - 1; index >= 0; index -= 1) {
+		const content = stripTimestamp(entries[index] ?? "");
+		if (seen.has(content)) continue;
+		seen.add(content);
+		result.unshift(entries[index] ?? "");
+	}
+	return result;
+}
 /** Truncated one-line previews of entries for ambiguity feedback. */
 function previews(entries, width = 80) {
 	return entries.map((entry) => entry.length > width ? `${entry.slice(0, width)}...` : entry);
@@ -810,12 +894,14 @@ function previews(entries, width = 80) {
 /**
 * Locate the unique entry index containing `oldText`; identical duplicates
 * collapse to the first match, distinct matches are ambiguous.
-* @param entries - the live entry list.
+* Matches against the stripped content (without timestamp prefix) so the
+* model can refer to entries by their visible text.
+* @param entries - the live entry list (may include timestamp prefixes).
 * @param oldText - the substring to match.
 * @returns the unique index, `'ambiguous'`, or `undefined` for no match.
 */
 function findUniqueMatch(entries, oldText) {
-	const matches = entries.map((entry, index) => ({
+	const matches = entries.map(stripTimestamp).map((entry, index) => ({
 		entry,
 		index
 	})).filter(({ entry }) => entry.includes(oldText));
@@ -848,7 +934,25 @@ function sanitizeForSnapshot(entries, filename) {
 		return `[BLOCKED: ${filename} entry contained threat pattern(s): ${findings.join(", ")}. Removed from system prompt; use memory(action=remove) to delete the original.]`;
 	});
 }
+/** Timestamp prefix regex: `[ISO-timestamp] ` at the start of an entry. */
+const TIMESTAMP_RE = /^\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)\]\s*/;
+/**
+* Extract the ISO timestamp from an entry's timestamp prefix, if present.
+* @param content - the raw entry content (may start with a timestamp).
+* @returns the ISO timestamp string, or undefined.
+*/
+function extractTimestamp(content) {
+	return content.match(TIMESTAMP_RE)?.[1];
+}
+/**
+* Strip the timestamp prefix from an entry, if present.
+* @param content - the raw entry content.
+* @returns the entry content without the timestamp prefix.
+*/
+function stripTimestamp(content) {
+	return content.replace(TIMESTAMP_RE, "");
+}
 //#endregion
 export { MemoryStore as t };
 
-//# sourceMappingURL=store-CW83JWIg.js.map
+//# sourceMappingURL=store-BcMNE9sl.js.map

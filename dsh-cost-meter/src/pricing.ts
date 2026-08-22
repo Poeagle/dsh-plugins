@@ -246,10 +246,65 @@ interface FoldSample {
   step: number | undefined
   costs: { input: number; cacheRead: number; cacheWrite: number; output: number }
   tokens: { input: number; cacheRead: number; cacheWrite: number; output: number }
+  hourBucketKey: string
 }
 
 function num(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0
+}
+
+function firstNumber(...values: unknown[]): number {
+  for (const value of values) {
+    if (typeof value === 'number' && Number.isFinite(value) && value >= 0) return value
+  }
+  return 0
+}
+
+function object(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === 'object' ? value as Record<string, unknown> : {}
+}
+
+/** Normalize common provider usage responses into DSH's disjoint token buckets. */
+export function normalizeUsage(raw: Record<string, unknown>): {
+  inputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  outputTokens: number
+} {
+  const promptDetails = object(raw.prompt_tokens_details)
+  const inputDetails = object(raw.input_tokens_details)
+  const completionDetails = object(raw.completion_tokens_details)
+  const cacheRead = firstNumber(
+    raw.cacheReadTokens,
+    raw.cache_read_input_tokens,
+    raw.cache_read_tokens,
+    promptDetails.cached_tokens,
+    inputDetails.cached_tokens,
+    raw.prompt_cache_hit_tokens,
+  )
+  const cacheWrite = firstNumber(
+    raw.cacheWriteTokens,
+    raw.cache_write_input_tokens,
+    raw.cache_write_tokens,
+    raw.cache_creation_input_tokens,
+    raw.cache_creation_tokens,
+    promptDetails.cache_creation_input_tokens,
+    inputDetails.cache_creation_input_tokens,
+  )
+  const canonicalInput = raw.inputTokens
+  const anthropicInput = raw.input_tokens
+  const promptTotal = firstNumber(raw.prompt_tokens, raw.promptTokens)
+  const input = canonicalInput !== undefined
+    ? num(canonicalInput)
+    : anthropicInput !== undefined
+      ? num(anthropicInput)
+      : Math.max(0, promptTotal - cacheRead - cacheWrite)
+  return {
+    inputTokens: input,
+    cacheReadTokens: cacheRead,
+    cacheWriteTokens: cacheWrite,
+    outputTokens: firstNumber(raw.outputTokens, raw.output_tokens, raw.completion_tokens),
+  }
 }
 
 function emptyFold(config: PricingConfig): CostFold {
@@ -288,6 +343,12 @@ function hourLabel(time: number): string {
 }
 
 interface HourBucket {
+  hour: string
+  hourLabel: string
+  model: string | null
+  provider: string | null
+  pricingSource: string
+  periodName: string | null
   inputTokens: number
   cacheReadTokens: number
   cacheWriteTokens: number
@@ -297,10 +358,6 @@ interface HourBucket {
   cacheWriteCost: number
   outputCost: number
   cost: number
-  models: Set<string>
-  providers: Set<string>
-  sources: Set<string>
-  periodNames: Set<string>
 }
 
 /** Fold request routes and provider usage into a cumulative estimate. */
@@ -339,11 +396,30 @@ export function foldSession(events: readonly CostEvent[], config: PricingConfig 
     return detail
   }
   const hourMap = new Map<string, HourBucket>()
-  const ensureHour = (hKey: string): HourBucket => {
-    let bucket = hourMap.get(hKey)
+  const hourBucketKey = (hKey: string, pricing: ResolvedPricing): string =>
+    `${hKey}|${provider ?? ''}|${model ?? ''}|${pricing.source}|${pricing.periodName ?? ''}`
+  const ensureHour = (hKey: string, pricing: ResolvedPricing): HourBucket => {
+    const key = hourBucketKey(hKey, pricing)
+    let bucket = hourMap.get(key)
     if (bucket === undefined) {
-      bucket = { inputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, inputCost: 0, cacheReadCost: 0, cacheWriteCost: 0, outputCost: 0, cost: 0, models: new Set(), providers: new Set(), sources: new Set(), periodNames: new Set() }
-      hourMap.set(hKey, bucket)
+      bucket = {
+        hour: hKey,
+        hourLabel: hourLabel(new Date(hKey).getTime()),
+        model,
+        provider,
+        pricingSource: pricing.source,
+        periodName: pricing.periodName ?? null,
+        inputTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        outputTokens: 0,
+        inputCost: 0,
+        cacheReadCost: 0,
+        cacheWriteCost: 0,
+        outputCost: 0,
+        cost: 0,
+      }
+      hourMap.set(key, bucket)
     }
     return bucket
   }
@@ -361,11 +437,12 @@ export function foldSession(events: readonly CostEvent[], config: PricingConfig 
     if (usage === undefined || usage === null) continue
 
     const pricing = resolvePricing(config, provider, model, event.time)
+    const normalized = normalizeUsage(usage)
     const tokens = {
-      input: num(usage.inputTokens),
-      cacheRead: num(usage.cacheReadTokens),
-      cacheWrite: num(usage.cacheWriteTokens),
-      output: num(usage.outputTokens),
+      input: normalized.inputTokens,
+      cacheRead: normalized.cacheReadTokens,
+      cacheWrite: normalized.cacheWriteTokens,
+      output: normalized.outputTokens,
     }
     const costs = {
       input: tokens.input * pricing.rates.input / config.unitTokens,
@@ -396,7 +473,7 @@ export function foldSession(events: readonly CostEvent[], config: PricingConfig 
         prevDetail.cost = prevDetail.inputCost + prevDetail.cacheReadCost + prevDetail.cacheWriteCost + prevDetail.outputCost
       }
       if (lastHourKey !== null) {
-        const prevBucket = ensureHour(lastHourKey)
+        const prevBucket = ensureHour(lastHourKey, lastPricing ?? pricing)
         prevBucket.inputTokens -= last.tokens.input
         prevBucket.cacheReadTokens -= last.tokens.cacheRead
         prevBucket.cacheWriteTokens -= last.tokens.cacheWrite
@@ -421,11 +498,11 @@ export function foldSession(events: readonly CostEvent[], config: PricingConfig 
     out.route = routeKey(provider, model)
     out.pricingSource = pricing.source
     out.pricingPeriod = pricing.periodName ?? null
-    last = { turn: event.data.turn, step: event.data.step, costs, tokens }
+    last = { turn: event.data.turn, step: event.data.step, costs, tokens, hourBucketKey: hourBucketKey(hKey, pricing) }
     lastPricing = pricing
     lastHourKey = hKey
 
-    const bucket = ensureHour(hKey)
+    const bucket = ensureHour(hKey, pricing)
     bucket.inputTokens += tokens.input
     bucket.cacheReadTokens += tokens.cacheRead
     bucket.cacheWriteTokens += tokens.cacheWrite
@@ -435,11 +512,6 @@ export function foldSession(events: readonly CostEvent[], config: PricingConfig 
     bucket.cacheWriteCost += costs.cacheWrite
     bucket.outputCost += costs.output
     bucket.cost = bucket.inputCost + bucket.cacheReadCost + bucket.cacheWriteCost + bucket.outputCost
-    if (provider !== null) bucket.providers.add(provider)
-    if (model !== null) bucket.models.add(model)
-    bucket.sources.add(pricing.source)
-    if (pricing.periodName) bucket.periodNames.add(pricing.periodName)
-
     const detail = ensureDetail(pricing)
     detail.inputTokens += tokens.input
     detail.cacheReadTokens += tokens.cacheRead
@@ -453,11 +525,11 @@ export function foldSession(events: readonly CostEvent[], config: PricingConfig 
   }
   out.cost = out.inputCost + out.cacheReadCost + out.cacheWriteCost + out.outputCost
   out.details = [...detailMap.values()]
-  out.hourly = [...hourMap.entries()].map(([hKey, bucket]) => {
+  out.hourly = [...hourMap.values()].map(bucket => {
     const totalTokens = bucket.inputTokens + bucket.cacheReadTokens + bucket.cacheWriteTokens + bucket.outputTokens
     return {
-      hour: hKey,
-      hourLabel: hourLabel(new Date(hKey).getTime()),
+      hour: bucket.hour,
+      hourLabel: bucket.hourLabel,
       inputTokens: bucket.inputTokens,
       cacheReadTokens: bucket.cacheReadTokens,
       cacheWriteTokens: bucket.cacheWriteTokens,
@@ -468,11 +540,11 @@ export function foldSession(events: readonly CostEvent[], config: PricingConfig 
       outputCost: bucket.outputCost,
       cost: bucket.cost,
       cacheRate: totalTokens > 0 ? (bucket.cacheReadTokens + bucket.cacheWriteTokens) / totalTokens : 0,
-      model: bucket.models.size === 1 ? [...bucket.models][0] : null,
-      provider: bucket.providers.size === 1 ? [...bucket.providers][0] : null,
-      pricingSource: bucket.sources.size === 1 ? [...bucket.sources][0] : null,
-      periodName: bucket.periodNames.size === 1 ? [...bucket.periodNames][0] : null,
+      model: bucket.model,
+      provider: bucket.provider,
+      pricingSource: bucket.pricingSource,
+      periodName: bucket.periodName,
     }
-  }).sort((a, b) => a.hour.localeCompare(b.hour))
+  }).sort((a, b) => a.hour.localeCompare(b.hour) || (a.provider ?? '').localeCompare(b.provider ?? '') || (a.model ?? '').localeCompare(b.model ?? ''))
   return out
 }

@@ -1,11 +1,11 @@
-import { t as MemoryStore } from "./store-CW83JWIg.js";
+import { t as MemoryStore } from "./store-BcMNE9sl.js";
 import z from "@deepseek-ai/schemastery";
 import { defineTool, parameterSchemaSpecToJsonSchema } from "@deepseek-ai/dsh-tools";
 import { BlockAssembler, createAssistantMessage, createToolResultMessage, createUserMessage } from "@deepseek-ai/dsh-llm";
 //#region src/schema.ts
 /** Model-facing description of the memory tool (single source for both the
 * registry registration and the review fork's tool schema). */
-const MEMORY_TOOL_DESCRIPTION = "Save durable facts to persistent memory that survive across sessions. Memory is injected into every future turn, so keep entries compact and high-signal.\n\nHOW: make ALL your changes in ONE call via an 'operations' array (each item: {action, content?, old_text?}). The batch applies atomically and the char limit is checked only on the FINAL result — so a single call can remove/replace stale entries to free room AND add new ones, even when an add alone would overflow. The response reports current/limit chars and confirms completion; one batch call finishes the update, so don't repeat it. Use the bare action/content/old_text fields only for a single lone change.\n\nWHEN: save proactively when the user states a preference, correction, or personal detail, or you learn a stable fact about their environment, conventions, or workflow. Priority: user preferences & corrections > environment facts > procedures. The best memory stops the user repeating themselves.\n\nIF FULL: an add is rejected with the current entries shown. Reissue as ONE batch that removes or shortens enough stale entries and adds the new one together.\n\nTARGETS: 'user' = who the user is (name, role, preferences, style). 'memory' = your notes (environment, conventions, tool quirks, lessons).\n\nSKIP: trivial/obvious info, easily re-discovered facts, raw data dumps, task progress, completed-work logs, temporary TODO state. Reusable procedures belong in a skill, not memory.";
+const MEMORY_TOOL_DESCRIPTION = "Save durable facts to persistent memory that survive across sessions. Memory is injected into every future turn, so keep entries compact and high-signal.\n\nHOW: make ALL your changes in ONE call via an 'operations' array (each item: {action, content?, old_text?}). The batch applies atomically and the char limit is checked only on the FINAL result — so a single call can remove/replace stale entries to free room AND add new ones, even when an add alone would overflow. The response reports current/limit chars and confirms completion; one batch call finishes the update, so don't repeat it. Use the bare action/content/old_text fields only for a single lone change.\n\nIMPORTANT: To UPDATE an existing entry, use action=\"replace\" with old_text and content in the SAME call. old_text must be a unique substring of exactly one current entry; use the distinctive full entry text shown in current_entries, never text spanning the § separator. Do NOT use remove+add as two separate calls — replace does both atomically. Do not use filesystem, shell, or edit tools to modify MEMORY.md or USER.md; all memory writes MUST go through this memory tool.\n\nWHEN: save proactively when the user states a preference, correction, or personal detail, or you learn a stable fact about their environment, conventions, or workflow. Priority: user preferences & corrections > environment facts > procedures. The best memory stops the user repeating themselves.\n\nIF FULL: an add is rejected with the current entries shown. Reissue as ONE batch that removes or shortens enough stale entries and adds the new one together.\n\nTARGETS: 'user' = who the user is (name, role, preferences, style). 'memory' = your notes (environment, conventions, tool quirks, lessons).\n\nSKIP: trivial/obvious info, easily re-discovered facts, raw data dumps, task progress, completed-work logs, temporary TODO state. Reusable procedures belong in a skill, not memory.";
 /** The tool's parameter declaration (implicit open-object root). */
 const MEMORY_TOOL_PARAMETERS = {
 	action: {
@@ -350,6 +350,25 @@ async function apply(ctx, config) {
 		userCharLimit: config.userCharLimit
 	});
 	await store.loadFromDisk();
+	/**
+	* Resolve the effective nudge/review settings from the optional settings
+	* service, falling back to the composition config when the service is
+	* unavailable or the namespace is not registered.
+	*/
+	function effectiveSettings() {
+		const settings = ctx.get("settings");
+		if (settings?.get) {
+			const raw = settings.get("memory");
+			if (raw !== void 0) return {
+				nudgeInterval: typeof raw.nudgeInterval === "number" ? raw.nudgeInterval : config.nudgeInterval,
+				reviewEnabled: typeof raw.reviewEnabled === "boolean" ? raw.reviewEnabled : config.reviewEnabled
+			};
+		}
+		return {
+			nudgeInterval: config.nudgeInterval,
+			reviewEnabled: config.reviewEnabled
+		};
+	}
 	ctx.tools.register(defineTool({
 		name: "memory",
 		description: MEMORY_TOOL_DESCRIPTION,
@@ -373,28 +392,57 @@ async function apply(ctx, config) {
 	});
 	/** Sessions that have already received the memory context injection. */
 	const injected = /* @__PURE__ */ new Set();
+	/**
+	* Per-session lock to prevent concurrent injection from multiple agents
+	* sharing the same session (main agent + subagent in same conversation).
+	*/
+	const injectionLocks = /* @__PURE__ */ new Map();
 	ctx.on("agent/pre-step", async ({ agent, messages, signal: _signal }, next) => {
 		const decision = await next();
 		const text = store.renderContextBlock();
 		if (text === "") return decision;
 		if (decision.kind !== "enter") return decision;
-		if (injected.has(agent.id)) return decision;
-		injected.add(agent.id);
-		const contextMessage = createUserMessage({
-			content: [{
-				type: "text",
-				text
-			}],
-			source: {
-				kind: "plugin",
-				plugin: name
-			}
+		const sid = agent.session.id;
+		let release;
+		const existing = injectionLocks.get(sid);
+		if (existing !== void 0) {
+			await existing;
+			return decision;
+		}
+		const lock = new Promise((resolve) => {
+			release = resolve;
 		});
-		const lastClaimedIndex = decision.messages.findLastIndex((m) => messages.includes(m));
-		return {
-			kind: "enter",
-			messages: decision.messages.toSpliced(lastClaimedIndex + 1, 0, contextMessage)
-		};
+		injectionLocks.set(sid, lock);
+		try {
+			if (injected.has(sid)) return decision;
+			if (agent.session.events.some((e) => {
+				if (e.type !== "user/message") return false;
+				const msg = e.data;
+				return msg.source?.kind === "plugin" && msg.source?.plugin === "memory";
+			})) {
+				injected.add(sid);
+				return decision;
+			}
+			injected.add(sid);
+			const contextMessage = createUserMessage({
+				content: [{
+					type: "text",
+					text
+				}],
+				source: {
+					kind: "plugin",
+					plugin: name
+				}
+			});
+			const lastClaimedIndex = decision.messages.findLastIndex((m) => messages.includes(m));
+			return {
+				kind: "enter",
+				messages: decision.messages.toSpliced(lastClaimedIndex + 1, 0, contextMessage)
+			};
+		} finally {
+			release();
+			injectionLocks.delete(sid);
+		}
 	});
 	/** Per-session nudge state, keyed by session id. */
 	const states = /* @__PURE__ */ new Map();
@@ -432,9 +480,10 @@ async function apply(ctx, config) {
 			const prior = priorUserTurns(session) - 1;
 			if (config.nudgeInterval > 0 && prior > 0) state.turnsSinceMemory = prior % config.nudgeInterval;
 		}
-		if (config.nudgeInterval > 0 && config.reviewEnabled) {
+		const { nudgeInterval, reviewEnabled } = effectiveSettings();
+		if (nudgeInterval > 0 && reviewEnabled) {
 			state.turnsSinceMemory += 1;
-			if (state.turnsSinceMemory >= config.nudgeInterval) {
+			if (state.turnsSinceMemory >= nudgeInterval) {
 				state.turnsSinceMemory = 0;
 				state.reviewPending = true;
 			}
@@ -472,6 +521,7 @@ async function apply(ctx, config) {
 		reviewing.delete(session.id);
 		states.delete(session.id);
 		injected.delete(session.id);
+		injectionLocks.delete(session.id);
 	});
 }
 //#endregion

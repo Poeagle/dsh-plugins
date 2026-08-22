@@ -61,10 +61,13 @@ export const inject = ['settings']
 /** Register the settings namespace and memory HTTP route for browser settings management. */
 export function apply(ctx: Context): void {
   // Register the settings namespace so the Configurable Plugins tab knows to
-  // dispatch our card key.
+  // dispatch our card key. The schema exposes the configurable fields.
   const settings = ctx.get('settings') as SettingsFace | undefined
   if (settings !== undefined) {
-    settings.register(SETTINGS_NS, z.object({}), {
+    settings.register(SETTINGS_NS, z.object({
+      nudgeInterval: z.number().step(1).min(0).default(10),
+      reviewEnabled: z.boolean().default(true),
+    }), {
       base: {},
       validate: () => {},
     })
@@ -115,18 +118,71 @@ export function apply(ctx: Context): void {
           return
         }
 
-        // GET /memory/api/entries?target=memory|user — return entries
+        // GET /memory/api/entries?target=memory|user — return entries with metadata
         if (method === 'GET' && url.pathname === '/memory/api/entries') {
           const target = url.searchParams.get('target') === 'user' ? 'user' : 'memory'
           await store.loadFromDisk()
+          const entries = store.entriesWithMeta(target)
           send(res, 200, {
             ok: true,
             value: {
               target,
-              entries: store.entriesFor(target),
+              entries: entries.map(e => ({ content: e.content, timestamp: e.timestamp })),
               usage: store.usageString(target),
             },
           })
+          return
+        }
+
+        // GET /memory/api/config — return current memory settings
+        if (method === 'GET' && url.pathname === '/memory/api/config') {
+          const settings = ctx.get('settings') as any
+          let nudgeInterval = 10
+          let reviewEnabled = true
+          if (settings?.get) {
+            const cfg = settings.get('memory') as any
+            if (cfg) {
+              nudgeInterval = cfg.nudgeInterval ?? 10
+              reviewEnabled = cfg.reviewEnabled ?? true
+            }
+          }
+          send(res, 200, { ok: true, value: { nudgeInterval, reviewEnabled } })
+          return
+        }
+
+        // POST /memory/api/config — update memory settings
+        if (method === 'POST' && url.pathname === '/memory/api/config') {
+          let body = ''
+          for await (const chunk of req) body += chunk
+          let parsed: { nudgeInterval?: number; reviewEnabled?: boolean }
+          try { parsed = JSON.parse(body) } catch { parsed = {} }
+          const settings = ctx.get('settings') as any
+          if (settings?.update) {
+            const patch: Record<string, unknown> = {}
+            if (parsed.nudgeInterval !== undefined) patch.nudgeInterval = parsed.nudgeInterval
+            if (parsed.reviewEnabled !== undefined) patch.reviewEnabled = parsed.reviewEnabled
+            await settings.update('memory', patch)
+            send(res, 200, { ok: true })
+          } else {
+            send(res, 200, { ok: true, note: 'Settings service not available; values will be used for this session only.' })
+          }
+          return
+        }
+
+        // POST /memory/api/delete-entries — delete entries by indices
+        if (method === 'POST' && url.pathname === '/memory/api/delete-entries') {
+          let body = ''
+          for await (const chunk of req) body += chunk
+          let parsed: { target?: string; indices?: number[] }
+          try { parsed = JSON.parse(body) } catch { parsed = {} }
+          const target = parsed.target === 'user' ? 'user' : 'memory'
+          const indices = Array.isArray(parsed.indices) ? parsed.indices : []
+          if (indices.length === 0) {
+            send(res, 400, { ok: false, error: 'No indices provided.' })
+            return
+          }
+          const result = await store.removeByIndices(target, indices)
+          send(res, result.success ? 200 : 400, { ok: result.success, value: result })
           return
         }
 

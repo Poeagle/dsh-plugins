@@ -13,7 +13,7 @@ import { basename, dirname, join } from 'node:path'
 import { withFileLock, writeFileAtomic } from '@deepseek-ai/dsh-atomic-write'
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 import { firstThreatMessage, scanForThreats } from './threats.ts'
-import type { MemoryAction, MemoryOperation, MemoryTarget, MemoryToolResult } from './types.ts'
+import type { MemoryAction, MemoryEntryMeta, MemoryOperation, MemoryTarget, MemoryToolResult } from './types.ts'
 
 /** Entry delimiter — entries may be multiline, so the delimiter spans lines. */
 export const ENTRY_DELIMITER = '\n§\n'
@@ -158,11 +158,26 @@ export class MemoryStore {
 
   /**
    * Live entries of one target (read-only view for diagnostics and tests).
+   * Returns entries with timestamps included (the raw on-disk form).
    * @param target - which store to read.
    * @returns the live entry list.
    */
   entriesFor(target: MemoryTarget): readonly string[] {
     return this.entries[target]
+  }
+
+  /**
+   * Live entries with metadata (timestamp) for one target. Each entry is
+   * paired with its creation/update timestamp. Old entries without timestamps
+   * (from before this feature) get the file's mtime as a fallback.
+   * @param target - which store to read.
+   * @returns the live entry list with metadata.
+   */
+  entriesWithMeta(target: MemoryTarget): MemoryEntryMeta[] {
+    return this.entries[target].map(content => {
+      const timestamp = extractTimestamp(content) ?? ''
+      return { content: stripTimestamp(content), timestamp }
+    })
   }
 
   /**
@@ -187,6 +202,9 @@ export class MemoryStore {
     const scanError = firstThreatMessage(trimmed, 'strict')
     if (scanError !== undefined) return { success: false, error: scanError }
 
+    // Prepend ISO timestamp to the entry.
+    const timestamped = `[${new Date().toISOString()}] ${trimmed}`
+
     return this.withLock(target, async () => {
       // Re-read under lock to pick up other sessions' writes. add skips the
       // drift guard because appending never clobbers existing content — but
@@ -196,10 +214,11 @@ export class MemoryStore {
       if (reload.kind === 'read-failed') return readFailedError(this.pathFor(target))
 
       const entries = this.entries[target]
-      if (entries.includes(trimmed)) {
+      if (entries.includes(timestamped)) {
         return this.successResponse(target, 'Entry already exists (no duplicate added).')
       }
-      const newTotal = [...entries, trimmed].join(ENTRY_DELIMITER).length
+      // Check budget against the stripped content length.
+      const newTotal = [...entries, timestamped].join(ENTRY_DELIMITER).length
       if (newTotal > this.charLimit(target)) {
         const current = this.charCount(target)
         return this.consolidationFailure({
@@ -211,11 +230,11 @@ export class MemoryStore {
             + "shorter ones or 'remove' stale or less important entries (see "
             + 'current_entries below), then retry this add — all in this turn.'
           ),
-          current_entries: entries,
+          current_entries: this.entries[target].map(stripTimestamp),
           usage: `${grouped(current)}/${grouped(this.charLimit(target))}`,
         })
       }
-      entries.push(trimmed)
+      entries.push(timestamped)
       await this.saveToDisk(target)
       return this.successResponse(target, 'Entry added.')
     })
@@ -238,6 +257,9 @@ export class MemoryStore {
     const scanError = firstThreatMessage(trimmedNew, 'strict')
     if (scanError !== undefined) return { success: false, error: scanError }
 
+    // Prepend ISO timestamp to the replacement entry.
+    const timestampedNew = `[${new Date().toISOString()}] ${trimmedNew}`
+
     return this.withLock(target, async () => {
       const refusal = await this.reloadGuarded(target)
       if (refusal !== undefined) return refusal
@@ -246,7 +268,7 @@ export class MemoryStore {
       const match = this.matchOrError(entries, trimmedOld, 'replace')
       if (typeof match !== 'number') return match
       const testEntries = [...entries]
-      testEntries[match] = trimmedNew
+      testEntries[match] = timestampedNew
       const newTotal = testEntries.join(ENTRY_DELIMITER).length
       if (newTotal > this.charLimit(target)) {
         const current = this.charCount(target)
@@ -258,22 +280,63 @@ export class MemoryStore {
             + 'entries to make room (see current_entries below), then retry — all '
             + 'in this turn.'
           ),
-          current_entries: entries,
+          current_entries: entries.map(stripTimestamp),
           usage: `${grouped(current)}/${grouped(this.charLimit(target))}`,
         })
       }
-      entries[match] = trimmedNew
+      entries[match] = timestampedNew
       await this.saveToDisk(target)
       return this.successResponse(target, 'Entry replaced.')
     })
   }
 
   /**
-   * Remove the entry containing `oldText`.
+   * Remove the entry at the given index (0-based). Used for batch deletions
+   * from the UI rather than from the memory tool.
    * @param target - which store holds the entry.
-   * @param oldText - substring identifying the entry to remove; must match exactly one.
+   * @param index - 0-based index of the entry to remove.
    * @returns the write outcome.
    */
+  async removeByIndex(target: MemoryTarget, index: number): Promise<MemoryToolResult> {
+    return this.withLock(target, async () => {
+      const refusal = await this.reloadGuarded(target)
+      if (refusal !== undefined) return refusal
+
+      const entries = this.entries[target]
+      if (index < 0 || index >= entries.length) {
+        return { success: false, error: `Index ${index} out of range (0-${entries.length - 1}).` }
+      }
+      entries.splice(index, 1)
+      await this.saveToDisk(target)
+      return this.successResponse(target, 'Entry removed.')
+    })
+  }
+
+  /**
+   * Remove multiple entries by their indices. All-or-nothing.
+   * @param target - which store holds the entries.
+   * @param indices - sorted 0-based indices to remove.
+   * @returns the write outcome.
+   */
+  async removeByIndices(target: MemoryTarget, indices: readonly number[]): Promise<MemoryToolResult> {
+    if (indices.length === 0) return { success: false, error: 'No indices provided.' }
+
+    return this.withLock(target, async () => {
+      const refusal = await this.reloadGuarded(target)
+      if (refusal !== undefined) return refusal
+
+      const entries = this.entries[target]
+      const sorted = [...indices].sort((a, b) => b - a) // descending for splice
+      for (const index of sorted) {
+        if (index < 0 || index >= entries.length) {
+          return { success: false, error: `Index ${index} out of range (0-${entries.length - 1}). No changes applied.` }
+        }
+        entries.splice(index, 1)
+      }
+      await this.saveToDisk(target)
+      return this.successResponse(target, `${indices.length} entry(s) removed.`)
+    })
+  }
   async remove(target: MemoryTarget, oldText: string): Promise<MemoryToolResult> {
     const trimmedOld = oldText.trim()
     if (trimmedOld.length === 0) return { success: false, error: 'old_text cannot be empty.' }
@@ -319,6 +382,7 @@ export class MemoryStore {
 
       // Work on a copy; commit only when the whole batch validates.
       const working = [...this.entries[target]]
+      const appliedOperations = new Set<string>()
       for (const [i, op] of operations.entries()) {
         const content = (op.content ?? '').trim()
         const oldText = (op.old_text ?? '').trim()
@@ -326,19 +390,32 @@ export class MemoryStore {
 
         if (op.action === 'add') {
           if (content.length === 0) return this.batchError(target, `${pos}: content is required.`)
-          if (working.includes(content)) continue // idempotent duplicate skip
-          working.push(content)
+          const timestamped = `[${new Date().toISOString()}] ${content}`
+          if (working.includes(timestamped)) continue // idempotent duplicate skip
+          working.push(timestamped)
         } else if (op.action === 'replace') {
           if (oldText.length === 0) return this.batchError(target, `${pos}: old_text is required.`)
           if (content.length === 0) {
             return this.batchError(target, `${pos}: content is required (use action='remove' to delete).`)
           }
           const match = findUniqueMatch(working, oldText)
-          if (match === undefined) return this.batchError(target, `${pos}: no entry matched '${oldText}'.`)
-          if (match === 'ambiguous') {
-            return this.batchError(target, `${pos}: '${oldText}' matched multiple distinct entries -- be more specific.`)
+          if (match === undefined) {
+            const signature = `replace\u0000${oldText}\u0000${content}`
+            // A repeated identical replacement is idempotent: an earlier
+            // operation in this atomic batch may already have resolved all
+            // matching entries.
+            if (appliedOperations.has(signature)) continue
+            return this.batchError(target, `${pos}: no entry matched '${oldText}'.`)
           }
-          working[match] = content
+          const timestamped = `[${new Date().toISOString()}] ${content}`
+          if (match === 'ambiguous') {
+            const matches = findAllMatches(working, oldText)
+            for (const index of matches) working[index] = timestamped
+          } else {
+            working[match] = timestamped
+          }
+          appliedOperations.add(`replace\u0000${oldText}\u0000${content}`)
+          working.splice(0, working.length, ...dedupeByContent(working))
         } else if (op.action === 'remove') {
           if (oldText.length === 0) return this.batchError(target, `${pos}: old_text is required.`)
           const match = findUniqueMatch(working, oldText)
@@ -414,7 +491,7 @@ export class MemoryStore {
     return this.consolidationFailure({
       success: false,
       error: `${message} No operations were applied (batch is all-or-nothing).`,
-      current_entries: this.entries[target],
+      current_entries: this.entries[target].map(stripTimestamp),
       usage: `${grouped(this.charCount(target))}/${grouped(this.charLimit(target))}`,
     })
   }
@@ -448,7 +525,7 @@ export class MemoryStore {
       return this.consolidationFailure({
         success: false,
         error: `No entry matched '${trimmedOld}'. Check current_entries below and retry with the exact text of the entry you want to ${verb}.`,
-        current_entries: entries,
+        current_entries: entries.map(stripTimestamp),
       })
     }
     if (match === 'ambiguous') {
@@ -490,7 +567,9 @@ export class MemoryStore {
   private renderBlock(target: MemoryTarget, entries: readonly string[]): string {
     if (entries.length === 0) return ''
     const limit = this.charLimit(target)
-    const content = entries.join(ENTRY_DELIMITER)
+    // Strip timestamps for the model-visible snapshot.
+    const cleanEntries = entries.map(stripTimestamp)
+    const content = cleanEntries.join(ENTRY_DELIMITER)
     const current = content.length
     const pct = limit > 0 ? Math.min(100, Math.trunc((current / limit) * 100)) : 0
     const header = `${MEMORY_BLOCK_HEADERS[target]} [${pct}% — ${grouped(current)}/${grouped(limit)} chars]`
@@ -611,6 +690,19 @@ function dedupe(entries: readonly string[]): string[] {
   return [...new Set(entries)]
 }
 
+/** Remove duplicate logical entries while retaining the newest timestamp. */
+function dedupeByContent(entries: readonly string[]): string[] {
+  const seen = new Set<string>()
+  const result: string[] = []
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const content = stripTimestamp(entries[index] ?? '')
+    if (seen.has(content)) continue
+    seen.add(content)
+    result.unshift(entries[index] ?? '')
+  }
+  return result
+}
+
 /** Truncated one-line previews of entries for ambiguity feedback. */
 function previews(entries: readonly string[], width = 80): string[] {
   return entries.map(entry => (entry.length > width ? `${entry.slice(0, width)}...` : entry))
@@ -619,17 +711,23 @@ function previews(entries: readonly string[], width = 80): string[] {
 /**
  * Locate the unique entry index containing `oldText`; identical duplicates
  * collapse to the first match, distinct matches are ambiguous.
- * @param entries - the live entry list.
+ * Matches against the stripped content (without timestamp prefix) so the
+ * model can refer to entries by their visible text.
+ * @param entries - the live entry list (may include timestamp prefixes).
  * @param oldText - the substring to match.
  * @returns the unique index, `'ambiguous'`, or `undefined` for no match.
  */
 function findUniqueMatch(entries: readonly string[], oldText: string): number | 'ambiguous' | undefined {
-  const matches = entries
-    .map((entry, index) => ({ entry, index }))
-    .filter(({ entry }) => entry.includes(oldText))
+  const matches = findAllMatches(entries, oldText)
   if (matches.length === 0) return undefined
-  if (matches.length > 1 && new Set(matches.map(({ entry }) => entry)).size > 1) return 'ambiguous'
-  return matches[0]?.index
+  const distinct = new Set(matches.map(index => stripTimestamp(entries[index] ?? '')))
+  if (distinct.size > 1) return 'ambiguous'
+  return matches[0]
+}
+
+/** Return every entry index whose visible content contains `oldText`. */
+function findAllMatches(entries: readonly string[], oldText: string): number[] {
+  return entries.flatMap((entry, index) => stripTimestamp(entry).includes(oldText) ? [index] : [])
 }
 
 /** Drift-refusal result pointing the operator at the backup snapshot. */
@@ -684,5 +782,27 @@ function sanitizeForSnapshot(entries: readonly string[], filename: string): stri
   })
 }
 
+/** Timestamp prefix regex: `[ISO-timestamp] ` at the start of an entry. */
+const TIMESTAMP_RE = /^\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)\]\s*/
+
+/**
+ * Extract the ISO timestamp from an entry's timestamp prefix, if present.
+ * @param content - the raw entry content (may start with a timestamp).
+ * @returns the ISO timestamp string, or undefined.
+ */
+function extractTimestamp(content: string): string | undefined {
+  const match = content.match(TIMESTAMP_RE)
+  return match?.[1]
+}
+
+/**
+ * Strip the timestamp prefix from an entry, if present.
+ * @param content - the raw entry content.
+ * @returns the entry content without the timestamp prefix.
+ */
+function stripTimestamp(content: string): string {
+  return content.replace(TIMESTAMP_RE, '')
+}
+
 /** Public vocabulary re-exported from the types module. */
-export type { MemoryAction, MemoryOperation, MemoryTarget, MemoryToolResult }
+export type { MemoryAction, MemoryEntryMeta, MemoryOperation, MemoryTarget, MemoryToolResult }

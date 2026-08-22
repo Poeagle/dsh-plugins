@@ -917,6 +917,30 @@ function validatePricing(config) {
 function num(value) {
 	return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
 }
+function firstNumber(...values) {
+	for (const value of values) if (typeof value === "number" && Number.isFinite(value) && value >= 0) return value;
+	return 0;
+}
+function object(value) {
+	return value !== null && typeof value === "object" ? value : {};
+}
+/** Normalize common provider usage responses into DSH's disjoint token buckets. */
+function normalizeUsage(raw) {
+	const promptDetails = object(raw.prompt_tokens_details);
+	const inputDetails = object(raw.input_tokens_details);
+	raw.completion_tokens_details;
+	const cacheRead = firstNumber(raw.cacheReadTokens, raw.cache_read_input_tokens, raw.cache_read_tokens, promptDetails.cached_tokens, inputDetails.cached_tokens, raw.prompt_cache_hit_tokens);
+	const cacheWrite = firstNumber(raw.cacheWriteTokens, raw.cache_write_input_tokens, raw.cache_write_tokens, raw.cache_creation_input_tokens, raw.cache_creation_tokens, promptDetails.cache_creation_input_tokens, inputDetails.cache_creation_input_tokens);
+	const canonicalInput = raw.inputTokens;
+	const anthropicInput = raw.input_tokens;
+	const promptTotal = firstNumber(raw.prompt_tokens, raw.promptTokens);
+	return {
+		inputTokens: canonicalInput !== void 0 ? num(canonicalInput) : anthropicInput !== void 0 ? num(anthropicInput) : Math.max(0, promptTotal - cacheRead - cacheWrite),
+		cacheReadTokens: cacheRead,
+		cacheWriteTokens: cacheWrite,
+		outputTokens: firstNumber(raw.outputTokens, raw.output_tokens, raw.completion_tokens)
+	};
+}
 function emptyFold(config) {
 	return {
 		cost: 0,
@@ -984,10 +1008,18 @@ function foldSession(events, config = DEFAULT_PRICING) {
 		return detail;
 	};
 	const hourMap = /* @__PURE__ */ new Map();
-	const ensureHour = (hKey) => {
-		let bucket = hourMap.get(hKey);
+	const hourBucketKey = (hKey, pricing) => `${hKey}|${provider ?? ""}|${model ?? ""}|${pricing.source}|${pricing.periodName ?? ""}`;
+	const ensureHour = (hKey, pricing) => {
+		const key = hourBucketKey(hKey, pricing);
+		let bucket = hourMap.get(key);
 		if (bucket === void 0) {
 			bucket = {
+				hour: hKey,
+				hourLabel: hourLabel(new Date(hKey).getTime()),
+				model,
+				provider,
+				pricingSource: pricing.source,
+				periodName: pricing.periodName ?? null,
 				inputTokens: 0,
 				cacheReadTokens: 0,
 				cacheWriteTokens: 0,
@@ -996,13 +1028,9 @@ function foldSession(events, config = DEFAULT_PRICING) {
 				cacheReadCost: 0,
 				cacheWriteCost: 0,
 				outputCost: 0,
-				cost: 0,
-				models: /* @__PURE__ */ new Set(),
-				providers: /* @__PURE__ */ new Set(),
-				sources: /* @__PURE__ */ new Set(),
-				periodNames: /* @__PURE__ */ new Set()
+				cost: 0
 			};
-			hourMap.set(hKey, bucket);
+			hourMap.set(key, bucket);
 		}
 		return bucket;
 	};
@@ -1019,11 +1047,12 @@ function foldSession(events, config = DEFAULT_PRICING) {
 		else continue;
 		if (usage === void 0 || usage === null) continue;
 		const pricing = resolvePricing(config, provider, model, event.time);
+		const normalized = normalizeUsage(usage);
 		const tokens = {
-			input: num(usage.inputTokens),
-			cacheRead: num(usage.cacheReadTokens),
-			cacheWrite: num(usage.cacheWriteTokens),
-			output: num(usage.outputTokens)
+			input: normalized.inputTokens,
+			cacheRead: normalized.cacheReadTokens,
+			cacheWrite: normalized.cacheWriteTokens,
+			output: normalized.outputTokens
 		};
 		const costs = {
 			input: tokens.input * pricing.rates.input / config.unitTokens,
@@ -1054,7 +1083,7 @@ function foldSession(events, config = DEFAULT_PRICING) {
 				prevDetail.cost = prevDetail.inputCost + prevDetail.cacheReadCost + prevDetail.cacheWriteCost + prevDetail.outputCost;
 			}
 			if (lastHourKey !== null) {
-				const prevBucket = ensureHour(lastHourKey);
+				const prevBucket = ensureHour(lastHourKey, lastPricing ?? pricing);
 				prevBucket.inputTokens -= last.tokens.input;
 				prevBucket.cacheReadTokens -= last.tokens.cacheRead;
 				prevBucket.cacheWriteTokens -= last.tokens.cacheWrite;
@@ -1083,11 +1112,12 @@ function foldSession(events, config = DEFAULT_PRICING) {
 			turn: event.data.turn,
 			step: event.data.step,
 			costs,
-			tokens
+			tokens,
+			hourBucketKey: hourBucketKey(hKey, pricing)
 		};
 		lastPricing = pricing;
 		lastHourKey = hKey;
-		const bucket = ensureHour(hKey);
+		const bucket = ensureHour(hKey, pricing);
 		bucket.inputTokens += tokens.input;
 		bucket.cacheReadTokens += tokens.cacheRead;
 		bucket.cacheWriteTokens += tokens.cacheWrite;
@@ -1097,10 +1127,6 @@ function foldSession(events, config = DEFAULT_PRICING) {
 		bucket.cacheWriteCost += costs.cacheWrite;
 		bucket.outputCost += costs.output;
 		bucket.cost = bucket.inputCost + bucket.cacheReadCost + bucket.cacheWriteCost + bucket.outputCost;
-		if (provider !== null) bucket.providers.add(provider);
-		if (model !== null) bucket.models.add(model);
-		bucket.sources.add(pricing.source);
-		if (pricing.periodName) bucket.periodNames.add(pricing.periodName);
 		const detail = ensureDetail(pricing);
 		detail.inputTokens += tokens.input;
 		detail.cacheReadTokens += tokens.cacheRead;
@@ -1114,11 +1140,11 @@ function foldSession(events, config = DEFAULT_PRICING) {
 	}
 	out.cost = out.inputCost + out.cacheReadCost + out.cacheWriteCost + out.outputCost;
 	out.details = [...detailMap.values()];
-	out.hourly = [...hourMap.entries()].map(([hKey, bucket]) => {
+	out.hourly = [...hourMap.values()].map((bucket) => {
 		const totalTokens = bucket.inputTokens + bucket.cacheReadTokens + bucket.cacheWriteTokens + bucket.outputTokens;
 		return {
-			hour: hKey,
-			hourLabel: hourLabel(new Date(hKey).getTime()),
+			hour: bucket.hour,
+			hourLabel: bucket.hourLabel,
 			inputTokens: bucket.inputTokens,
 			cacheReadTokens: bucket.cacheReadTokens,
 			cacheWriteTokens: bucket.cacheWriteTokens,
@@ -1129,12 +1155,12 @@ function foldSession(events, config = DEFAULT_PRICING) {
 			outputCost: bucket.outputCost,
 			cost: bucket.cost,
 			cacheRate: totalTokens > 0 ? (bucket.cacheReadTokens + bucket.cacheWriteTokens) / totalTokens : 0,
-			model: bucket.models.size === 1 ? [...bucket.models][0] : null,
-			provider: bucket.providers.size === 1 ? [...bucket.providers][0] : null,
-			pricingSource: bucket.sources.size === 1 ? [...bucket.sources][0] : null,
-			periodName: bucket.periodNames.size === 1 ? [...bucket.periodNames][0] : null
+			model: bucket.model,
+			provider: bucket.provider,
+			pricingSource: bucket.pricingSource,
+			periodName: bucket.periodName
 		};
-	}).sort((a, b) => a.hour.localeCompare(b.hour));
+	}).sort((a, b) => a.hour.localeCompare(b.hour) || (a.provider ?? "").localeCompare(b.provider ?? "") || (a.model ?? "").localeCompare(b.model ?? ""));
 	return out;
 }
 //#endregion
@@ -1193,4 +1219,4 @@ var CostMeterService = class extends TypertRemoteService {
 	}
 };
 //#endregion
-export { resolvePricing as a, foldSession as i, CostMeterService as n, routeKey as o, DEFAULT_PRICING as r, validatePricing as s, Config as t };
+export { normalizeUsage as a, validatePricing as c, foldSession as i, CostMeterService as n, resolvePricing as o, DEFAULT_PRICING as r, routeKey as s, Config as t };

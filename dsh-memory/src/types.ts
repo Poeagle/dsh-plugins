@@ -58,3 +58,19 @@ export interface MemoryToolResult {
   /** Operator instruction paired with a drift backup. */
   remediation?: string
 }
+
+/** One entry with its creation/update metadata. */
+export interface MemoryEntryMeta {
+  /** The entry content text. */
+  readonly content: string
+  /** ISO-format timestamp of creation or last update. */
+  readonly timestamp: string
+}
+
+/** Configurable memory settings exposed to the settings UI. */
+export interface MemorySettings {
+  /** Completed user turns between background memory reviews; 0 disables reviews. */
+  nudgeInterval: number
+  /** Run background memory reviews after gated completed turns. */
+  reviewEnabled: boolean
+}
