@@ -150,8 +150,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     void store.refreshSnapshot()
   })
 
+  /** Sessions that have already received the memory context injection. */
+  const injected = new Set<SessionId>()
+
   ctx.on('agent/pre-step', async (
-    { agent: _agent, messages, signal: _signal },
+    { agent, messages, signal: _signal },
     next,
   ): Promise<PreStepDecision> => {
     const decision = await next()
@@ -159,12 +162,9 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     if (text === '') return decision
     if (decision.kind !== 'enter') return decision
 
-    // Only inject on the first step of a new session.
-    // Check if memory context is already in the pending batch.
-    const alreadyInjected = decision.messages.some(m =>
-      (m as any).source?.kind === 'plugin' && (m as any).source?.plugin === name,
-    )
-    if (alreadyInjected) return decision
+    // Only inject once per session lifetime.
+    if (injected.has(agent.id)) return decision
+    injected.add(agent.id)
 
     const contextMessage = createUserMessage({
       content: [{ type: 'text', text }],
@@ -258,5 +258,6 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     aborters.delete(session.id)
     reviewing.delete(session.id)
     states.delete(session.id)
+    injected.delete(session.id)
   })
 }

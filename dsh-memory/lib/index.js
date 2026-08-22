@@ -371,12 +371,15 @@ async function apply(ctx, config) {
 	ctx.on("session/created", () => {
 		store.refreshSnapshot();
 	});
-	ctx.on("agent/pre-step", async ({ agent: _agent, messages, signal: _signal }, next) => {
+	/** Sessions that have already received the memory context injection. */
+	const injected = /* @__PURE__ */ new Set();
+	ctx.on("agent/pre-step", async ({ agent, messages, signal: _signal }, next) => {
 		const decision = await next();
 		const text = store.renderContextBlock();
 		if (text === "") return decision;
 		if (decision.kind !== "enter") return decision;
-		if (decision.messages.some((m) => m.source?.kind === "plugin" && m.source?.plugin === "memory")) return decision;
+		if (injected.has(agent.id)) return decision;
+		injected.add(agent.id);
 		const contextMessage = createUserMessage({
 			content: [{
 				type: "text",
@@ -468,6 +471,7 @@ async function apply(ctx, config) {
 		aborters.delete(session.id);
 		reviewing.delete(session.id);
 		states.delete(session.id);
+		injected.delete(session.id);
 	});
 }
 //#endregion
