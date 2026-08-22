@@ -928,7 +928,6 @@ function object(value) {
 function normalizeUsage(raw) {
 	const promptDetails = object(raw.prompt_tokens_details);
 	const inputDetails = object(raw.input_tokens_details);
-	raw.completion_tokens_details;
 	const cacheRead = firstNumber(raw.cacheReadTokens, raw.cache_read_input_tokens, raw.cache_read_tokens, promptDetails.cached_tokens, inputDetails.cached_tokens, raw.prompt_cache_hit_tokens);
 	const cacheWrite = firstNumber(raw.cacheWriteTokens, raw.cache_write_input_tokens, raw.cache_write_tokens, raw.cache_creation_input_tokens, raw.cache_creation_tokens, promptDetails.cache_creation_input_tokens, inputDetails.cache_creation_input_tokens);
 	const canonicalInput = raw.inputTokens;
@@ -960,7 +959,8 @@ function emptyFold(config) {
 		pricingSource: null,
 		pricingPeriod: null,
 		details: [],
-		hourly: []
+		hourly: [],
+		subagents: []
 	};
 }
 function hourKey(time) {
@@ -1016,6 +1016,9 @@ function foldSession(events, config = DEFAULT_PRICING) {
 			bucket = {
 				hour: hKey,
 				hourLabel: hourLabel(new Date(hKey).getTime()),
+				turns: /* @__PURE__ */ new Set(),
+				steps: /* @__PURE__ */ new Set(),
+				toolCalls: 0,
 				model,
 				provider,
 				pricingSource: pricing.source,
@@ -1039,6 +1042,11 @@ function foldSession(events, config = DEFAULT_PRICING) {
 			const call = event.data.header?.config;
 			if (typeof call?.provider === "string") provider = call.provider;
 			if (typeof call?.model === "string") model = call.model;
+			continue;
+		}
+		if (event.type === "tool/call") {
+			const pricing = resolvePricing(config, provider, model, event.time);
+			ensureHour(hourKey(event.time), pricing).toolCalls += 1;
 			continue;
 		}
 		let usage;
@@ -1118,6 +1126,8 @@ function foldSession(events, config = DEFAULT_PRICING) {
 		lastPricing = pricing;
 		lastHourKey = hKey;
 		const bucket = ensureHour(hKey, pricing);
+		if (event.data.turn !== void 0) bucket.turns.add(event.data.turn);
+		if (event.data.turn !== void 0 && event.data.step !== void 0) bucket.steps.add(`${event.data.turn}/${event.data.step}`);
 		bucket.inputTokens += tokens.input;
 		bucket.cacheReadTokens += tokens.cacheRead;
 		bucket.cacheWriteTokens += tokens.cacheWrite;
@@ -1145,6 +1155,9 @@ function foldSession(events, config = DEFAULT_PRICING) {
 		return {
 			hour: bucket.hour,
 			hourLabel: bucket.hourLabel,
+			turns: bucket.turns.size,
+			steps: bucket.steps.size,
+			toolCalls: bucket.toolCalls,
 			inputTokens: bucket.inputTokens,
 			cacheReadTokens: bucket.cacheReadTokens,
 			cacheWriteTokens: bucket.cacheWriteTokens,
@@ -1198,6 +1211,56 @@ const Config = Schema.object({
 	models: Schema.dict(planSchema).default({})
 });
 const SETTINGS_NS = "cost-meter";
+function subagentChildren(records) {
+	const children = /* @__PURE__ */ new Map();
+	for (const record of records) {
+		const parent = record.header.parentSession;
+		if (parent === void 0 || record.header.origin !== "subagent") continue;
+		const ids = children.get(parent);
+		if (ids === void 0) children.set(parent, [record.header.id]);
+		else ids.push(record.header.id);
+	}
+	return children;
+}
+async function readSubagentTree(query, children, sessionId, config, seen) {
+	const ids = children.get(sessionId) ?? [];
+	const rows = [];
+	for (const id of ids) {
+		if (seen.has(id)) continue;
+		seen.add(id);
+		const cost = foldSession((await query.readSession(id)).events, config);
+		rows.push({
+			...cost,
+			sessionId: id,
+			children: await readSubagentTree(query, children, id, config, seen)
+		});
+	}
+	return rows;
+}
+function mergeCostInto(target, cost) {
+	target.cost += cost.cost;
+	target.inputCost += cost.inputCost;
+	target.cacheReadCost += cost.cacheReadCost;
+	target.cacheWriteCost += cost.cacheWriteCost;
+	target.outputCost += cost.outputCost;
+	target.inputTokens += cost.inputTokens;
+	target.cacheReadTokens += cost.cacheReadTokens;
+	target.cacheWriteTokens += cost.cacheWriteTokens;
+	target.outputTokens += cost.outputTokens;
+	target.details.push(...cost.details);
+}
+function mergeCosts(primary, subagents) {
+	const out = structuredClone(primary);
+	out.subagents = structuredClone([...subagents]);
+	const visit = (rows) => {
+		for (const row of rows) {
+			mergeCostInto(out, row);
+			visit(row.children);
+		}
+	};
+	visit(subagents);
+	return out;
+}
 /** Typert Remote service exposing the cumulative cost of one session. */
 var CostMeterService = class extends TypertRemoteService {
 	static Config = Config;
@@ -1205,17 +1268,20 @@ var CostMeterService = class extends TypertRemoteService {
 	constructor(ctx) {
 		super(ctx, "costMeter");
 	}
-	/** Compute the current cumulative cost for one live or persisted session. */
+	/** Compute one session's cost together with every descendant subagent session. */
 	async sessionCost(sessionId) {
 		if (typeof sessionId !== "string" || sessionId.length === 0) return null;
-		let events = this.ctx.get("sessions")?.get(sessionId)?.events;
+		const sessions = this.ctx.get("sessions");
+		const query = this.ctx.get("sessionQuery");
+		let events = sessions?.get(sessionId)?.events;
 		if (events === void 0) {
-			const query = this.ctx.get("sessionQuery");
 			if (query === void 0) return null;
 			events = (await query.readSession(sessionId)).events;
 		}
-		const pricing = this.ctx.settings.get(SETTINGS_NS);
-		return foldSession(events, pricing ?? DEFAULT_PRICING);
+		const config = this.ctx.settings.get(SETTINGS_NS) ?? DEFAULT_PRICING;
+		const cost = foldSession(events, config);
+		if (query === void 0) return cost;
+		return mergeCosts(cost, await readSubagentTree(query, subagentChildren(await query.listSessions()), sessionId, config, /* @__PURE__ */ new Set([sessionId])));
 	}
 };
 //#endregion

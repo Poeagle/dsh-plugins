@@ -203,6 +203,9 @@ export interface CostDetail {
 export interface HourlyDetail {
   hour: string
   hourLabel: string
+  turns: number
+  steps: number
+  toolCalls: number
   inputTokens: number
   cacheReadTokens: number
   cacheWriteTokens: number
@@ -217,6 +220,12 @@ export interface HourlyDetail {
   provider: string | null
   pricingSource: string | null
   periodName: string | null
+}
+
+/** One descendant subagent's own cost and recursive descendants. */
+export interface CostSubagent extends CostFold {
+  sessionId: string
+  children: CostSubagent[]
 }
 
 /** Cumulative session cost estimate resolved against one pricing config. */
@@ -239,6 +248,7 @@ export interface CostFold {
   pricingPeriod: string | null
   details: CostDetail[]
   hourly: HourlyDetail[]
+  subagents: CostSubagent[]
 }
 
 interface FoldSample {
@@ -273,7 +283,6 @@ export function normalizeUsage(raw: Record<string, unknown>): {
 } {
   const promptDetails = object(raw.prompt_tokens_details)
   const inputDetails = object(raw.input_tokens_details)
-  const completionDetails = object(raw.completion_tokens_details)
   const cacheRead = firstNumber(
     raw.cacheReadTokens,
     raw.cache_read_input_tokens,
@@ -327,6 +336,7 @@ function emptyFold(config: PricingConfig): CostFold {
     pricingPeriod: null,
     details: [],
     hourly: [],
+    subagents: [],
   }
 }
 
@@ -345,6 +355,9 @@ function hourLabel(time: number): string {
 interface HourBucket {
   hour: string
   hourLabel: string
+  turns: Set<number>
+  steps: Set<string>
+  toolCalls: number
   model: string | null
   provider: string | null
   pricingSource: string
@@ -405,6 +418,9 @@ export function foldSession(events: readonly CostEvent[], config: PricingConfig 
       bucket = {
         hour: hKey,
         hourLabel: hourLabel(new Date(hKey).getTime()),
+        turns: new Set<number>(),
+        steps: new Set<string>(),
+        toolCalls: 0,
         model,
         provider,
         pricingSource: pricing.source,
@@ -428,6 +444,11 @@ export function foldSession(events: readonly CostEvent[], config: PricingConfig 
       const call = event.data.header?.config
       if (typeof call?.provider === 'string') provider = call.provider
       if (typeof call?.model === 'string') model = call.model
+      continue
+    }
+    if (event.type === 'tool/call') {
+      const pricing = resolvePricing(config, provider, model, event.time)
+      ensureHour(hourKey(event.time), pricing).toolCalls += 1
       continue
     }
     let usage: Record<string, unknown> | undefined
@@ -503,6 +524,8 @@ export function foldSession(events: readonly CostEvent[], config: PricingConfig 
     lastHourKey = hKey
 
     const bucket = ensureHour(hKey, pricing)
+    if (event.data.turn !== undefined) bucket.turns.add(event.data.turn)
+    if (event.data.turn !== undefined && event.data.step !== undefined) bucket.steps.add(`${event.data.turn}/${event.data.step}`)
     bucket.inputTokens += tokens.input
     bucket.cacheReadTokens += tokens.cacheRead
     bucket.cacheWriteTokens += tokens.cacheWrite
@@ -530,6 +553,9 @@ export function foldSession(events: readonly CostEvent[], config: PricingConfig 
     return {
       hour: bucket.hour,
       hourLabel: bucket.hourLabel,
+      turns: bucket.turns.size,
+      steps: bucket.steps.size,
+      toolCalls: bucket.toolCalls,
       inputTokens: bucket.inputTokens,
       cacheReadTokens: bucket.cacheReadTokens,
       cacheWriteTokens: bucket.cacheWriteTokens,

@@ -26,6 +26,12 @@ interface CostFold {
   pricingPeriod?: string | null
   details?: CostDetail[]
   hourly?: HourlyDetail[]
+  subagents?: CostSubagent[]
+}
+
+interface CostSubagent extends CostFold {
+  sessionId: string
+  children: CostSubagent[]
 }
 
 interface CostDetail {
@@ -48,6 +54,9 @@ interface CostDetail {
 interface HourlyDetail {
   hour: string
   hourLabel: string
+  turns: number
+  steps: number
+  toolCalls: number
   inputTokens: number
   cacheReadTokens: number
   cacheWriteTokens: number
@@ -340,6 +349,7 @@ function CostDock(props: { sessionId: string; costMeter: CostMeterFace; interval
   const [state, setState] = React.useState<CostFold | null>(null)
   const [tooltip, setTooltip] = React.useState(false)
   const [showModal, setShowModal] = React.useState(false)
+  const [expandedSubagents, setExpandedSubagents] = React.useState<Set<string>>(() => new Set())
   const tooltipTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null)
   React.useEffect(() => {
     const load = () => {
@@ -365,22 +375,45 @@ function CostDock(props: { sessionId: string; costMeter: CostMeterFace; interval
   }
   const route = state.route ?? '未知模型'
   const pricingInfo = state.pricingPeriod ? `${state.pricingPeriod} · ${state.pricingSource === 'model-period' ? '模型时段价' : state.pricingSource === 'model' ? '模型基准价' : state.pricingSource === 'default-period' ? '默认时段价' : '默认价格'}` : '默认价格'
-  const shownRows = state.hourly ?? []
-  const totalInput = shownRows.reduce((s, r) => s + r.inputTokens, 0)
-  const totalCacheRead = shownRows.reduce((s, r) => s + r.cacheReadTokens, 0)
-  const totalCacheWrite = shownRows.reduce((s, r) => s + r.cacheWriteTokens, 0)
-  const totalOutput = shownRows.reduce((s, r) => s + r.outputTokens, 0)
-  const totalInputCost = shownRows.reduce((s, r) => s + r.inputCost, 0)
-  const totalCacheReadCost = shownRows.reduce((s, r) => s + r.cacheReadCost, 0)
-  const totalCacheWriteCost = shownRows.reduce((s, r) => s + r.cacheWriteCost, 0)
-  const totalOutputCost = shownRows.reduce((s, r) => s + r.outputCost, 0)
-  const totalCost = shownRows.reduce((s, r) => s + r.cost, 0)
+  const totalInput = state.inputTokens
+  const totalCacheRead = state.cacheReadTokens
+  const totalCacheWrite = state.cacheWriteTokens
+  const totalOutput = state.outputTokens
+  const totalInputCost = state.inputCost
+  const totalCacheReadCost = state.cacheReadCost
+  const totalCacheWriteCost = state.cacheWriteCost
+  const totalOutputCost = state.outputCost
+  const totalCost = state.cost
   const totalTokens = totalInput + totalCacheRead + totalCacheWrite + totalOutput
   const totalCacheRate = totalTokens > 0 ? (totalCacheRead + totalCacheWrite) / totalTokens : 0
   const cellBase = { fontSize: 12, padding: '4px 8px', textAlign: 'right' as const, whiteSpace: 'nowrap' as const }
   const cellLeft = { ...cellBase, textAlign: 'left' as const }
   const headerStyle = { ...cellBase, fontWeight: 600, background: 'var(--dsw-alias-bg-layer-3, #f5f5f5)', borderBottom: '1px solid var(--dsw-alias-border-l2, #ddd)', position: 'sticky' as const, top: 0, zIndex: 1 }
   const headerLeft = { ...headerStyle, textAlign: 'left' as const }
+  const toggleSubagent = (id: string) => setExpandedSubagents(previous => {
+    const next = new Set(previous)
+    if (next.has(id)) next.delete(id)
+    else next.add(id)
+    return next
+  })
+  const routeKey = (row: HourlyDetail): string => `${row.provider ?? ''}/${row.model ?? ''}`
+  const childEntries = (rows: readonly CostSubagent[], hour: string, route: string): Array<{ sessionId: string; entry: HourlyDetail }> => rows.flatMap(row => [
+    ...(row.hourly ?? []).filter(entry => entry.hour === hour && routeKey(entry) === route).map(entry => ({ sessionId: row.sessionId, entry })),
+    ...childEntries(row.children, hour, route),
+  ])
+  const sumRows = (rows: readonly HourlyDetail[]): HourlyDetail | null => {
+    const first = rows[0]
+    if (first === undefined) return null
+    const sum = (field: keyof HourlyDetail): number => rows.reduce((total, row) => total + (row[field] as number), 0)
+    const inputTokens = sum('inputTokens')
+    const cacheReadTokens = sum('cacheReadTokens')
+    const cacheWriteTokens = sum('cacheWriteTokens')
+    const outputTokens = sum('outputTokens')
+    return { ...first, turns: sum('turns'), steps: sum('steps'), toolCalls: sum('toolCalls'), inputTokens, cacheReadTokens, cacheWriteTokens, outputTokens, inputCost: sum('inputCost'), cacheReadCost: sum('cacheReadCost'), cacheWriteCost: sum('cacheWriteCost'), outputCost: sum('outputCost'), cost: sum('cost'), cacheRate: (cacheReadTokens + cacheWriteTokens) / Math.max(1, inputTokens + cacheReadTokens + cacheWriteTokens + outputTokens), provider: null, model: null, pricingSource: null, periodName: null }
+  }
+  const dataCells = (row: HourlyDetail): React.ReactNode[] => [
+    React.createElement('td', { style: cellBase }, String(row.turns)), React.createElement('td', { style: cellBase }, String(row.steps)), React.createElement('td', { style: cellBase }, String(row.toolCalls)), React.createElement('td', { style: cellBase }, row.inputTokens.toLocaleString('zh-CN')), React.createElement('td', { style: cellBase }, `${symbol}${money(row.inputCost)}`), React.createElement('td', { style: cellBase }, (row.cacheReadTokens + row.cacheWriteTokens).toLocaleString('zh-CN')), React.createElement('td', { style: cellBase }, `${symbol}${money(row.cacheReadCost + row.cacheWriteCost)}`), React.createElement('td', { style: cellBase }, row.outputTokens.toLocaleString('zh-CN')), React.createElement('td', { style: cellBase }, `${symbol}${money(row.outputCost)}`), React.createElement('td', { style: cellBase }, `${(row.cacheRate * 100).toFixed(1)}%`), React.createElement('td', { style: { ...cellBase, fontWeight: 600 } }, `${symbol}${money(row.cost)}`),
+  ]
   return React.createElement(React.Fragment, null,
     React.createElement('div', {
       style: { position: 'relative', overflow: 'visible', padding: '2px calc(var(--dsh-composer-side-clearance) + 16px) 0', cursor: 'pointer' },
@@ -470,6 +503,9 @@ function CostDock(props: { sessionId: string; costMeter: CostMeterFace; interval
             React.createElement('thead', null,
               React.createElement('tr', null,
                 React.createElement('th', { style: headerLeft }, '时间段'),
+                React.createElement('th', { style: headerStyle }, '轮次'),
+                React.createElement('th', { style: headerStyle }, '步骤'),
+                React.createElement('th', { style: headerStyle }, '工具调用'),
                 React.createElement('th', { style: headerStyle }, '输入 tokens'),
                 React.createElement('th', { style: headerStyle }, '输入价格'),
                 React.createElement('th', { style: headerStyle }, '缓存 tokens'),
@@ -483,24 +519,47 @@ function CostDock(props: { sessionId: string; costMeter: CostMeterFace; interval
               ),
             ),
             React.createElement('tbody', null,
-              ...state.hourly.map((row) => {
-                const sourceLabel = row.periodName ?? (row.pricingSource === 'model-period' ? '模型时段价' : row.pricingSource === 'model' ? '模型基准价' : row.pricingSource === 'default-period' ? '默认时段价' : row.pricingSource === 'default' ? '默认价格' : '-')
-                return React.createElement('tr', { key: `${row.hour}|${row.provider ?? ''}|${row.model ?? ''}|${row.pricingSource ?? ''}|${row.periodName ?? ''}`, style: { borderBottom: '1px solid var(--dsw-alias-border-l2, #eee)' } },
-                  React.createElement('td', { style: cellLeft }, row.hourLabel),
-                  React.createElement('td', { style: cellBase }, row.inputTokens.toLocaleString('zh-CN')),
-                  React.createElement('td', { style: cellBase }, `${symbol}${money(row.inputCost)}`),
-                  React.createElement('td', { style: cellBase }, row.cacheReadTokens.toLocaleString('zh-CN')),
-                  React.createElement('td', { style: cellBase }, `${symbol}${money(row.cacheReadCost + row.cacheWriteCost)}`),
-                  React.createElement('td', { style: cellBase }, row.outputTokens.toLocaleString('zh-CN')),
-                  React.createElement('td', { style: cellBase }, `${symbol}${money(row.outputCost)}`),
-                  React.createElement('td', { style: cellBase }, `${(row.cacheRate * 100).toFixed(1)}%`),
-                  React.createElement('td', { style: { ...cellBase, fontWeight: 600 } }, `${symbol}${money(row.cost)}`),
-                  React.createElement('td', { style: cellBase }, sourceLabel),
-                  React.createElement('td', { style: cellBase }, row.model ?? '-'),
-                )
-              }),
+              ...(() => {
+                const flatten = (rows: readonly CostSubagent[]): Array<{ sessionId: string; entry: HourlyDetail }> => rows.flatMap(row => [
+                  ...(row.hourly ?? []).map(entry => ({ sessionId: row.sessionId, entry })), ...flatten(row.children),
+                ])
+                const childRows = flatten(state.subagents ?? [])
+                const hours = [...new Set([...state.hourly.map(row => row.hour), ...childRows.map(row => row.entry.hour)])].sort()
+                return hours.flatMap(hour => {
+                  const rootRows = (state.hourly ?? []).filter(row => row.hour === hour)
+                  const allRows = [...rootRows, ...childRows.filter(row => row.entry.hour === hour).map(row => row.entry)]
+                  const total = sumRows(allRows)
+                  if (total === null) return []
+                  const timeKey = `time:${hour}`
+                  const timeExpanded = expandedSubagents.has(timeKey)
+                  const routes = [...new Set(allRows.map(routeKey))]
+                  const timeRow = React.createElement('tr', { key: timeKey, style: { borderBottom: '1px solid var(--dsw-alias-border-l2, #eee)', fontWeight: 600 } },
+                    React.createElement('td', { style: cellLeft }, React.createElement('button', { type: 'button', 'aria-expanded': timeExpanded, onClick: () => toggleSubagent(timeKey), style: { border: 0, background: 'transparent', cursor: 'pointer', padding: '0 6px 0 0', fontSize: 13, color: 'inherit' } }, timeExpanded ? '−' : '+'), total.hourLabel),
+                    ...dataCells(total), React.createElement('td', { style: cellBase }, '-'), React.createElement('td', { style: cellBase }, `${routes.length} 个模型`),
+                  )
+                  if (!timeExpanded) return [timeRow]
+                  const models = routes.flatMap(route => {
+                    const entries = allRows.filter(row => routeKey(row) === route)
+                    const modelTotal = sumRows(entries)
+                    if (modelTotal === null) return []
+                    const modelKey = `model:${hour}:${route}`
+                    const modelExpanded = expandedSubagents.has(modelKey)
+                    const children = childRows.filter(row => row.entry.hour === hour && routeKey(row.entry) === route)
+                    const modelRow = React.createElement('tr', { key: modelKey, style: { borderBottom: '1px solid var(--dsw-alias-border-l2, #eee)', background: 'var(--dsw-alias-bg-layer-2, #fafafa)' } },
+                      React.createElement('td', { style: { ...cellLeft, paddingLeft: 28 } }, children.length > 0 ? React.createElement('button', { type: 'button', 'aria-expanded': modelExpanded, onClick: () => toggleSubagent(modelKey), style: { border: 0, background: 'transparent', cursor: 'pointer', padding: '0 6px 0 0', fontSize: 13, color: 'inherit' } }, modelExpanded ? '−' : '+') : React.createElement('span', { style: { display: 'inline-block', width: 19 } }), `↳ ${route}`),
+                      ...dataCells(modelTotal), React.createElement('td', { style: cellBase }, '-'), React.createElement('td', { style: cellBase }, route),
+                    )
+                    if (!modelExpanded) return [modelRow]
+                    return [modelRow, ...children.map(({ sessionId, entry }) => React.createElement('tr', { key: `child:${hour}:${route}:${sessionId}`, style: { borderBottom: '1px solid var(--dsw-alias-border-l2, #eee)', color: 'var(--dsw-alias-label-secondary)' } }, React.createElement('td', { style: { ...cellLeft, paddingLeft: 52 } }, `↳ 子代理 ${sessionId.slice(0, 8)}`), ...dataCells(entry), React.createElement('td', { style: cellBase }, entry.periodName ?? '-'), React.createElement('td', { style: cellBase }, `${entry.provider ?? '?'}/${entry.model ?? '?'}`)))]
+                  })
+                  return [timeRow, ...models]
+                })
+              })(),
               React.createElement('tr', { style: { fontWeight: 600, borderTop: '2px solid var(--dsw-alias-border-l1, #bbb)' } },
                 React.createElement('td', { style: { ...cellLeft, fontWeight: 600 } }, '合计'),
+                React.createElement('td', { style: cellBase }),
+                React.createElement('td', { style: cellBase }),
+                React.createElement('td', { style: cellBase }),
                 React.createElement('td', { style: { ...cellBase, fontWeight: 600 } }, totalInput.toLocaleString('zh-CN')),
                 React.createElement('td', { style: { ...cellBase, fontWeight: 600 } }, `${symbol}${money(totalInputCost)}`),
                 React.createElement('td', { style: { ...cellBase, fontWeight: 600 } }, (totalCacheRead + totalCacheWrite).toLocaleString('zh-CN')),

@@ -10,11 +10,12 @@ import {
   resolvePricing,
   routeKey,
   validatePricing,
+  type CostSubagent,
   type PricingConfig,
 } from './pricing.js'
 
 export { DEFAULT_PRICING, foldSession, normalizeUsage, resolvePricing, routeKey, validatePricing }
-export type { CostDetail, CostFold, HourlyDetail, PartialTokenRates, PricingConfig, PricingPeriod, PricingPlan, TokenRates } from './pricing.js'
+export type { CostDetail, CostFold, CostSubagent, HourlyDetail, PartialTokenRates, PricingConfig, PricingPeriod, PricingPlan, TokenRates } from './pricing.js'
 
 const ratesSchema = z.object({
   input: z.number().min(0),
@@ -65,12 +66,77 @@ interface SessionsFace {
   get(id: string): { events: readonly CostEvent[] } | undefined
 }
 
+interface SessionRecord {
+  header: {
+    id: string
+    parentSession?: string
+    origin?: string
+  }
+}
+
 interface SessionQueryFace {
+  listSessions(): Promise<readonly SessionRecord[]>
   readSession(id: string): Promise<{ events: readonly CostEvent[] }>
 }
 
 interface SettingsReaderFace {
   get(namespace: string): unknown
+}
+
+function subagentChildren(records: readonly SessionRecord[]): Map<string, string[]> {
+  const children = new Map<string, string[]>()
+  for (const record of records) {
+    const parent = record.header.parentSession
+    if (parent === undefined || record.header.origin !== 'subagent') continue
+    const ids = children.get(parent)
+    if (ids === undefined) children.set(parent, [record.header.id])
+    else ids.push(record.header.id)
+  }
+  return children
+}
+
+async function readSubagentTree(
+  query: SessionQueryFace,
+  children: ReadonlyMap<string, readonly string[]>,
+  sessionId: string,
+  config: PricingConfig,
+  seen: Set<string>,
+): Promise<CostSubagent[]> {
+  const ids = children.get(sessionId) ?? []
+  const rows: CostSubagent[] = []
+  for (const id of ids) {
+    if (seen.has(id)) continue
+    seen.add(id)
+    const cost = foldSession((await query.readSession(id)).events, config)
+    rows.push({ ...cost, sessionId: id, children: await readSubagentTree(query, children, id, config, seen) })
+  }
+  return rows
+}
+
+function mergeCostInto(target: ReturnType<typeof foldSession>, cost: ReturnType<typeof foldSession>): void {
+  target.cost += cost.cost
+  target.inputCost += cost.inputCost
+  target.cacheReadCost += cost.cacheReadCost
+  target.cacheWriteCost += cost.cacheWriteCost
+  target.outputCost += cost.outputCost
+  target.inputTokens += cost.inputTokens
+  target.cacheReadTokens += cost.cacheReadTokens
+  target.cacheWriteTokens += cost.cacheWriteTokens
+  target.outputTokens += cost.outputTokens
+  target.details.push(...cost.details)
+}
+
+function mergeCosts(primary: ReturnType<typeof foldSession>, subagents: readonly CostSubagent[]): ReturnType<typeof foldSession> {
+  const out = structuredClone(primary)
+  out.subagents = structuredClone([...subagents])
+  const visit = (rows: readonly CostSubagent[]): void => {
+    for (const row of rows) {
+      mergeCostInto(out, row)
+      visit(row.children)
+    }
+  }
+  visit(subagents)
+  return out
 }
 
 /** Typert Remote service exposing the cumulative cost of one session. */
@@ -82,17 +148,22 @@ export default class CostMeterService extends TypertRemoteService {
     super(ctx, 'costMeter')
   }
 
-  /** Compute the current cumulative cost for one live or persisted session. */
+  /** Compute one session's cost together with every descendant subagent session. */
   async sessionCost(sessionId: string): Promise<ReturnType<typeof foldSession> | null> {
     if (typeof sessionId !== 'string' || sessionId.length === 0) return null
     const sessions = this.ctx.get('sessions') as SessionsFace | undefined
+    const query = this.ctx.get('sessionQuery') as SessionQueryFace | undefined
     let events = sessions?.get(sessionId)?.events
     if (events === undefined) {
-      const query = this.ctx.get('sessionQuery') as SessionQueryFace | undefined
       if (query === undefined) return null
       events = (await query.readSession(sessionId)).events
     }
     const pricing = (this.ctx as Context & { settings: SettingsReaderFace }).settings.get(SETTINGS_NS) as PricingConfig | undefined
-    return foldSession(events, pricing ?? DEFAULT_PRICING)
+    const config = pricing ?? DEFAULT_PRICING
+    const cost = foldSession(events, config)
+    if (query === undefined) return cost
+    const children = subagentChildren(await query.listSessions())
+    const subagents = await readSubagentTree(query, children, sessionId, config, new Set<string>([sessionId]))
+    return mergeCosts(cost, subagents)
   }
 }

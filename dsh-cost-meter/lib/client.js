@@ -711,6 +711,7 @@ window.__ModuleLoader__.load({
 			const [state, setState] = react.default.useState(null);
 			const [tooltip, setTooltip] = react.default.useState(false);
 			const [showModal, setShowModal] = react.default.useState(false);
+			const [expandedSubagents, setExpandedSubagents] = react.default.useState(() => /* @__PURE__ */ new Set());
 			const tooltipTimerRef = react.default.useRef(null);
 			react.default.useEffect(() => {
 				const load = () => {
@@ -744,16 +745,15 @@ window.__ModuleLoader__.load({
 			};
 			const route = state.route ?? "未知模型";
 			const pricingInfo = state.pricingPeriod ? `${state.pricingPeriod} · ${state.pricingSource === "model-period" ? "模型时段价" : state.pricingSource === "model" ? "模型基准价" : state.pricingSource === "default-period" ? "默认时段价" : "默认价格"}` : "默认价格";
-			const shownRows = state.hourly ?? [];
-			const totalInput = shownRows.reduce((s, r) => s + r.inputTokens, 0);
-			const totalCacheRead = shownRows.reduce((s, r) => s + r.cacheReadTokens, 0);
-			const totalCacheWrite = shownRows.reduce((s, r) => s + r.cacheWriteTokens, 0);
-			const totalOutput = shownRows.reduce((s, r) => s + r.outputTokens, 0);
-			const totalInputCost = shownRows.reduce((s, r) => s + r.inputCost, 0);
-			const totalCacheReadCost = shownRows.reduce((s, r) => s + r.cacheReadCost, 0);
-			const totalCacheWriteCost = shownRows.reduce((s, r) => s + r.cacheWriteCost, 0);
-			const totalOutputCost = shownRows.reduce((s, r) => s + r.outputCost, 0);
-			const totalCost = shownRows.reduce((s, r) => s + r.cost, 0);
+			const totalInput = state.inputTokens;
+			const totalCacheRead = state.cacheReadTokens;
+			const totalCacheWrite = state.cacheWriteTokens;
+			const totalOutput = state.outputTokens;
+			const totalInputCost = state.inputCost;
+			const totalCacheReadCost = state.cacheReadCost;
+			const totalCacheWriteCost = state.cacheWriteCost;
+			const totalOutputCost = state.outputCost;
+			const totalCost = state.cost;
 			const totalTokens = totalInput + totalCacheRead + totalCacheWrite + totalOutput;
 			const totalCacheRate = totalTokens > 0 ? (totalCacheRead + totalCacheWrite) / totalTokens : 0;
 			const cellBase = {
@@ -779,6 +779,58 @@ window.__ModuleLoader__.load({
 				...headerStyle,
 				textAlign: "left"
 			};
+			const toggleSubagent = (id) => setExpandedSubagents((previous) => {
+				const next = new Set(previous);
+				if (next.has(id)) next.delete(id);
+				else next.add(id);
+				return next;
+			});
+			const routeKey = (row) => `${row.provider ?? ""}/${row.model ?? ""}`;
+			const sumRows = (rows) => {
+				const first = rows[0];
+				if (first === void 0) return null;
+				const sum = (field) => rows.reduce((total, row) => total + row[field], 0);
+				const inputTokens = sum("inputTokens");
+				const cacheReadTokens = sum("cacheReadTokens");
+				const cacheWriteTokens = sum("cacheWriteTokens");
+				const outputTokens = sum("outputTokens");
+				return {
+					...first,
+					turns: sum("turns"),
+					steps: sum("steps"),
+					toolCalls: sum("toolCalls"),
+					inputTokens,
+					cacheReadTokens,
+					cacheWriteTokens,
+					outputTokens,
+					inputCost: sum("inputCost"),
+					cacheReadCost: sum("cacheReadCost"),
+					cacheWriteCost: sum("cacheWriteCost"),
+					outputCost: sum("outputCost"),
+					cost: sum("cost"),
+					cacheRate: (cacheReadTokens + cacheWriteTokens) / Math.max(1, inputTokens + cacheReadTokens + cacheWriteTokens + outputTokens),
+					provider: null,
+					model: null,
+					pricingSource: null,
+					periodName: null
+				};
+			};
+			const dataCells = (row) => [
+				react.default.createElement("td", { style: cellBase }, String(row.turns)),
+				react.default.createElement("td", { style: cellBase }, String(row.steps)),
+				react.default.createElement("td", { style: cellBase }, String(row.toolCalls)),
+				react.default.createElement("td", { style: cellBase }, row.inputTokens.toLocaleString("zh-CN")),
+				react.default.createElement("td", { style: cellBase }, `${symbol}${money(row.inputCost)}`),
+				react.default.createElement("td", { style: cellBase }, (row.cacheReadTokens + row.cacheWriteTokens).toLocaleString("zh-CN")),
+				react.default.createElement("td", { style: cellBase }, `${symbol}${money(row.cacheReadCost + row.cacheWriteCost)}`),
+				react.default.createElement("td", { style: cellBase }, row.outputTokens.toLocaleString("zh-CN")),
+				react.default.createElement("td", { style: cellBase }, `${symbol}${money(row.outputCost)}`),
+				react.default.createElement("td", { style: cellBase }, `${(row.cacheRate * 100).toFixed(1)}%`),
+				react.default.createElement("td", { style: {
+					...cellBase,
+					fontWeight: 600
+				} }, `${symbol}${money(row.cost)}`)
+			];
 			return react.default.createElement(react.default.Fragment, null, react.default.createElement("div", {
 				style: {
 					position: "relative",
@@ -993,22 +1045,91 @@ window.__ModuleLoader__.load({
 				width: "100%",
 				borderCollapse: "collapse",
 				whiteSpace: "nowrap"
-			} }, react.default.createElement("thead", null, react.default.createElement("tr", null, react.default.createElement("th", { style: headerLeft }, "时间段"), react.default.createElement("th", { style: headerStyle }, "输入 tokens"), react.default.createElement("th", { style: headerStyle }, "输入价格"), react.default.createElement("th", { style: headerStyle }, "缓存 tokens"), react.default.createElement("th", { style: headerStyle }, "缓存价格"), react.default.createElement("th", { style: headerStyle }, "输出 tokens"), react.default.createElement("th", { style: headerStyle }, "输出价格"), react.default.createElement("th", { style: headerStyle }, "缓存率"), react.default.createElement("th", { style: headerStyle }, "总价"), react.default.createElement("th", { style: headerStyle }, "时段名称"), react.default.createElement("th", { style: headerStyle }, "模型"))), react.default.createElement("tbody", null, ...state.hourly.map((row) => {
-				const sourceLabel = row.periodName ?? (row.pricingSource === "model-period" ? "模型时段价" : row.pricingSource === "model" ? "模型基准价" : row.pricingSource === "default-period" ? "默认时段价" : row.pricingSource === "default" ? "默认价格" : "-");
-				return react.default.createElement("tr", {
-					key: `${row.hour}|${row.provider ?? ""}|${row.model ?? ""}|${row.pricingSource ?? ""}|${row.periodName ?? ""}`,
-					style: { borderBottom: "1px solid var(--dsw-alias-border-l2, #eee)" }
-				}, react.default.createElement("td", { style: cellLeft }, row.hourLabel), react.default.createElement("td", { style: cellBase }, row.inputTokens.toLocaleString("zh-CN")), react.default.createElement("td", { style: cellBase }, `${symbol}${money(row.inputCost)}`), react.default.createElement("td", { style: cellBase }, row.cacheReadTokens.toLocaleString("zh-CN")), react.default.createElement("td", { style: cellBase }, `${symbol}${money(row.cacheReadCost + row.cacheWriteCost)}`), react.default.createElement("td", { style: cellBase }, row.outputTokens.toLocaleString("zh-CN")), react.default.createElement("td", { style: cellBase }, `${symbol}${money(row.outputCost)}`), react.default.createElement("td", { style: cellBase }, `${(row.cacheRate * 100).toFixed(1)}%`), react.default.createElement("td", { style: {
-					...cellBase,
-					fontWeight: 600
-				} }, `${symbol}${money(row.cost)}`), react.default.createElement("td", { style: cellBase }, sourceLabel), react.default.createElement("td", { style: cellBase }, row.model ?? "-"));
-			}), react.default.createElement("tr", { style: {
+			} }, react.default.createElement("thead", null, react.default.createElement("tr", null, react.default.createElement("th", { style: headerLeft }, "时间段"), react.default.createElement("th", { style: headerStyle }, "轮次"), react.default.createElement("th", { style: headerStyle }, "步骤"), react.default.createElement("th", { style: headerStyle }, "工具调用"), react.default.createElement("th", { style: headerStyle }, "输入 tokens"), react.default.createElement("th", { style: headerStyle }, "输入价格"), react.default.createElement("th", { style: headerStyle }, "缓存 tokens"), react.default.createElement("th", { style: headerStyle }, "缓存价格"), react.default.createElement("th", { style: headerStyle }, "输出 tokens"), react.default.createElement("th", { style: headerStyle }, "输出价格"), react.default.createElement("th", { style: headerStyle }, "缓存率"), react.default.createElement("th", { style: headerStyle }, "总价"), react.default.createElement("th", { style: headerStyle }, "时段名称"), react.default.createElement("th", { style: headerStyle }, "模型"))), react.default.createElement("tbody", null, ...(() => {
+				const flatten = (rows) => rows.flatMap((row) => [...(row.hourly ?? []).map((entry) => ({
+					sessionId: row.sessionId,
+					entry
+				})), ...flatten(row.children)]);
+				const childRows = flatten(state.subagents ?? []);
+				return [.../* @__PURE__ */ new Set([...state.hourly.map((row) => row.hour), ...childRows.map((row) => row.entry.hour)])].sort().flatMap((hour) => {
+					const allRows = [...(state.hourly ?? []).filter((row) => row.hour === hour), ...childRows.filter((row) => row.entry.hour === hour).map((row) => row.entry)];
+					const total = sumRows(allRows);
+					if (total === null) return [];
+					const timeKey = `time:${hour}`;
+					const timeExpanded = expandedSubagents.has(timeKey);
+					const routes = [...new Set(allRows.map(routeKey))];
+					const timeRow = react.default.createElement("tr", {
+						key: timeKey,
+						style: {
+							borderBottom: "1px solid var(--dsw-alias-border-l2, #eee)",
+							fontWeight: 600
+						}
+					}, react.default.createElement("td", { style: cellLeft }, react.default.createElement("button", {
+						type: "button",
+						"aria-expanded": timeExpanded,
+						onClick: () => toggleSubagent(timeKey),
+						style: {
+							border: 0,
+							background: "transparent",
+							cursor: "pointer",
+							padding: "0 6px 0 0",
+							fontSize: 13,
+							color: "inherit"
+						}
+					}, timeExpanded ? "−" : "+"), total.hourLabel), ...dataCells(total), react.default.createElement("td", { style: cellBase }, "-"), react.default.createElement("td", { style: cellBase }, `${routes.length} 个模型`));
+					if (!timeExpanded) return [timeRow];
+					return [timeRow, ...routes.flatMap((route) => {
+						const entries = allRows.filter((row) => routeKey(row) === route);
+						const modelTotal = sumRows(entries);
+						if (modelTotal === null) return [];
+						const modelKey = `model:${hour}:${route}`;
+						const modelExpanded = expandedSubagents.has(modelKey);
+						const children = childRows.filter((row) => row.entry.hour === hour && routeKey(row.entry) === route);
+						const modelRow = react.default.createElement("tr", {
+							key: modelKey,
+							style: {
+								borderBottom: "1px solid var(--dsw-alias-border-l2, #eee)",
+								background: "var(--dsw-alias-bg-layer-2, #fafafa)"
+							}
+						}, react.default.createElement("td", { style: {
+							...cellLeft,
+							paddingLeft: 28
+						} }, children.length > 0 ? react.default.createElement("button", {
+							type: "button",
+							"aria-expanded": modelExpanded,
+							onClick: () => toggleSubagent(modelKey),
+							style: {
+								border: 0,
+								background: "transparent",
+								cursor: "pointer",
+								padding: "0 6px 0 0",
+								fontSize: 13,
+								color: "inherit"
+							}
+						}, modelExpanded ? "−" : "+") : react.default.createElement("span", { style: {
+							display: "inline-block",
+							width: 19
+						} }), `↳ ${route}`), ...dataCells(modelTotal), react.default.createElement("td", { style: cellBase }, "-"), react.default.createElement("td", { style: cellBase }, route));
+						if (!modelExpanded) return [modelRow];
+						return [modelRow, ...children.map(({ sessionId, entry }) => react.default.createElement("tr", {
+							key: `child:${hour}:${route}:${sessionId}`,
+							style: {
+								borderBottom: "1px solid var(--dsw-alias-border-l2, #eee)",
+								color: "var(--dsw-alias-label-secondary)"
+							}
+						}, react.default.createElement("td", { style: {
+							...cellLeft,
+							paddingLeft: 52
+						} }, `↳ 子代理 ${sessionId.slice(0, 8)}`), ...dataCells(entry), react.default.createElement("td", { style: cellBase }, entry.periodName ?? "-"), react.default.createElement("td", { style: cellBase }, `${entry.provider ?? "?"}/${entry.model ?? "?"}`)))];
+					})];
+				});
+			})(), react.default.createElement("tr", { style: {
 				fontWeight: 600,
 				borderTop: "2px solid var(--dsw-alias-border-l1, #bbb)"
 			} }, react.default.createElement("td", { style: {
 				...cellLeft,
 				fontWeight: 600
-			} }, "合计"), react.default.createElement("td", { style: {
+			} }, "合计"), react.default.createElement("td", { style: cellBase }), react.default.createElement("td", { style: cellBase }), react.default.createElement("td", { style: cellBase }), react.default.createElement("td", { style: {
 				...cellBase,
 				fontWeight: 600
 			} }, totalInput.toLocaleString("zh-CN")), react.default.createElement("td", { style: {
