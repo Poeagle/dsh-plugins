@@ -24,12 +24,15 @@ import type { MemoryStore } from './store.ts'
 
 /** The review directive appended after the replayed conversation. */
 export const MEMORY_REVIEW_PROMPT =
-  'Review the conversation above and consider saving to memory if appropriate.\n\n'
-  + 'Focus on:\n'
-  + '1. Has the user revealed things about themselves — their persona, desires, '
-  + 'preferences, or personal details worth remembering?\n'
-  + '2. Has the user expressed expectations about how you should behave, their work '
-  + 'style, or ways they want you to operate?\n\n'
+  'Review the conversation above and consider saving a durable fact if appropriate.\n\n'
+  + 'Classify every candidate before writing it:\n'
+  + '1. Use target="user" ONLY for stable facts about the person: name, location, age, '
+  + 'identity, education, employer, role, personal preferences, or communication style.\n'
+  + '2. Use target="memory" for project and environment facts: repositories, code conventions, '
+  + 'product details, workflows, tool behavior, technical rules, and instructions about how the '
+  + 'project should be operated.\n'
+  + '3. Project/API debugging facts and implementation requirements MUST use target="memory"; '
+  + 'they do not belong in USER.md. Personal profile facts MUST use target="user".\n\n'
   + 'If something stands out, save it using the memory tool. '
   + "If nothing is worth saving, just say 'Nothing to save.' and stop.\n\n"
   + 'You can only call the memory tool. Other tools will be denied at runtime — '

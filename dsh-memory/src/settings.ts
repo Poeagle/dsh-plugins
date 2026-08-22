@@ -2,8 +2,8 @@
 
 import { readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import z from '@deepseek-ai/schemastery'
 import type { Context } from '@deepseek-ai/cordis'
+import { Config } from './index.ts'
 import { MemoryStore } from './store.ts'
 
 const MEMORY_ROUTE = '/memory/api'
@@ -64,10 +64,7 @@ export function apply(ctx: Context): void {
   // dispatch our card key. The schema exposes the configurable fields.
   const settings = ctx.get('settings') as SettingsFace | undefined
   if (settings !== undefined) {
-    settings.register(SETTINGS_NS, z.object({
-      nudgeInterval: z.number().step(1).min(0).default(10),
-      reviewEnabled: z.boolean().default(true),
-    }), {
+    settings.register(SETTINGS_NS, Config, {
       base: {},
       validate: () => {},
     })

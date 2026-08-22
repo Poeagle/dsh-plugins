@@ -1,5 +1,4 @@
-import { t as MemoryStore } from "./store-BcMNE9sl.js";
-import z from "@deepseek-ai/schemastery";
+import { l as MemoryStore, t as Config } from "./src-CmaoCkCf.js";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 //#region src/settings.ts
@@ -40,10 +39,7 @@ const inject = ["settings"];
 /** Register the settings namespace and memory HTTP route for browser settings management. */
 function apply(ctx) {
 	const settings = ctx.get("settings");
-	if (settings !== void 0) settings.register(SETTINGS_NS, z.object({
-		nudgeInterval: z.number().step(1).min(0).default(10),
-		reviewEnabled: z.boolean().default(true)
-	}), {
+	if (settings !== void 0) settings.register(SETTINGS_NS, Config, {
 		base: {},
 		validate: () => {}
 	});
