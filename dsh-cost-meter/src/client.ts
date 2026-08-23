@@ -3,7 +3,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import React from 'react'
 import type { ContextSurcharge, PricingConfig, PricingPeriod, PricingPlan, TokenRates } from './pricing.js'
-import { DEFAULT_PRICING, routeKey, validatePricing } from './pricing.js'
+import { DEFAULT_PRICING, formatContextSurcharge, routeKey, validatePricing } from './pricing.js'
 import {
   localDateOfHour,
   mapWithConcurrency,
@@ -51,6 +51,7 @@ interface CostDetail {
   model: string | null
   rates: { input: number; cacheRead: number; cacheWrite: number; output: number }
   contextMultiplier?: number
+  contextAfterTokens?: number | null
   inputTokens: number
   cacheReadTokens: number
   cacheWriteTokens: number
@@ -83,6 +84,7 @@ interface HourlyDetail {
   pricingSource: string | null
   periodName: string | null
   contextMultiplier?: number
+  contextAfterTokens?: number | null
 }
 
 interface SessionCostRecord {
@@ -233,6 +235,7 @@ const currencySymbol = (currency: string): string => ({ CNY: '¥', USD: '$', EUR
 const inputStyle: React.CSSProperties = { height: 32, minWidth: 0, border: '1px solid var(--dsw-alias-border-l2)', borderRadius: 6, padding: '0 9px', background: 'var(--dsw-alias-bg-layer-3)', color: 'var(--dsw-alias-label-primary)', font: 'inherit', fontSize: 12 }
 const buttonStyle: React.CSSProperties = { border: '1px solid var(--dsw-alias-border-l2)', borderRadius: 6, padding: '5px 10px', background: 'transparent', color: 'var(--dsw-alias-label-secondary)', font: 'inherit', fontSize: 12, cursor: 'pointer' }
 const primaryButtonStyle: React.CSSProperties = { ...buttonStyle, background: 'var(--dsw-alias-label-primary)', color: 'var(--dsw-alias-bg-layer-3)' }
+const surchargeLabel = (afterTokens: number | null | undefined, multiplier: number | null | undefined): string => formatContextSurcharge(afterTokens, multiplier) ?? '-'
 const RATE_FIELDS: Array<{ key: keyof TokenRates; label: string }> = [
   { key: 'input', label: '未缓存输入' },
   { key: 'cacheRead', label: '缓存读取' },
@@ -509,7 +512,7 @@ function HourlyTable(props: {
         React.createElement('th', { style: props.headerStyle }, '输出价格'),
         React.createElement('th', { style: props.headerStyle }, '缓存率'),
         React.createElement('th', { style: props.headerStyle }, '总价'),
-        React.createElement('th', { style: props.headerStyle }, '倍率'),
+        React.createElement('th', { style: props.headerStyle }, '上下文翻倍'),
         React.createElement('th', { style: props.headerStyle }, '时段名称'),
         React.createElement('th', { style: props.headerStyle }, '模型'),
       ),
@@ -527,7 +530,7 @@ function HourlyTable(props: {
         const timeRow = React.createElement('tr', { key: timeKey, style: { borderBottom: '1px solid var(--dsw-alias-border-l2, #eee)', fontWeight: 600 } },
           React.createElement('td', { style: props.cellLeft }, React.createElement('button', { type: 'button', 'aria-expanded': timeExpanded, onClick: () => props.toggleHour(timeKey), style: { border: 0, background: 'transparent', cursor: 'pointer', padding: '0 6px 0 0', fontSize: 13, color: 'inherit' } }, timeExpanded ? '−' : '+'), total.hourLabel),
           ...dataCells(total),
-          React.createElement('td', { style: props.cellBase }, '-'),
+          React.createElement('td', { style: props.cellBase }, surchargeLabel(hourRows.length === 1 ? hourRows[0]?.contextAfterTokens : null, hourRows.length === 1 ? hourRows[0]?.contextMultiplier : undefined)),
           React.createElement('td', { style: props.cellBase }, '-'),
           React.createElement('td', { style: props.cellBase }, `${routes.length} 个模型`),
         )
@@ -542,7 +545,7 @@ function HourlyTable(props: {
           const modelRow = React.createElement('tr', { key: modelKey, style: { borderBottom: '1px solid var(--dsw-alias-border-l2, #eee)', background: 'var(--dsw-alias-bg-layer-2, #fafafa)' } },
             React.createElement('td', { style: { ...props.cellLeft, paddingLeft: 28 } }, children.length > 0 ? React.createElement('button', { type: 'button', 'aria-expanded': modelExpanded, onClick: () => props.toggleHour(modelKey), style: { border: 0, background: 'transparent', cursor: 'pointer', padding: '0 6px 0 0', fontSize: 13, color: 'inherit' } }, modelExpanded ? '−' : '+') : React.createElement('span', { style: { display: 'inline-block', width: 19 } }), `↳ ${route}`),
             ...dataCells(modelTotal),
-            React.createElement('td', { style: props.cellBase }, '-'),
+            React.createElement('td', { style: props.cellBase }, surchargeLabel(entries.length === 1 ? entries[0]?.contextAfterTokens : null, entries.length === 1 ? entries[0]?.contextMultiplier : undefined)),
             React.createElement('td', { style: props.cellBase }, '-'),
             React.createElement('td', { style: props.cellBase }, route),
           )
@@ -550,7 +553,7 @@ function HourlyTable(props: {
           return [modelRow, ...children.map(({ sessionId, entry }) => React.createElement('tr', { key: `${props.sessionId}:child:${hour}:${route}:${sessionId}`, style: { borderBottom: '1px solid var(--dsw-alias-border-l2, #eee)', color: 'var(--dsw-alias-label-secondary)' } },
             React.createElement('td', { style: { ...props.cellLeft, paddingLeft: 52 } }, `↳ 子代理 ${sessionId.slice(0, 8)}`),
             ...dataCells(entry),
-            React.createElement('td', { style: props.cellBase }, entry.contextMultiplier && entry.contextMultiplier !== 1 ? `×${entry.contextMultiplier}` : '-'),
+            React.createElement('td', { style: props.cellBase }, surchargeLabel(entry.contextAfterTokens, entry.contextMultiplier)),
             React.createElement('td', { style: props.cellBase }, entry.periodName ?? '-'),
             React.createElement('td', { style: props.cellBase }, `${entry.provider ?? '?'}/${entry.model ?? '?'}`),
           ))]
@@ -692,7 +695,7 @@ function CostDock(props: { sessionId: string; costMeter: CostMeterFace; sessions
           return [
             di > 0 ? React.createElement('div', { key: `sep-${di}`, style: { borderTop: '1px solid var(--dsw-alias-border-l2, #333)', margin: '2px 0' } }) : null,
             React.createElement('div', { key: `hdr-${di}`, style: { fontWeight: 600, fontSize: 12, marginTop: di > 0 ? 2 : 0 } },
-              `${ds.provider ?? '?'}/${ds.model ?? '?'} · ${sourceLabel}${ds.periodName ? ` · ${ds.periodName}` : ''}${ds.contextMultiplier && ds.contextMultiplier !== 1 ? ` · ×${ds.contextMultiplier}` : ''}`,
+              `${ds.provider ?? '?'}/${ds.model ?? '?'} · ${sourceLabel}${ds.periodName ? ` · ${ds.periodName}` : ''}${formatContextSurcharge(ds.contextAfterTokens, ds.contextMultiplier) ? ` · ${formatContextSurcharge(ds.contextAfterTokens, ds.contextMultiplier)}` : ''}`,
             ),
             React.createElement('div', { key: `rates-${di}`, style: { display: 'grid', gridTemplateColumns: 'auto auto auto auto', gap: '0 14px', fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } },
               React.createElement('span', {}, `输入 ${rateSymbol(ds.rates.input)}/M`),
@@ -788,7 +791,7 @@ function CostDock(props: { sessionId: string; costMeter: CostMeterFace; sessions
                   React.createElement('th', { style: headerStyle }, '输出价格'),
                   React.createElement('th', { style: headerStyle }, '缓存率'),
                   React.createElement('th', { style: headerStyle }, '总价'),
-                  React.createElement('th', { style: headerStyle }, '倍率'),
+                  React.createElement('th', { style: headerStyle }, '上下文翻倍'),
                   React.createElement('th', { style: headerStyle }, '时段名称'),
                   React.createElement('th', { style: headerStyle }, '模型'),
                 ),
@@ -801,7 +804,7 @@ function CostDock(props: { sessionId: string; costMeter: CostMeterFace; sessions
                   const timeRow = React.createElement('tr', { key: timeKey, style: { borderBottom: '1px solid var(--dsw-alias-border-l2, #eee)', fontWeight: 600 } },
                     React.createElement('td', { style: cellLeft }, React.createElement('button', { type: 'button', 'aria-expanded': expanded, onClick: () => toggleHour(timeKey), style: { border: 0, background: 'transparent', cursor: 'pointer', padding: '0 6px 0 0', fontSize: 13, color: 'inherit' } }, expanded ? '−' : '+'), `${localDateOfHour(group.hour)} ${group.hourLabel}`),
                     ...hourlyDataCells(group.totals),
-                    React.createElement('td', { style: cellBase }, '-'),
+                    React.createElement('td', { style: cellBase }, surchargeLabel(group.sessions.length === 1 ? group.sessions[0]?.entry.contextAfterTokens : null, group.sessions.length === 1 ? group.sessions[0]?.entry.contextMultiplier : undefined)),
                     React.createElement('td', { style: cellBase }, `${group.sessions.length} 个会话`),
                     React.createElement('td', { style: cellBase }, routes.length === 0 ? '-' : `${routes.length} 个模型`),
                   )
@@ -809,7 +812,7 @@ function CostDock(props: { sessionId: string; costMeter: CostMeterFace; sessions
                   return [timeRow, ...group.sessions.map(item => React.createElement('tr', { key: `${timeKey}:${item.sessionId}:${item.entry.provider ?? ''}/${item.entry.model ?? ''}`, style: { borderBottom: '1px solid var(--dsw-alias-border-l2, #eee)', background: 'var(--dsw-alias-bg-layer-2, #fafafa)' } },
                     React.createElement('td', { style: { ...cellLeft, paddingLeft: 28 }, title: item.sessionId }, `↳ ${compactId(item.sessionId)}${item.origin ? ` · ${item.origin}` : ''}`),
                     ...hourlyDataCells(item.entry),
-                    React.createElement('td', { style: cellBase }, item.entry.contextMultiplier && item.entry.contextMultiplier !== 1 ? `×${item.entry.contextMultiplier}` : '-'),
+                    React.createElement('td', { style: cellBase }, surchargeLabel(item.entry.contextAfterTokens, item.entry.contextMultiplier)),
                     React.createElement('td', { style: cellBase }, item.entry.periodName ?? '-'),
                     React.createElement('td', { style: cellBase }, item.entry.provider && item.entry.model ? `${item.entry.provider}/${item.entry.model}` : '-'),
                   ))]
@@ -826,6 +829,10 @@ function CostDock(props: { sessionId: string; costMeter: CostMeterFace; sessions
           ),
         ) : React.createElement('section', { style: { display: 'flex', flexDirection: 'column', gap: 10 } },
           React.createElement('h3', { style: { margin: 0, fontSize: 13, fontWeight: 600 } }, '当前会话'),
+          React.createElement('p', { style: { margin: 0, fontSize: 12, color: 'var(--dsw-alias-label-tertiary)' } }, (() => {
+            const labels = [...new Set([...(state.details ?? []), ...(state.hourly ?? [])].map(row => formatContextSurcharge(row.contextAfterTokens, row.contextMultiplier)).filter((value): value is string => Boolean(value)))]
+            return labels.length === 0 ? '本会话没有触发上下文翻倍。' : `本会话命中：${labels.join('、')}`
+          })()),
           React.createElement('div', { style: { overflowX: 'auto', fontSize: 12 } },
             React.createElement(HourlyTable, {
               sessionId: props.sessionId,

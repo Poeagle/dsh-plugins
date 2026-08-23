@@ -47,7 +47,7 @@ cost-meter:
 
 The UI lists every model in the live `llm.models` catalog. A model without an override uses default pricing. Each rate resolves independently in this order: matching model period, model base rate, matching default period, default base rate. Periods use the configured IANA time zone, may cross midnight, and must not overlap within one plan.
 
-`contextSurcharges` apply after the base rates. A request whose prompt-side context (`input + cacheRead + cacheWrite`) is greater than `afterTokens` multiplies that request's entire cost, including output, by `multiplier`. Among matching tiers the highest threshold wins. A model list, including an empty list, replaces the default list instead of merging with it. Output tokens do not count toward the threshold.
+`contextSurcharges` apply after the base rates. A request whose prompt-side context (`input + cacheRead + cacheWrite`) is greater than `afterTokens` multiplies that request's entire cost, including output, by `multiplier`. Among matching tiers the highest threshold wins. A model list, including an empty list, replaces the default list instead of merging with it. Output tokens do not count toward the threshold. The composer tooltip and session-detail table show the matched rule as `超过 200K ×2`.
 
 ## Accounting
 

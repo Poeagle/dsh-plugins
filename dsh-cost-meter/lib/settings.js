@@ -1,4 +1,4 @@
-import { E as validatePricing, t as Config } from "./src-BAczlAiI.js";
+import { O as validatePricing, t as Config } from "./src-gXeNI2pj.js";
 //#region src/settings.ts
 const SETTINGS_NS = "cost-meter";
 const ROUTE_PATH = "/cost-meter/pricing";

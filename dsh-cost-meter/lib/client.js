@@ -58,6 +58,22 @@ window.__ModuleLoader__.load({
 			const [hour, minute] = value.split(":").map(Number);
 			return hour * 60 + minute;
 		}
+		/** Compact a token threshold for UI labels, e.g. 200000 → `200K`. */
+		function formatTokenThreshold(tokens) {
+			if (Number.isSafeInteger(tokens) && tokens >= 1e6 && tokens % 1e6 === 0) return `${tokens / 1e6}M`;
+			if (Number.isSafeInteger(tokens) && tokens >= 1e3 && tokens % 1e3 === 0) return `${tokens / 1e3}K`;
+			return tokens.toLocaleString("zh-CN");
+		}
+		/**
+		* @param afterTokens Threshold that triggered the surcharge, or null when none applied.
+		* @param multiplier Request-wide cost multiplier.
+		* @returns A label such as `超过 200K ×2`, or null when the request is uncharged.
+		*/
+		function formatContextSurcharge(afterTokens, multiplier) {
+			if (multiplier === void 0 || multiplier === null || multiplier === 1) return null;
+			if (afterTokens === void 0 || afterTokens === null) return `×${multiplier}`;
+			return `超过 ${formatTokenThreshold(afterTokens)} ×${multiplier}`;
+		}
 		function assertRates(rates, path, complete) {
 			for (const key of RATE_KEYS) {
 				const value = rates[key];
@@ -214,7 +230,8 @@ window.__ModuleLoader__.load({
 				model: value.model ?? null,
 				provider: value.provider ?? null,
 				periodName: value.periodName ?? null,
-				contextMultiplier: value.contextMultiplier
+				contextMultiplier: value.contextMultiplier,
+				contextAfterTokens: value.contextAfterTokens ?? null
 			};
 		}
 		/** Flatten each session's own hourly buckets; parent rows do not include child sessions. */
@@ -463,6 +480,7 @@ window.__ModuleLoader__.load({
 			background: "var(--dsw-alias-label-primary)",
 			color: "var(--dsw-alias-bg-layer-3)"
 		};
+		const surchargeLabel = (afterTokens, multiplier) => formatContextSurcharge(afterTokens, multiplier) ?? "-";
 		const RATE_FIELDS = [
 			{
 				key: "input",
@@ -1049,7 +1067,7 @@ window.__ModuleLoader__.load({
 				borderCollapse: "collapse",
 				whiteSpace: "nowrap",
 				marginTop: 8
-			} }, react.default.createElement("thead", null, react.default.createElement("tr", null, react.default.createElement("th", { style: props.headerLeft }, "时间段"), react.default.createElement("th", { style: props.headerStyle }, "轮次"), react.default.createElement("th", { style: props.headerStyle }, "步骤"), react.default.createElement("th", { style: props.headerStyle }, "工具调用"), react.default.createElement("th", { style: props.headerStyle }, "输入 tokens"), react.default.createElement("th", { style: props.headerStyle }, "输入价格"), react.default.createElement("th", { style: props.headerStyle }, "缓存 tokens"), react.default.createElement("th", { style: props.headerStyle }, "缓存价格"), react.default.createElement("th", { style: props.headerStyle }, "输出 tokens"), react.default.createElement("th", { style: props.headerStyle }, "输出价格"), react.default.createElement("th", { style: props.headerStyle }, "缓存率"), react.default.createElement("th", { style: props.headerStyle }, "总价"), react.default.createElement("th", { style: props.headerStyle }, "倍率"), react.default.createElement("th", { style: props.headerStyle }, "时段名称"), react.default.createElement("th", { style: props.headerStyle }, "模型"))), react.default.createElement("tbody", null, ...hours.flatMap((hour) => {
+			} }, react.default.createElement("thead", null, react.default.createElement("tr", null, react.default.createElement("th", { style: props.headerLeft }, "时间段"), react.default.createElement("th", { style: props.headerStyle }, "轮次"), react.default.createElement("th", { style: props.headerStyle }, "步骤"), react.default.createElement("th", { style: props.headerStyle }, "工具调用"), react.default.createElement("th", { style: props.headerStyle }, "输入 tokens"), react.default.createElement("th", { style: props.headerStyle }, "输入价格"), react.default.createElement("th", { style: props.headerStyle }, "缓存 tokens"), react.default.createElement("th", { style: props.headerStyle }, "缓存价格"), react.default.createElement("th", { style: props.headerStyle }, "输出 tokens"), react.default.createElement("th", { style: props.headerStyle }, "输出价格"), react.default.createElement("th", { style: props.headerStyle }, "缓存率"), react.default.createElement("th", { style: props.headerStyle }, "总价"), react.default.createElement("th", { style: props.headerStyle }, "上下文翻倍"), react.default.createElement("th", { style: props.headerStyle }, "时段名称"), react.default.createElement("th", { style: props.headerStyle }, "模型"))), react.default.createElement("tbody", null, ...hours.flatMap((hour) => {
 				const rootRows = props.hourly.filter((row) => row.hour === hour);
 				const hourChildren = childRows.filter((row) => row.entry.hour === hour);
 				const hourRows = [...rootRows, ...hourChildren.map((row) => row.entry)];
@@ -1076,7 +1094,7 @@ window.__ModuleLoader__.load({
 						fontSize: 13,
 						color: "inherit"
 					}
-				}, timeExpanded ? "−" : "+"), total.hourLabel), ...dataCells(total), react.default.createElement("td", { style: props.cellBase }, "-"), react.default.createElement("td", { style: props.cellBase }, "-"), react.default.createElement("td", { style: props.cellBase }, `${routes.length} 个模型`));
+				}, timeExpanded ? "−" : "+"), total.hourLabel), ...dataCells(total), react.default.createElement("td", { style: props.cellBase }, surchargeLabel(hourRows.length === 1 ? hourRows[0]?.contextAfterTokens : null, hourRows.length === 1 ? hourRows[0]?.contextMultiplier : void 0)), react.default.createElement("td", { style: props.cellBase }, "-"), react.default.createElement("td", { style: props.cellBase }, `${routes.length} 个模型`));
 				if (!timeExpanded) return [timeRow];
 				return [timeRow, ...routes.flatMap((route) => {
 					const entries = hourRows.filter((row) => routeOf(row) === route);
@@ -1109,7 +1127,7 @@ window.__ModuleLoader__.load({
 					}, modelExpanded ? "−" : "+") : react.default.createElement("span", { style: {
 						display: "inline-block",
 						width: 19
-					} }), `↳ ${route}`), ...dataCells(modelTotal), react.default.createElement("td", { style: props.cellBase }, "-"), react.default.createElement("td", { style: props.cellBase }, "-"), react.default.createElement("td", { style: props.cellBase }, route));
+					} }), `↳ ${route}`), ...dataCells(modelTotal), react.default.createElement("td", { style: props.cellBase }, surchargeLabel(entries.length === 1 ? entries[0]?.contextAfterTokens : null, entries.length === 1 ? entries[0]?.contextMultiplier : void 0)), react.default.createElement("td", { style: props.cellBase }, "-"), react.default.createElement("td", { style: props.cellBase }, route));
 					if (!modelExpanded) return [modelRow];
 					return [modelRow, ...children.map(({ sessionId, entry }) => react.default.createElement("tr", {
 						key: `${props.sessionId}:child:${hour}:${route}:${sessionId}`,
@@ -1120,7 +1138,7 @@ window.__ModuleLoader__.load({
 					}, react.default.createElement("td", { style: {
 						...props.cellLeft,
 						paddingLeft: 52
-					} }, `↳ 子代理 ${sessionId.slice(0, 8)}`), ...dataCells(entry), react.default.createElement("td", { style: props.cellBase }, entry.contextMultiplier && entry.contextMultiplier !== 1 ? `×${entry.contextMultiplier}` : "-"), react.default.createElement("td", { style: props.cellBase }, entry.periodName ?? "-"), react.default.createElement("td", { style: props.cellBase }, `${entry.provider ?? "?"}/${entry.model ?? "?"}`)))];
+					} }, `↳ 子代理 ${sessionId.slice(0, 8)}`), ...dataCells(entry), react.default.createElement("td", { style: props.cellBase }, surchargeLabel(entry.contextAfterTokens, entry.contextMultiplier)), react.default.createElement("td", { style: props.cellBase }, entry.periodName ?? "-"), react.default.createElement("td", { style: props.cellBase }, `${entry.provider ?? "?"}/${entry.model ?? "?"}`)))];
 				})];
 			}), totals ? react.default.createElement("tr", { style: {
 				fontWeight: 600,
@@ -1337,7 +1355,7 @@ window.__ModuleLoader__.load({
 							fontSize: 12,
 							marginTop: di > 0 ? 2 : 0
 						}
-					}, `${ds.provider ?? "?"}/${ds.model ?? "?"} · ${sourceLabel}${ds.periodName ? ` · ${ds.periodName}` : ""}${ds.contextMultiplier && ds.contextMultiplier !== 1 ? ` · ×${ds.contextMultiplier}` : ""}`),
+					}, `${ds.provider ?? "?"}/${ds.model ?? "?"} · ${sourceLabel}${ds.periodName ? ` · ${ds.periodName}` : ""}${formatContextSurcharge(ds.contextAfterTokens, ds.contextMultiplier) ? ` · ${formatContextSurcharge(ds.contextAfterTokens, ds.contextMultiplier)}` : ""}`),
 					react.default.createElement("div", {
 						key: `rates-${di}`,
 						style: {
@@ -1573,7 +1591,7 @@ window.__ModuleLoader__.load({
 				width: "100%",
 				borderCollapse: "collapse",
 				whiteSpace: "nowrap"
-			} }, react.default.createElement("thead", null, react.default.createElement("tr", null, react.default.createElement("th", { style: headerLeft }, "时间段"), react.default.createElement("th", { style: headerStyle }, "轮次"), react.default.createElement("th", { style: headerStyle }, "步骤"), react.default.createElement("th", { style: headerStyle }, "工具调用"), react.default.createElement("th", { style: headerStyle }, "输入 tokens"), react.default.createElement("th", { style: headerStyle }, "输入价格"), react.default.createElement("th", { style: headerStyle }, "缓存 tokens"), react.default.createElement("th", { style: headerStyle }, "缓存价格"), react.default.createElement("th", { style: headerStyle }, "输出 tokens"), react.default.createElement("th", { style: headerStyle }, "输出价格"), react.default.createElement("th", { style: headerStyle }, "缓存率"), react.default.createElement("th", { style: headerStyle }, "总价"), react.default.createElement("th", { style: headerStyle }, "倍率"), react.default.createElement("th", { style: headerStyle }, "时段名称"), react.default.createElement("th", { style: headerStyle }, "模型"))), react.default.createElement("tbody", null, ...hourGroups.flatMap((group) => {
+			} }, react.default.createElement("thead", null, react.default.createElement("tr", null, react.default.createElement("th", { style: headerLeft }, "时间段"), react.default.createElement("th", { style: headerStyle }, "轮次"), react.default.createElement("th", { style: headerStyle }, "步骤"), react.default.createElement("th", { style: headerStyle }, "工具调用"), react.default.createElement("th", { style: headerStyle }, "输入 tokens"), react.default.createElement("th", { style: headerStyle }, "输入价格"), react.default.createElement("th", { style: headerStyle }, "缓存 tokens"), react.default.createElement("th", { style: headerStyle }, "缓存价格"), react.default.createElement("th", { style: headerStyle }, "输出 tokens"), react.default.createElement("th", { style: headerStyle }, "输出价格"), react.default.createElement("th", { style: headerStyle }, "缓存率"), react.default.createElement("th", { style: headerStyle }, "总价"), react.default.createElement("th", { style: headerStyle }, "上下文翻倍"), react.default.createElement("th", { style: headerStyle }, "时段名称"), react.default.createElement("th", { style: headerStyle }, "模型"))), react.default.createElement("tbody", null, ...hourGroups.flatMap((group) => {
 				const timeKey = `all:time:${group.hour}`;
 				const expanded = expandedHours.has(timeKey);
 				const routes = [...new Set(group.sessions.map((item) => `${item.entry.provider ?? ""}/${item.entry.model ?? ""}`).filter((value) => value !== "/"))];
@@ -1595,7 +1613,7 @@ window.__ModuleLoader__.load({
 						fontSize: 13,
 						color: "inherit"
 					}
-				}, expanded ? "−" : "+"), `${localDateOfHour(group.hour)} ${group.hourLabel}`), ...hourlyDataCells(group.totals), react.default.createElement("td", { style: cellBase }, "-"), react.default.createElement("td", { style: cellBase }, `${group.sessions.length} 个会话`), react.default.createElement("td", { style: cellBase }, routes.length === 0 ? "-" : `${routes.length} 个模型`));
+				}, expanded ? "−" : "+"), `${localDateOfHour(group.hour)} ${group.hourLabel}`), ...hourlyDataCells(group.totals), react.default.createElement("td", { style: cellBase }, surchargeLabel(group.sessions.length === 1 ? group.sessions[0]?.entry.contextAfterTokens : null, group.sessions.length === 1 ? group.sessions[0]?.entry.contextMultiplier : void 0)), react.default.createElement("td", { style: cellBase }, `${group.sessions.length} 个会话`), react.default.createElement("td", { style: cellBase }, routes.length === 0 ? "-" : `${routes.length} 个模型`));
 				if (!expanded) return [timeRow];
 				return [timeRow, ...group.sessions.map((item) => react.default.createElement("tr", {
 					key: `${timeKey}:${item.sessionId}:${item.entry.provider ?? ""}/${item.entry.model ?? ""}`,
@@ -1609,7 +1627,7 @@ window.__ModuleLoader__.load({
 						paddingLeft: 28
 					},
 					title: item.sessionId
-				}, `↳ ${compactId(item.sessionId)}${item.origin ? ` · ${item.origin}` : ""}`), ...hourlyDataCells(item.entry), react.default.createElement("td", { style: cellBase }, item.entry.contextMultiplier && item.entry.contextMultiplier !== 1 ? `×${item.entry.contextMultiplier}` : "-"), react.default.createElement("td", { style: cellBase }, item.entry.periodName ?? "-"), react.default.createElement("td", { style: cellBase }, item.entry.provider && item.entry.model ? `${item.entry.provider}/${item.entry.model}` : "-")))];
+				}, `↳ ${compactId(item.sessionId)}${item.origin ? ` · ${item.origin}` : ""}`), ...hourlyDataCells(item.entry), react.default.createElement("td", { style: cellBase }, surchargeLabel(item.entry.contextAfterTokens, item.entry.contextMultiplier)), react.default.createElement("td", { style: cellBase }, item.entry.periodName ?? "-"), react.default.createElement("td", { style: cellBase }, item.entry.provider && item.entry.model ? `${item.entry.provider}/${item.entry.model}` : "-")))];
 			}), hourGroups.length > 0 ? react.default.createElement("tr", { style: {
 				fontWeight: 600,
 				borderTop: "2px solid var(--dsw-alias-border-l1, #bbb)"
@@ -1624,7 +1642,14 @@ window.__ModuleLoader__.load({
 				margin: 0,
 				fontSize: 13,
 				fontWeight: 600
-			} }, "当前会话"), react.default.createElement("div", { style: {
+			} }, "当前会话"), react.default.createElement("p", { style: {
+				margin: 0,
+				fontSize: 12,
+				color: "var(--dsw-alias-label-tertiary)"
+			} }, (() => {
+				const labels = [...new Set([...state.details ?? [], ...state.hourly ?? []].map((row) => formatContextSurcharge(row.contextAfterTokens, row.contextMultiplier)).filter((value) => Boolean(value)))];
+				return labels.length === 0 ? "本会话没有触发上下文翻倍。" : `本会话命中：${labels.join("、")}`;
+			})()), react.default.createElement("div", { style: {
 				overflowX: "auto",
 				fontSize: 12
 			} }, react.default.createElement(HourlyTable, {

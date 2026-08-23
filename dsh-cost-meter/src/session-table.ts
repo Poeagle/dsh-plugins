@@ -20,6 +20,7 @@ export interface HourlySlice {
   provider: string | null
   periodName: string | null
   contextMultiplier?: number
+  contextAfterTokens?: number | null
 }
 
 export interface SessionTableCost {
@@ -266,6 +267,7 @@ function asHourlySlice(value: Partial<HourlySlice> & { provider: string | null; 
     provider: value.provider ?? null,
     periodName: value.periodName ?? null,
     contextMultiplier: value.contextMultiplier,
+    contextAfterTokens: value.contextAfterTokens ?? null,
   }
 }
 

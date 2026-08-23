@@ -170,6 +170,24 @@ export function resolveContextMultiplier(
   return resolveContextSurcharge(config, provider, model, contextTokens)?.multiplier ?? 1
 }
 
+/** Compact a token threshold for UI labels, e.g. 200000 → `200K`. */
+export function formatTokenThreshold(tokens: number): string {
+  if (Number.isSafeInteger(tokens) && tokens >= 1_000_000 && tokens % 1_000_000 === 0) return `${tokens / 1_000_000}M`
+  if (Number.isSafeInteger(tokens) && tokens >= 1_000 && tokens % 1_000 === 0) return `${tokens / 1_000}K`
+  return tokens.toLocaleString('zh-CN')
+}
+
+/**
+ * @param afterTokens Threshold that triggered the surcharge, or null when none applied.
+ * @param multiplier Request-wide cost multiplier.
+ * @returns A label such as `超过 200K ×2`, or null when the request is uncharged.
+ */
+export function formatContextSurcharge(afterTokens: number | null | undefined, multiplier: number | null | undefined): string | null {
+  if (multiplier === undefined || multiplier === null || multiplier === 1) return null
+  if (afterTokens === undefined || afterTokens === null) return `×${multiplier}`
+  return `超过 ${formatTokenThreshold(afterTokens)} ×${multiplier}`
+}
+
 function assertRates(rates: PartialTokenRates, path: string, complete: boolean): void {
   for (const key of RATE_KEYS) {
     const value = rates[key]
@@ -268,6 +286,7 @@ export interface CostDetail {
   model: string | null
   rates: TokenRates
   contextMultiplier: number
+  contextAfterTokens: number | null
   inputTokens: number
   cacheReadTokens: number
   cacheWriteTokens: number
@@ -301,6 +320,7 @@ export interface HourlyDetail {
   pricingSource: string | null
   periodName: string | null
   contextMultiplier: number
+  contextAfterTokens: number | null
 }
 
 /** One descendant subagent's own cost and recursive descendants. */
@@ -339,6 +359,7 @@ interface FoldSample {
   tokens: { input: number; cacheRead: number; cacheWrite: number; output: number }
   hourBucketKey: string
   contextMultiplier: number
+  contextAfterTokens: number | null
 }
 
 function num(value: unknown): number {
@@ -445,6 +466,7 @@ interface HourBucket {
   pricingSource: string
   periodName: string | null
   contextMultiplier: number
+  contextAfterTokens: number | null
   inputTokens: number
   cacheReadTokens: number
   cacheWriteTokens: number
@@ -465,10 +487,10 @@ export function foldSession(events: readonly CostEvent[], config: PricingConfig 
   let lastPricing: ResolvedPricing | null = null
   let lastHourKey: string | null = null
   const detailMap = new Map<string, CostDetail>()
-  const detailKey = (p: string | null, m: string | null, s: string, pn: string | null, multiplier: number): string =>
-    `${p ?? ''}|${m ?? ''}|${s}|${pn ?? ''}|${multiplier}`
-  const ensureDetail = (pricing: ResolvedPricing, multiplier: number): CostDetail => {
-    const key = detailKey(provider, model, pricing.source, pricing.periodName ?? null, multiplier)
+  const detailKey = (p: string | null, m: string | null, s: string, pn: string | null, multiplier: number, afterTokens: number | null): string =>
+    `${p ?? ''}|${m ?? ''}|${s}|${pn ?? ''}|${multiplier}|${afterTokens ?? ''}`
+  const ensureDetail = (pricing: ResolvedPricing, multiplier: number, afterTokens: number | null): CostDetail => {
+    const key = detailKey(provider, model, pricing.source, pricing.periodName ?? null, multiplier, afterTokens)
     let detail = detailMap.get(key)
     if (detail === undefined) {
       detail = {
@@ -478,6 +500,7 @@ export function foldSession(events: readonly CostEvent[], config: PricingConfig 
         model,
         rates: { ...pricing.rates },
         contextMultiplier: multiplier,
+        contextAfterTokens: afterTokens,
         inputTokens: 0,
         cacheReadTokens: 0,
         cacheWriteTokens: 0,
@@ -493,10 +516,10 @@ export function foldSession(events: readonly CostEvent[], config: PricingConfig 
     return detail
   }
   const hourMap = new Map<string, HourBucket>()
-  const hourBucketKey = (hKey: string, pricing: ResolvedPricing, multiplier: number): string =>
-    `${hKey}|${provider ?? ''}|${model ?? ''}|${pricing.source}|${pricing.periodName ?? ''}|${multiplier}`
-  const ensureHour = (hKey: string, pricing: ResolvedPricing, multiplier: number): HourBucket => {
-    const key = hourBucketKey(hKey, pricing, multiplier)
+  const hourBucketKey = (hKey: string, pricing: ResolvedPricing, multiplier: number, afterTokens: number | null): string =>
+    `${hKey}|${provider ?? ''}|${model ?? ''}|${pricing.source}|${pricing.periodName ?? ''}|${multiplier}|${afterTokens ?? ''}`
+  const ensureHour = (hKey: string, pricing: ResolvedPricing, multiplier: number, afterTokens: number | null): HourBucket => {
+    const key = hourBucketKey(hKey, pricing, multiplier, afterTokens)
     let bucket = hourMap.get(key)
     if (bucket === undefined) {
       bucket = {
@@ -510,6 +533,7 @@ export function foldSession(events: readonly CostEvent[], config: PricingConfig 
         pricingSource: pricing.source,
         periodName: pricing.periodName ?? null,
         contextMultiplier: multiplier,
+        contextAfterTokens: afterTokens,
         inputTokens: 0,
         cacheReadTokens: 0,
         cacheWriteTokens: 0,
@@ -533,7 +557,7 @@ export function foldSession(events: readonly CostEvent[], config: PricingConfig 
     }
     if (event.type === 'tool/call') {
       const pricing = resolvePricing(config, provider, model, event.time)
-      ensureHour(hourKey(event.time), pricing, 1).toolCalls += 1
+      ensureHour(hourKey(event.time), pricing, 1, null).toolCalls += 1
       continue
     }
     let usage: Record<string, unknown> | undefined
@@ -550,7 +574,9 @@ export function foldSession(events: readonly CostEvent[], config: PricingConfig 
       cacheWrite: normalized.cacheWriteTokens,
       output: normalized.outputTokens,
     }
-    const contextMultiplier = resolveContextMultiplier(config, provider, model, contextTokensOf(tokens))
+    const surcharge = resolveContextSurcharge(config, provider, model, contextTokensOf(tokens))
+    const contextMultiplier = surcharge?.multiplier ?? 1
+    const contextAfterTokens = surcharge?.afterTokens ?? null
     const costs = {
       input: tokens.input * pricing.rates.input / config.unitTokens * contextMultiplier,
       cacheRead: tokens.cacheRead * pricing.rates.cacheRead / config.unitTokens * contextMultiplier,
@@ -568,7 +594,7 @@ export function foldSession(events: readonly CostEvent[], config: PricingConfig 
       out.cacheWriteTokens -= last.tokens.cacheWrite
       out.outputTokens -= last.tokens.output
       if (lastPricing !== null) {
-        const prevDetail = ensureDetail(lastPricing, last.contextMultiplier)
+        const prevDetail = ensureDetail(lastPricing, last.contextMultiplier, last.contextAfterTokens)
         prevDetail.inputTokens -= last.tokens.input
         prevDetail.cacheReadTokens -= last.tokens.cacheRead
         prevDetail.cacheWriteTokens -= last.tokens.cacheWrite
@@ -580,7 +606,7 @@ export function foldSession(events: readonly CostEvent[], config: PricingConfig 
         prevDetail.cost = prevDetail.inputCost + prevDetail.cacheReadCost + prevDetail.cacheWriteCost + prevDetail.outputCost
       }
       if (lastHourKey !== null) {
-        const prevBucket = ensureHour(lastHourKey, lastPricing ?? pricing, last.contextMultiplier)
+        const prevBucket = ensureHour(lastHourKey, lastPricing ?? pricing, last.contextMultiplier, last.contextAfterTokens)
         prevBucket.inputTokens -= last.tokens.input
         prevBucket.cacheReadTokens -= last.tokens.cacheRead
         prevBucket.cacheWriteTokens -= last.tokens.cacheWrite
@@ -605,11 +631,11 @@ export function foldSession(events: readonly CostEvent[], config: PricingConfig 
     out.route = routeKey(provider, model)
     out.pricingSource = pricing.source
     out.pricingPeriod = pricing.periodName ?? null
-    last = { turn: event.data.turn, step: event.data.step, costs, tokens, hourBucketKey: hourBucketKey(hKey, pricing, contextMultiplier), contextMultiplier }
+    last = { turn: event.data.turn, step: event.data.step, costs, tokens, hourBucketKey: hourBucketKey(hKey, pricing, contextMultiplier, contextAfterTokens), contextMultiplier, contextAfterTokens }
     lastPricing = pricing
     lastHourKey = hKey
 
-    const bucket = ensureHour(hKey, pricing, contextMultiplier)
+    const bucket = ensureHour(hKey, pricing, contextMultiplier, contextAfterTokens)
     if (event.data.turn !== undefined) bucket.turns.add(event.data.turn)
     if (event.data.turn !== undefined && event.data.step !== undefined) bucket.steps.add(`${event.data.turn}/${event.data.step}`)
     bucket.inputTokens += tokens.input
@@ -621,7 +647,7 @@ export function foldSession(events: readonly CostEvent[], config: PricingConfig 
     bucket.cacheWriteCost += costs.cacheWrite
     bucket.outputCost += costs.output
     bucket.cost = bucket.inputCost + bucket.cacheReadCost + bucket.cacheWriteCost + bucket.outputCost
-    const detail = ensureDetail(pricing, contextMultiplier)
+    const detail = ensureDetail(pricing, contextMultiplier, contextAfterTokens)
     detail.inputTokens += tokens.input
     detail.cacheReadTokens += tokens.cacheRead
     detail.cacheWriteTokens += tokens.cacheWrite
@@ -660,6 +686,7 @@ export function foldSession(events: readonly CostEvent[], config: PricingConfig 
       pricingSource: bucket.pricingSource,
       periodName: bucket.periodName,
       contextMultiplier: bucket.contextMultiplier,
+      contextAfterTokens: bucket.contextAfterTokens,
     }]
   }).sort((a, b) => a.hour.localeCompare(b.hour) || (a.provider ?? '').localeCompare(b.provider ?? '') || (a.model ?? '').localeCompare(b.model ?? '') || a.contextMultiplier - b.contextMultiplier)
   return out

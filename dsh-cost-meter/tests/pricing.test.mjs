@@ -4,6 +4,8 @@ import {
   DEFAULT_PRICING,
   contextTokensOf,
   foldSession,
+  formatContextSurcharge,
+  formatTokenThreshold,
   normalizeUsage,
   resolveContextMultiplier,
   resolvePricing,
@@ -124,8 +126,14 @@ test('context surcharge multiplies the whole request after the threshold', () =>
   assert.equal(above.cost, above.inputCost + above.cacheReadCost + above.outputCost)
   assert.equal(above.cost, costOf(aboveTokens, 2))
   assert.equal(above.details[0].contextMultiplier, 2)
+  assert.equal(above.details[0].contextAfterTokens, 200_000)
   assert.equal(above.hourly[0].contextMultiplier, 2)
+  assert.equal(above.hourly[0].contextAfterTokens, 200_000)
   assert.equal(below.details[0].contextMultiplier, 1)
+  assert.equal(below.details[0].contextAfterTokens, null)
+  assert.equal(formatTokenThreshold(200_000), '200K')
+  assert.equal(formatContextSurcharge(200_000, 2), '超过 200K ×2')
+  assert.equal(formatContextSurcharge(null, 1), null)
 })
 
 test('context surcharge uses the highest matching threshold and model lists replace default', () => {

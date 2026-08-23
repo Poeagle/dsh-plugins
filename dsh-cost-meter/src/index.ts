@@ -7,6 +7,8 @@ import {
   DEFAULT_PRICING,
   contextTokensOf,
   foldSession,
+  formatContextSurcharge,
+  formatTokenThreshold,
   normalizeUsage,
   resolveContextMultiplier,
   resolveContextSurcharge,
@@ -17,7 +19,7 @@ import {
   type PricingConfig,
 } from './pricing.js'
 
-export { DEFAULT_PRICING, contextTokensOf, foldSession, normalizeUsage, resolveContextMultiplier, resolveContextSurcharge, resolvePricing, routeKey, validatePricing }
+export { DEFAULT_PRICING, contextTokensOf, foldSession, formatContextSurcharge, formatTokenThreshold, normalizeUsage, resolveContextMultiplier, resolveContextSurcharge, resolvePricing, routeKey, validatePricing }
 export {
   filterHourlyEntries,
   filterSessionRows,
