@@ -31,7 +31,7 @@ const TYPERT = {
 	package: PKG,
 	face: "host",
 	schemas: [],
-	invocations: [inv("sessionCost", [strParam("sessionCost", "sessionId")])],
+	invocations: [inv("sessionCost", [strParam("sessionCost", "sessionId")]), inv("sessionCosts", [])],
 	model: {
 		services: [],
 		events: [],

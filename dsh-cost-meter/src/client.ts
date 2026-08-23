@@ -4,6 +4,15 @@ import type { Context } from '@deepseek-ai/cordis'
 import React from 'react'
 import type { PricingConfig, PricingPeriod, PricingPlan, TokenRates } from './pricing.js'
 import { DEFAULT_PRICING, routeKey, validatePricing } from './pricing.js'
+import {
+  querySessionRows,
+  sessionRoutes,
+  sessionTotalTokens,
+  toggleSessionTableSort,
+  type SessionTableFilter,
+  type SessionTableSort,
+  type SessionTableSortKey,
+} from './session-table.js'
 
 export const inject = ['slots', 'remote', 'timer', 'connection']
 
@@ -73,9 +82,18 @@ interface HourlyDetail {
   periodName: string | null
 }
 
+interface SessionCostRecord {
+  sessionId: string
+  parentSession: string | null
+  origin: string | null
+  cost: CostFold
+}
 interface RemoteEnvelope<T> { ok: boolean; value?: T; error?: unknown }
 interface RemoteMount { $mount(contribution: unknown): Promise<() => Promise<void>> }
-interface CostMeterFace { sessionCost(sessionId: string): Promise<RemoteEnvelope<CostFold | null>> }
+interface CostMeterFace {
+  sessionCost(sessionId: string): Promise<RemoteEnvelope<CostFold | null>>
+  sessionCosts(): Promise<RemoteEnvelope<SessionCostRecord[]>>
+}
 interface SlotsFace {
   inject(name: string, fn: () => unknown): void
   register(spec: Record<string, unknown>, component: React.ComponentType<any>): unknown
@@ -342,11 +360,135 @@ function PricingSettingsCard(props: {
   )
 }
 
+const EMPTY_SESSION_FILTER: SessionTableFilter = { sessionId: '', origin: '', parentSession: '', route: '' }
+const DEFAULT_SESSION_SORT: SessionTableSort = { key: 'cost', dir: 'desc' }
+
+function HourlyTable(props: {
+  sessionId: string
+  hourly: readonly HourlyDetail[]
+  expandedHours: ReadonlySet<string>
+  toggleHour(id: string): void
+  symbol: string
+  cellBase: React.CSSProperties
+  cellLeft: React.CSSProperties
+  headerStyle: React.CSSProperties
+  headerLeft: React.CSSProperties
+}) {
+  const routeOf = (row: HourlyDetail): string => `${row.provider ?? ''}/${row.model ?? ''}`
+  const sumRows = (rows: readonly HourlyDetail[]): HourlyDetail | null => {
+    const first = rows[0]
+    if (first === undefined) return null
+    const sum = (field: keyof HourlyDetail): number => rows.reduce((total, row) => total + (row[field] as number), 0)
+    const inputTokens = sum('inputTokens')
+    const cacheReadTokens = sum('cacheReadTokens')
+    const cacheWriteTokens = sum('cacheWriteTokens')
+    const outputTokens = sum('outputTokens')
+    return {
+      ...first,
+      turns: sum('turns'),
+      steps: sum('steps'),
+      toolCalls: sum('toolCalls'),
+      inputTokens,
+      cacheReadTokens,
+      cacheWriteTokens,
+      outputTokens,
+      inputCost: sum('inputCost'),
+      cacheReadCost: sum('cacheReadCost'),
+      cacheWriteCost: sum('cacheWriteCost'),
+      outputCost: sum('outputCost'),
+      cost: sum('cost'),
+      cacheRate: (cacheReadTokens + cacheWriteTokens) / Math.max(1, inputTokens + cacheReadTokens + cacheWriteTokens + outputTokens),
+      provider: null,
+      model: null,
+      pricingSource: null,
+      periodName: null,
+    }
+  }
+  const dataCells = (row: HourlyDetail): React.ReactNode[] => [
+    React.createElement('td', { style: props.cellBase }, String(row.turns)),
+    React.createElement('td', { style: props.cellBase }, String(row.steps)),
+    React.createElement('td', { style: props.cellBase }, String(row.toolCalls)),
+    React.createElement('td', { style: props.cellBase }, row.inputTokens.toLocaleString('zh-CN')),
+    React.createElement('td', { style: props.cellBase }, `${props.symbol}${money(row.inputCost)}`),
+    React.createElement('td', { style: props.cellBase }, (row.cacheReadTokens + row.cacheWriteTokens).toLocaleString('zh-CN')),
+    React.createElement('td', { style: props.cellBase }, `${props.symbol}${money(row.cacheReadCost + row.cacheWriteCost)}`),
+    React.createElement('td', { style: props.cellBase }, row.outputTokens.toLocaleString('zh-CN')),
+    React.createElement('td', { style: props.cellBase }, `${props.symbol}${money(row.outputCost)}`),
+    React.createElement('td', { style: props.cellBase }, `${(row.cacheRate * 100).toFixed(1)}%`),
+    React.createElement('td', { style: { ...props.cellBase, fontWeight: 600 } }, `${props.symbol}${money(row.cost)}`),
+  ]
+  const hours = [...new Set(props.hourly.map(row => row.hour))].sort()
+  const totals = sumRows(props.hourly)
+  return React.createElement('table', { style: { width: '100%', borderCollapse: 'collapse', whiteSpace: 'nowrap', marginTop: 8 } },
+    React.createElement('thead', null,
+      React.createElement('tr', null,
+        React.createElement('th', { style: props.headerLeft }, '时间段'),
+        React.createElement('th', { style: props.headerStyle }, '轮次'),
+        React.createElement('th', { style: props.headerStyle }, '步骤'),
+        React.createElement('th', { style: props.headerStyle }, '工具调用'),
+        React.createElement('th', { style: props.headerStyle }, '输入 tokens'),
+        React.createElement('th', { style: props.headerStyle }, '输入价格'),
+        React.createElement('th', { style: props.headerStyle }, '缓存 tokens'),
+        React.createElement('th', { style: props.headerStyle }, '缓存价格'),
+        React.createElement('th', { style: props.headerStyle }, '输出 tokens'),
+        React.createElement('th', { style: props.headerStyle }, '输出价格'),
+        React.createElement('th', { style: props.headerStyle }, '缓存率'),
+        React.createElement('th', { style: props.headerStyle }, '总价'),
+        React.createElement('th', { style: props.headerStyle }, '时段名称'),
+        React.createElement('th', { style: props.headerStyle }, '模型'),
+      ),
+    ),
+    React.createElement('tbody', null,
+      ...hours.flatMap(hour => {
+        const hourRows = props.hourly.filter(row => row.hour === hour)
+        const total = sumRows(hourRows)
+        if (total === null) return []
+        const timeKey = `${props.sessionId}:time:${hour}`
+        const timeExpanded = props.expandedHours.has(timeKey)
+        const routes = [...new Set(hourRows.map(routeOf))]
+        const timeRow = React.createElement('tr', { key: timeKey, style: { borderBottom: '1px solid var(--dsw-alias-border-l2, #eee)', fontWeight: 600 } },
+          React.createElement('td', { style: props.cellLeft }, React.createElement('button', { type: 'button', 'aria-expanded': timeExpanded, onClick: () => props.toggleHour(timeKey), style: { border: 0, background: 'transparent', cursor: 'pointer', padding: '0 6px 0 0', fontSize: 13, color: 'inherit' } }, timeExpanded ? '−' : '+'), total.hourLabel),
+          ...dataCells(total),
+          React.createElement('td', { style: props.cellBase }, '-'),
+          React.createElement('td', { style: props.cellBase }, `${routes.length} 个模型`),
+        )
+        if (!timeExpanded) return [timeRow]
+        return [timeRow, ...routes.flatMap(route => {
+          const entries = hourRows.filter(row => routeOf(row) === route)
+          const modelTotal = sumRows(entries)
+          if (modelTotal === null) return []
+          const modelKey = `${props.sessionId}:model:${hour}:${route}`
+          return [React.createElement('tr', { key: modelKey, style: { borderBottom: '1px solid var(--dsw-alias-border-l2, #eee)', background: 'var(--dsw-alias-bg-layer-2, #fafafa)' } },
+            React.createElement('td', { style: { ...props.cellLeft, paddingLeft: 28 } }, `↳ ${route}`),
+            ...dataCells(modelTotal),
+            React.createElement('td', { style: props.cellBase }, entries[0]?.periodName ?? '-'),
+            React.createElement('td', { style: props.cellBase }, route),
+          )]
+        })]
+      }),
+      totals ? React.createElement('tr', { style: { fontWeight: 600, borderTop: '2px solid var(--dsw-alias-border-l1, #bbb)' } },
+        React.createElement('td', { style: { ...props.cellLeft, fontWeight: 600 } }, '合计'),
+        ...dataCells(totals),
+        React.createElement('td', { style: props.cellBase }),
+        React.createElement('td', { style: props.cellBase }),
+      ) : React.createElement('tr', null,
+        React.createElement('td', { style: { ...props.cellLeft, color: 'var(--dsw-alias-label-tertiary)' }, colSpan: 14 }, '该会话暂无按时段明细'),
+      ),
+    ),
+  )
+}
+
 function CostDock(props: { sessionId: string; costMeter: CostMeterFace; interval(callback: () => void, delay: number): () => void }) {
   const [state, setState] = React.useState<CostFold | null>(null)
   const [tooltip, setTooltip] = React.useState(false)
   const [showModal, setShowModal] = React.useState(false)
-  const [expandedSubagents, setExpandedSubagents] = React.useState<Set<string>>(() => new Set())
+  const [sessionRows, setSessionRows] = React.useState<SessionCostRecord[]>([])
+  const [sessionLoadError, setSessionLoadError] = React.useState<string | null>(null)
+  const [sessionLoading, setSessionLoading] = React.useState(false)
+  const [expandedSessions, setExpandedSessions] = React.useState<Set<string>>(() => new Set())
+  const [expandedHours, setExpandedHours] = React.useState<Set<string>>(() => new Set())
+  const [sessionFilter, setSessionFilter] = React.useState<SessionTableFilter>(EMPTY_SESSION_FILTER)
+  const [sessionSort, setSessionSort] = React.useState<SessionTableSort>(DEFAULT_SESSION_SORT)
   const tooltipTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null)
   React.useEffect(() => {
     const load = () => {
@@ -359,6 +501,27 @@ function CostDock(props: { sessionId: string; costMeter: CostMeterFace; interval
     return props.interval(load, 2000)
   }, [props.sessionId])
   React.useEffect(() => () => { if (tooltipTimerRef.current) clearTimeout(tooltipTimerRef.current) }, [])
+  const loadSessionCosts = () => {
+    setSessionLoading(true)
+    setSessionLoadError(null)
+    props.costMeter.sessionCosts().then(response => {
+      if (response.ok && Array.isArray(response.value)) {
+        setSessionRows(response.value)
+        setSessionLoadError(null)
+      } else {
+        setSessionLoadError('会话费用加载失败')
+      }
+    }).catch(() => {
+      setSessionLoadError('会话费用加载失败')
+    }).finally(() => {
+      setSessionLoading(false)
+    })
+  }
+  const openModal = () => {
+    setShowModal(true)
+    setTooltip(false)
+    loadSessionCosts()
+  }
   if (!state || !(state.cost > 0)) return null
   const symbol = currencySymbol(state.currency)
   const parts = [`API费用 ≈${symbol}${money(state.cost)}`, `输入 ${symbol}${money(state.inputCost)}`, `缓存读 ${symbol}${money(state.cacheReadCost)}`, `缓存写 ${symbol}${money(state.cacheWriteCost)}`, `输出 ${symbol}${money(state.outputCost)}`]
@@ -372,51 +535,46 @@ function CostDock(props: { sessionId: string; costMeter: CostMeterFace; interval
   }
   const route = state.route ?? '未知模型'
   const pricingInfo = state.pricingPeriod ? `${state.pricingPeriod} · ${state.pricingSource === 'model-period' ? '模型时段价' : state.pricingSource === 'model' ? '模型基准价' : state.pricingSource === 'default-period' ? '默认时段价' : '默认价格'}` : '默认价格'
-  const totalInput = state.inputTokens
-  const totalCacheRead = state.cacheReadTokens
-  const totalCacheWrite = state.cacheWriteTokens
-  const totalOutput = state.outputTokens
-  const totalInputCost = state.inputCost
-  const totalCacheReadCost = state.cacheReadCost
-  const totalCacheWriteCost = state.cacheWriteCost
-  const totalOutputCost = state.outputCost
-  const totalCost = state.cost
-  const totalTokens = totalInput + totalCacheRead + totalCacheWrite + totalOutput
-  const totalCacheRate = totalTokens > 0 ? (totalCacheRead + totalCacheWrite) / totalTokens : 0
   const cellBase = { fontSize: 12, padding: '4px 8px', textAlign: 'right' as const, whiteSpace: 'nowrap' as const }
   const cellLeft = { ...cellBase, textAlign: 'left' as const }
   const headerStyle = { ...cellBase, fontWeight: 600, background: 'var(--dsw-alias-bg-layer-3, #f5f5f5)', borderBottom: '1px solid var(--dsw-alias-border-l2, #ddd)', position: 'sticky' as const, top: 0, zIndex: 1 }
   const headerLeft = { ...headerStyle, textAlign: 'left' as const }
-  const toggleSubagent = (id: string) => setExpandedSubagents(previous => {
+  const toggleExpanded = (store: React.Dispatch<React.SetStateAction<Set<string>>>, id: string) => store(previous => {
     const next = new Set(previous)
     if (next.has(id)) next.delete(id)
     else next.add(id)
     return next
   })
-  const routeKey = (row: HourlyDetail): string => `${row.provider ?? ''}/${row.model ?? ''}`
-  const childEntries = (rows: readonly CostSubagent[], hour: string, route: string): Array<{ sessionId: string; entry: HourlyDetail }> => rows.flatMap(row => [
-    ...(row.hourly ?? []).filter(entry => entry.hour === hour && routeKey(entry) === route).map(entry => ({ sessionId: row.sessionId, entry })),
-    ...childEntries(row.children, hour, route),
-  ])
-  const sumRows = (rows: readonly HourlyDetail[]): HourlyDetail | null => {
-    const first = rows[0]
-    if (first === undefined) return null
-    const sum = (field: keyof HourlyDetail): number => rows.reduce((total, row) => total + (row[field] as number), 0)
-    const inputTokens = sum('inputTokens')
-    const cacheReadTokens = sum('cacheReadTokens')
-    const cacheWriteTokens = sum('cacheWriteTokens')
-    const outputTokens = sum('outputTokens')
-    return { ...first, turns: sum('turns'), steps: sum('steps'), toolCalls: sum('toolCalls'), inputTokens, cacheReadTokens, cacheWriteTokens, outputTokens, inputCost: sum('inputCost'), cacheReadCost: sum('cacheReadCost'), cacheWriteCost: sum('cacheWriteCost'), outputCost: sum('outputCost'), cost: sum('cost'), cacheRate: (cacheReadTokens + cacheWriteTokens) / Math.max(1, inputTokens + cacheReadTokens + cacheWriteTokens + outputTokens), provider: null, model: null, pricingSource: null, periodName: null }
-  }
-  const dataCells = (row: HourlyDetail): React.ReactNode[] => [
-    React.createElement('td', { style: cellBase }, String(row.turns)), React.createElement('td', { style: cellBase }, String(row.steps)), React.createElement('td', { style: cellBase }, String(row.toolCalls)), React.createElement('td', { style: cellBase }, row.inputTokens.toLocaleString('zh-CN')), React.createElement('td', { style: cellBase }, `${symbol}${money(row.inputCost)}`), React.createElement('td', { style: cellBase }, (row.cacheReadTokens + row.cacheWriteTokens).toLocaleString('zh-CN')), React.createElement('td', { style: cellBase }, `${symbol}${money(row.cacheReadCost + row.cacheWriteCost)}`), React.createElement('td', { style: cellBase }, row.outputTokens.toLocaleString('zh-CN')), React.createElement('td', { style: cellBase }, `${symbol}${money(row.outputCost)}`), React.createElement('td', { style: cellBase }, `${(row.cacheRate * 100).toFixed(1)}%`), React.createElement('td', { style: { ...cellBase, fontWeight: 600 } }, `${symbol}${money(row.cost)}`),
-  ]
+  const toggleHour = (id: string) => toggleExpanded(setExpandedHours, id)
+  const toggleSession = (id: string) => toggleExpanded(setExpandedSessions, id)
+  const originOptions = [...new Set(sessionRows.map(row => row.origin).filter((value): value is string => Boolean(value)))].sort()
+  const routeOptions = [...new Set(sessionRows.flatMap(row => sessionRoutes(row)))].sort()
+  const visibleRows = querySessionRows(sessionRows, sessionFilter, sessionSort)
+  const parseBound = (value: string): number | undefined => value === '' ? undefined : Number(value)
+  const sortMark = (key: SessionTableSortKey): string => sessionSort.key === key ? (sessionSort.dir === 'asc' ? ' ↑' : ' ↓') : ''
+  const sortHeader = (key: SessionTableSortKey, label: string, align: 'left' | 'right' = 'right') => React.createElement('th', {
+    style: { ...(align === 'left' ? headerLeft : headerStyle), cursor: 'pointer', userSelect: 'none' },
+    'aria-sort': sessionSort.key === key ? (sessionSort.dir === 'asc' ? 'ascending' : 'descending') : 'none',
+    onClick: () => setSessionSort(current => toggleSessionTableSort(current, key)),
+  }, `${label}${sortMark(key)}`)
+  const compactId = (value: string | null): string => value ? (value.length > 12 ? `${value.slice(0, 8)}…` : value) : '-'
+  const filterInput = (value: string, placeholder: string, onChange: (next: string) => void) => React.createElement('input', {
+    style: { ...inputStyle, height: 28, fontSize: 11 },
+    value,
+    placeholder,
+    onChange: (event: React.ChangeEvent<HTMLInputElement>) => onChange(event.target.value),
+  })
+  const filterSelect = (value: string, options: readonly string[], onChange: (next: string) => void) => React.createElement('select', {
+    style: { ...inputStyle, height: 28, fontSize: 11 },
+    value,
+    onChange: (event: React.ChangeEvent<HTMLSelectElement>) => onChange(event.target.value),
+  }, React.createElement('option', { value: '' }, '全部'), ...options.map(option => React.createElement('option', { key: option, value: option }, option)))
   return React.createElement(React.Fragment, null,
     React.createElement('div', {
       style: { position: 'relative', overflow: 'visible', padding: '2px calc(var(--dsh-composer-side-clearance) + 16px) 0', cursor: 'pointer' },
       onMouseEnter: showTooltip,
       onMouseLeave: hideTooltip,
-      onClick: () => { setShowModal(true); setTooltip(false) },
+      onClick: openModal,
     },
       React.createElement('div', {
         style: { textAlign: 'center', boxSizing: 'border-box', color: 'var(--dsw-alias-label-tertiary)', whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden', fontSize: 12, lineHeight: '20px' },
@@ -483,90 +641,82 @@ function CostDock(props: { sessionId: string; costMeter: CostMeterFace; interval
         ),
       ) : null,
     ),
-    showModal && state.hourly && state.hourly.length > 0 ? React.createElement('div', {
+    showModal && state ? React.createElement('div', {
       style: { position: 'fixed', inset: 0, zIndex: 9999, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 },
       onClick: () => setShowModal(false),
     },
       React.createElement('div', {
-        style: { background: 'var(--dsw-alias-bg-layer-1, #fff)', borderRadius: 12, padding: 24, maxWidth: '90vw', maxHeight: '80vh', overflow: 'auto', boxShadow: '0 8px 32px rgba(0,0,0,0.3)', display: 'flex', flexDirection: 'column', gap: 16 },
+        style: { background: 'var(--dsw-alias-bg-layer-1, #fff)', borderRadius: 12, padding: 24, maxWidth: '94vw', maxHeight: '86vh', overflow: 'auto', boxShadow: '0 8px 32px rgba(0,0,0,0.3)', display: 'flex', flexDirection: 'column', gap: 16 },
         onClick: (e: React.MouseEvent) => e.stopPropagation(),
       },
         React.createElement('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center' } },
           React.createElement('h2', { style: { margin: 0, fontSize: 18, fontWeight: 600 } }, 'API 费用统计明细'),
           React.createElement('button', { style: { background: 'none', border: 'none', color: 'inherit', fontSize: 20, cursor: 'pointer', padding: '4px 8px', borderRadius: 4 }, onClick: () => setShowModal(false) }, '✕'),
         ),
-        React.createElement('div', { style: { overflowX: 'auto', fontSize: 12 } },
-          React.createElement('table', { style: { width: '100%', borderCollapse: 'collapse', whiteSpace: 'nowrap' } },
-            React.createElement('thead', null,
-              React.createElement('tr', null,
-                React.createElement('th', { style: headerLeft }, '时间段'),
-                React.createElement('th', { style: headerStyle }, '轮次'),
-                React.createElement('th', { style: headerStyle }, '步骤'),
-                React.createElement('th', { style: headerStyle }, '工具调用'),
-                React.createElement('th', { style: headerStyle }, '输入 tokens'),
-                React.createElement('th', { style: headerStyle }, '输入价格'),
-                React.createElement('th', { style: headerStyle }, '缓存 tokens'),
-                React.createElement('th', { style: headerStyle }, '缓存价格'),
-                React.createElement('th', { style: headerStyle }, '输出 tokens'),
-                React.createElement('th', { style: headerStyle }, '输出价格'),
-                React.createElement('th', { style: headerStyle }, '缓存率'),
-                React.createElement('th', { style: headerStyle }, '总价'),
-                React.createElement('th', { style: headerStyle }, '时段名称'),
-                React.createElement('th', { style: headerStyle }, '模型'),
+        React.createElement('section', { style: { display: 'flex', flexDirection: 'column', gap: 10 } },
+          React.createElement('h3', { style: { margin: 0, fontSize: 13, fontWeight: 600 } }, '会话费用总览'),
+          React.createElement('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(6, minmax(110px, 1fr))', gap: 8 } },
+            React.createElement('label', { style: { display: 'flex', flexDirection: 'column', gap: 4, fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, '会话 ID', filterInput(sessionFilter.sessionId, '包含…', value => setSessionFilter(current => ({ ...current, sessionId: value })))),
+            React.createElement('label', { style: { display: 'flex', flexDirection: 'column', gap: 4, fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, '来源', filterSelect(sessionFilter.origin, originOptions, value => setSessionFilter(current => ({ ...current, origin: value })))),
+            React.createElement('label', { style: { display: 'flex', flexDirection: 'column', gap: 4, fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, '父会话', filterInput(sessionFilter.parentSession, '包含…', value => setSessionFilter(current => ({ ...current, parentSession: value })))),
+            React.createElement('label', { style: { display: 'flex', flexDirection: 'column', gap: 4, fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, '模型/路由', filterSelect(sessionFilter.route, routeOptions, value => setSessionFilter(current => ({ ...current, route: value })))),
+            React.createElement('label', { style: { display: 'flex', flexDirection: 'column', gap: 4, fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, '最低费用', filterInput(sessionFilter.minCost === undefined ? '' : String(sessionFilter.minCost), '≥', value => setSessionFilter(current => ({ ...current, minCost: parseBound(value) })))),
+            React.createElement('label', { style: { display: 'flex', flexDirection: 'column', gap: 4, fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, '最高费用', filterInput(sessionFilter.maxCost === undefined ? '' : String(sessionFilter.maxCost), '≤', value => setSessionFilter(current => ({ ...current, maxCost: parseBound(value) })))),
+          ),
+          sessionLoading ? React.createElement('p', { style: { margin: 0, fontSize: 12, color: 'var(--dsw-alias-label-tertiary)' } }, '正在加载会话费用…') : null,
+          sessionLoadError ? React.createElement('p', { role: 'alert', style: { margin: 0, fontSize: 12, color: 'var(--dsw-alias-label-error)' } }, sessionLoadError) : null,
+          !sessionLoading && !sessionLoadError && visibleRows.length === 0 ? React.createElement('p', { style: { margin: 0, fontSize: 12, color: 'var(--dsw-alias-label-tertiary)' } }, '暂无匹配的会话费用') : null,
+          React.createElement('div', { style: { overflowX: 'auto', fontSize: 12 } },
+            React.createElement('table', { style: { width: '100%', borderCollapse: 'collapse', whiteSpace: 'nowrap' } },
+              React.createElement('thead', null,
+                React.createElement('tr', null,
+                  React.createElement('th', { style: headerLeft }),
+                  sortHeader('sessionId', '会话 ID', 'left'),
+                  sortHeader('origin', '来源', 'left'),
+                  sortHeader('parentSession', '父会话', 'left'),
+                  sortHeader('cost', '总费用'),
+                  sortHeader('inputTokens', '输入 Token'),
+                  sortHeader('cacheReadTokens', '缓存读取 Token'),
+                  React.createElement('th', { style: headerStyle }, '缓存写入 Token'),
+                  sortHeader('outputTokens', '输出 Token'),
+                  sortHeader('totalTokens', '总 Token'),
+                  React.createElement('th', { style: headerStyle }, '模型/路由'),
+                ),
               ),
-            ),
-            React.createElement('tbody', null,
-              ...(() => {
-                const flatten = (rows: readonly CostSubagent[]): Array<{ sessionId: string; entry: HourlyDetail }> => rows.flatMap(row => [
-                  ...(row.hourly ?? []).map(entry => ({ sessionId: row.sessionId, entry })), ...flatten(row.children),
-                ])
-                const childRows = flatten(state.subagents ?? [])
-                const hours = [...new Set([...state.hourly.map(row => row.hour), ...childRows.map(row => row.entry.hour)])].sort()
-                return hours.flatMap(hour => {
-                  const rootRows = (state.hourly ?? []).filter(row => row.hour === hour)
-                  const allRows = [...rootRows, ...childRows.filter(row => row.entry.hour === hour).map(row => row.entry)]
-                  const total = sumRows(allRows)
-                  if (total === null) return []
-                  const timeKey = `time:${hour}`
-                  const timeExpanded = expandedSubagents.has(timeKey)
-                  const routes = [...new Set(allRows.map(routeKey))]
-                  const timeRow = React.createElement('tr', { key: timeKey, style: { borderBottom: '1px solid var(--dsw-alias-border-l2, #eee)', fontWeight: 600 } },
-                    React.createElement('td', { style: cellLeft }, React.createElement('button', { type: 'button', 'aria-expanded': timeExpanded, onClick: () => toggleSubagent(timeKey), style: { border: 0, background: 'transparent', cursor: 'pointer', padding: '0 6px 0 0', fontSize: 13, color: 'inherit' } }, timeExpanded ? '−' : '+'), total.hourLabel),
-                    ...dataCells(total), React.createElement('td', { style: cellBase }, '-'), React.createElement('td', { style: cellBase }, `${routes.length} 个模型`),
+              React.createElement('tbody', null,
+                ...visibleRows.flatMap(row => {
+                  const expanded = expandedSessions.has(row.sessionId)
+                  const routes = sessionRoutes(row)
+                  const summary = React.createElement('tr', { key: row.sessionId, style: { borderBottom: '1px solid var(--dsw-alias-border-l2, #eee)', cursor: 'pointer' }, onClick: () => toggleSession(row.sessionId) },
+                    React.createElement('td', { style: cellLeft }, React.createElement('button', { type: 'button', 'aria-expanded': expanded, onClick: (event: React.MouseEvent) => { event.stopPropagation(); toggleSession(row.sessionId) }, style: { border: 0, background: 'transparent', cursor: 'pointer', padding: '0 6px 0 0', fontSize: 13, color: 'inherit' } }, expanded ? '−' : '+')),
+                    React.createElement('td', { style: cellLeft, title: row.sessionId }, compactId(row.sessionId)),
+                    React.createElement('td', { style: cellLeft }, row.origin ?? '-'),
+                    React.createElement('td', { style: cellLeft, title: row.parentSession ?? undefined }, compactId(row.parentSession)),
+                    React.createElement('td', { style: { ...cellBase, fontWeight: 600 } }, `${symbol}${money(row.cost.cost)}`),
+                    React.createElement('td', { style: cellBase }, row.cost.inputTokens.toLocaleString('zh-CN')),
+                    React.createElement('td', { style: cellBase }, row.cost.cacheReadTokens.toLocaleString('zh-CN')),
+                    React.createElement('td', { style: cellBase }, row.cost.cacheWriteTokens.toLocaleString('zh-CN')),
+                    React.createElement('td', { style: cellBase }, row.cost.outputTokens.toLocaleString('zh-CN')),
+                    React.createElement('td', { style: cellBase }, sessionTotalTokens(row).toLocaleString('zh-CN')),
+                    React.createElement('td', { style: cellBase }, routes.length === 0 ? '-' : routes.length === 1 ? routes[0] : `${routes.length} 个模型`),
                   )
-                  if (!timeExpanded) return [timeRow]
-                  const models = routes.flatMap(route => {
-                    const entries = allRows.filter(row => routeKey(row) === route)
-                    const modelTotal = sumRows(entries)
-                    if (modelTotal === null) return []
-                    const modelKey = `model:${hour}:${route}`
-                    const modelExpanded = expandedSubagents.has(modelKey)
-                    const children = childRows.filter(row => row.entry.hour === hour && routeKey(row.entry) === route)
-                    const modelRow = React.createElement('tr', { key: modelKey, style: { borderBottom: '1px solid var(--dsw-alias-border-l2, #eee)', background: 'var(--dsw-alias-bg-layer-2, #fafafa)' } },
-                      React.createElement('td', { style: { ...cellLeft, paddingLeft: 28 } }, children.length > 0 ? React.createElement('button', { type: 'button', 'aria-expanded': modelExpanded, onClick: () => toggleSubagent(modelKey), style: { border: 0, background: 'transparent', cursor: 'pointer', padding: '0 6px 0 0', fontSize: 13, color: 'inherit' } }, modelExpanded ? '−' : '+') : React.createElement('span', { style: { display: 'inline-block', width: 19 } }), `↳ ${route}`),
-                      ...dataCells(modelTotal), React.createElement('td', { style: cellBase }, '-'), React.createElement('td', { style: cellBase }, route),
-                    )
-                    if (!modelExpanded) return [modelRow]
-                    return [modelRow, ...children.map(({ sessionId, entry }) => React.createElement('tr', { key: `child:${hour}:${route}:${sessionId}`, style: { borderBottom: '1px solid var(--dsw-alias-border-l2, #eee)', color: 'var(--dsw-alias-label-secondary)' } }, React.createElement('td', { style: { ...cellLeft, paddingLeft: 52 } }, `↳ 子代理 ${sessionId.slice(0, 8)}`), ...dataCells(entry), React.createElement('td', { style: cellBase }, entry.periodName ?? '-'), React.createElement('td', { style: cellBase }, `${entry.provider ?? '?'}/${entry.model ?? '?'}`)))]
-                  })
-                  return [timeRow, ...models]
-                })
-              })(),
-              React.createElement('tr', { style: { fontWeight: 600, borderTop: '2px solid var(--dsw-alias-border-l1, #bbb)' } },
-                React.createElement('td', { style: { ...cellLeft, fontWeight: 600 } }, '合计'),
-                React.createElement('td', { style: cellBase }),
-                React.createElement('td', { style: cellBase }),
-                React.createElement('td', { style: cellBase }),
-                React.createElement('td', { style: { ...cellBase, fontWeight: 600 } }, totalInput.toLocaleString('zh-CN')),
-                React.createElement('td', { style: { ...cellBase, fontWeight: 600 } }, `${symbol}${money(totalInputCost)}`),
-                React.createElement('td', { style: { ...cellBase, fontWeight: 600 } }, (totalCacheRead + totalCacheWrite).toLocaleString('zh-CN')),
-                React.createElement('td', { style: { ...cellBase, fontWeight: 600 } }, `${symbol}${money(totalCacheReadCost + totalCacheWriteCost)}`),
-                React.createElement('td', { style: { ...cellBase, fontWeight: 600 } }, totalOutput.toLocaleString('zh-CN')),
-                React.createElement('td', { style: { ...cellBase, fontWeight: 600 } }, `${symbol}${money(totalOutputCost)}`),
-                React.createElement('td', { style: { ...cellBase, fontWeight: 600 } }, `${(totalCacheRate * 100).toFixed(1)}%`),
-                React.createElement('td', { style: { ...cellBase, fontWeight: 600 } }, `${symbol}${money(totalCost)}`),
-                React.createElement('td', { style: cellBase }),
-                React.createElement('td', { style: cellBase }),
+                  if (!expanded) return [summary]
+                  return [summary, React.createElement('tr', { key: `${row.sessionId}:detail` },
+                    React.createElement('td', { colSpan: 11, style: { padding: '0 8px 12px' } },
+                      React.createElement(HourlyTable, {
+                        sessionId: row.sessionId,
+                        hourly: row.cost.hourly ?? [],
+                        expandedHours,
+                        toggleHour,
+                        symbol,
+                        cellBase,
+                        cellLeft,
+                        headerStyle,
+                        headerLeft,
+                      }),
+                    ),
+                  )]
+                }),
               ),
             ),
           ),
@@ -585,6 +735,21 @@ export async function apply(ctx: Context) {
       id: 'dsh-cost-meter#costMeter/sessionCost', service: 'costMeter', namespace: 'costMeter', method: 'sessionCost', invocation: { kind: 'direct' },
       parameters: [{ name: 'sessionId', wire: 'sessionId', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-cost-meter#sessionCost#sessionId', schema: { _zod: true, parse: (value: unknown) => value } } }],
       result: { mode: 'strict', typeSymbol: 'dsh-cost-meter#sessionCost#result', schema: { _zod: true, parse: (value: unknown) => value } },
+    }, {
+      id: 'dsh-cost-meter#costMeter/sessionCosts',
+      service: 'costMeter',
+      namespace: 'costMeter',
+      method: 'sessionCosts',
+      invocation: { kind: 'direct' },
+      parameters: [],
+      result: {
+        mode: 'strict',
+        typeSymbol: 'dsh-cost-meter#sessionCosts#result',
+        schema: {
+          _zod: true,
+          parse: (value: unknown) => value,
+        },
+      },
     }],
   })
   const slots = ctx.get('slots') as SlotsFace | undefined

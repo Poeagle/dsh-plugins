@@ -106,6 +106,76 @@ window.__ModuleLoader__.load({
 			}
 		}
 		//#endregion
+		//#region src/session-table.ts
+		function routeLabel(provider, model) {
+			if (provider && model) return `${provider}/${model}`;
+			return model ?? provider ?? null;
+		}
+		/** Distinct provider/model routes observed on one session fold. */
+		function sessionRoutes(row) {
+			const routes = /* @__PURE__ */ new Set();
+			if (row.cost.route) routes.add(row.cost.route);
+			for (const hourly of row.cost.hourly ?? []) {
+				const key = routeLabel(hourly.provider, hourly.model);
+				if (key) routes.add(key);
+			}
+			for (const detail of row.cost.details ?? []) {
+				const key = routeLabel(detail.provider, detail.model);
+				if (key) routes.add(key);
+			}
+			return [...routes];
+		}
+		function sessionTotalTokens(row) {
+			return row.cost.inputTokens + row.cost.cacheReadTokens + row.cost.cacheWriteTokens + row.cost.outputTokens;
+		}
+		/** Keep rows that match every populated filter field. */
+		function filterSessionRows(rows, filter) {
+			const sessionId = filter.sessionId.trim().toLowerCase();
+			const parent = filter.parentSession.trim().toLowerCase();
+			return rows.filter((row) => {
+				if (sessionId && !row.sessionId.toLowerCase().includes(sessionId)) return false;
+				if (filter.origin && (row.origin ?? "") !== filter.origin) return false;
+				if (parent && !(row.parentSession ?? "").toLowerCase().includes(parent)) return false;
+				if (filter.route && !sessionRoutes(row).includes(filter.route)) return false;
+				if (filter.minCost !== void 0 && row.cost.cost < filter.minCost) return false;
+				if (filter.maxCost !== void 0 && row.cost.cost > filter.maxCost) return false;
+				return true;
+			});
+		}
+		function compareSessionRows(left, right, key) {
+			switch (key) {
+				case "sessionId": return left.sessionId.localeCompare(right.sessionId);
+				case "origin": return (left.origin ?? "").localeCompare(right.origin ?? "");
+				case "parentSession": return (left.parentSession ?? "").localeCompare(right.parentSession ?? "");
+				case "cost": return left.cost.cost - right.cost.cost;
+				case "inputTokens": return left.cost.inputTokens - right.cost.inputTokens;
+				case "cacheReadTokens": return left.cost.cacheReadTokens - right.cost.cacheReadTokens;
+				case "outputTokens": return left.cost.outputTokens - right.cost.outputTokens;
+				case "totalTokens": return sessionTotalTokens(left) - sessionTotalTokens(right);
+			}
+		}
+		/** Stable sort: equal values keep sessionId order. */
+		function sortSessionRows(rows, sort) {
+			const direction = sort.dir === "asc" ? 1 : -1;
+			return [...rows].sort((left, right) => {
+				const compared = compareSessionRows(left, right, sort.key);
+				return compared === 0 ? left.sessionId.localeCompare(right.sessionId) : compared * direction;
+			});
+		}
+		function querySessionRows(rows, filter, sort) {
+			return sortSessionRows(filterSessionRows(rows, filter), sort);
+		}
+		function toggleSessionTableSort(current, key) {
+			if (current.key === key) return {
+				key,
+				dir: current.dir === "asc" ? "desc" : "asc"
+			};
+			return {
+				key,
+				dir: key === "sessionId" || key === "origin" || key === "parentSession" ? "asc" : "desc"
+			};
+		}
+		//#endregion
 		//#region src/client.ts
 		const inject = [
 			"slots",
@@ -698,85 +768,18 @@ window.__ModuleLoader__.load({
 				onClick: save
 			}, saving ? "保存中…" : saved ? "✓ 保存成功" : "保存"))) : null);
 		}
-		function CostDock(props) {
-			const [state, setState] = react.default.useState(null);
-			const [tooltip, setTooltip] = react.default.useState(false);
-			const [showModal, setShowModal] = react.default.useState(false);
-			const [expandedSubagents, setExpandedSubagents] = react.default.useState(() => /* @__PURE__ */ new Set());
-			const tooltipTimerRef = react.default.useRef(null);
-			react.default.useEffect(() => {
-				const load = () => {
-					if (typeof props.sessionId !== "string") return;
-					props.costMeter.sessionCost(props.sessionId).then((response) => {
-						if (response.ok && response.value && typeof response.value === "object") setState(response.value);
-					}).catch(() => {});
-				};
-				load();
-				return props.interval(load, 2e3);
-			}, [props.sessionId]);
-			react.default.useEffect(() => () => {
-				if (tooltipTimerRef.current) clearTimeout(tooltipTimerRef.current);
-			}, []);
-			if (!state || !(state.cost > 0)) return null;
-			const symbol = currencySymbol(state.currency);
-			const parts = [
-				`API费用 ≈${symbol}${money(state.cost)}`,
-				`输入 ${symbol}${money(state.inputCost)}`,
-				`缓存读 ${symbol}${money(state.cacheReadCost)}`,
-				`缓存写 ${symbol}${money(state.cacheWriteCost)}`,
-				`输出 ${symbol}${money(state.outputCost)}`
-			];
-			const showTooltip = () => {
-				if (tooltipTimerRef.current) clearTimeout(tooltipTimerRef.current);
-				tooltipTimerRef.current = setTimeout(() => setTooltip(true), 300);
-			};
-			const hideTooltip = () => {
-				if (tooltipTimerRef.current) clearTimeout(tooltipTimerRef.current);
-				tooltipTimerRef.current = setTimeout(() => setTooltip(false), 200);
-			};
-			const route = state.route ?? "未知模型";
-			const pricingInfo = state.pricingPeriod ? `${state.pricingPeriod} · ${state.pricingSource === "model-period" ? "模型时段价" : state.pricingSource === "model" ? "模型基准价" : state.pricingSource === "default-period" ? "默认时段价" : "默认价格"}` : "默认价格";
-			const totalInput = state.inputTokens;
-			const totalCacheRead = state.cacheReadTokens;
-			const totalCacheWrite = state.cacheWriteTokens;
-			const totalOutput = state.outputTokens;
-			const totalInputCost = state.inputCost;
-			const totalCacheReadCost = state.cacheReadCost;
-			const totalCacheWriteCost = state.cacheWriteCost;
-			const totalOutputCost = state.outputCost;
-			const totalCost = state.cost;
-			const totalTokens = totalInput + totalCacheRead + totalCacheWrite + totalOutput;
-			const totalCacheRate = totalTokens > 0 ? (totalCacheRead + totalCacheWrite) / totalTokens : 0;
-			const cellBase = {
-				fontSize: 12,
-				padding: "4px 8px",
-				textAlign: "right",
-				whiteSpace: "nowrap"
-			};
-			const cellLeft = {
-				...cellBase,
-				textAlign: "left"
-			};
-			const headerStyle = {
-				...cellBase,
-				fontWeight: 600,
-				background: "var(--dsw-alias-bg-layer-3, #f5f5f5)",
-				borderBottom: "1px solid var(--dsw-alias-border-l2, #ddd)",
-				position: "sticky",
-				top: 0,
-				zIndex: 1
-			};
-			const headerLeft = {
-				...headerStyle,
-				textAlign: "left"
-			};
-			const toggleSubagent = (id) => setExpandedSubagents((previous) => {
-				const next = new Set(previous);
-				if (next.has(id)) next.delete(id);
-				else next.add(id);
-				return next;
-			});
-			const routeKey = (row) => `${row.provider ?? ""}/${row.model ?? ""}`;
+		const EMPTY_SESSION_FILTER = {
+			sessionId: "",
+			origin: "",
+			parentSession: "",
+			route: ""
+		};
+		const DEFAULT_SESSION_SORT = {
+			key: "cost",
+			dir: "desc"
+		};
+		function HourlyTable(props) {
+			const routeOf = (row) => `${row.provider ?? ""}/${row.model ?? ""}`;
 			const sumRows = (rows) => {
 				const first = rows[0];
 				if (first === void 0) return null;
@@ -807,21 +810,216 @@ window.__ModuleLoader__.load({
 				};
 			};
 			const dataCells = (row) => [
-				react.default.createElement("td", { style: cellBase }, String(row.turns)),
-				react.default.createElement("td", { style: cellBase }, String(row.steps)),
-				react.default.createElement("td", { style: cellBase }, String(row.toolCalls)),
-				react.default.createElement("td", { style: cellBase }, row.inputTokens.toLocaleString("zh-CN")),
-				react.default.createElement("td", { style: cellBase }, `${symbol}${money(row.inputCost)}`),
-				react.default.createElement("td", { style: cellBase }, (row.cacheReadTokens + row.cacheWriteTokens).toLocaleString("zh-CN")),
-				react.default.createElement("td", { style: cellBase }, `${symbol}${money(row.cacheReadCost + row.cacheWriteCost)}`),
-				react.default.createElement("td", { style: cellBase }, row.outputTokens.toLocaleString("zh-CN")),
-				react.default.createElement("td", { style: cellBase }, `${symbol}${money(row.outputCost)}`),
-				react.default.createElement("td", { style: cellBase }, `${(row.cacheRate * 100).toFixed(1)}%`),
+				react.default.createElement("td", { style: props.cellBase }, String(row.turns)),
+				react.default.createElement("td", { style: props.cellBase }, String(row.steps)),
+				react.default.createElement("td", { style: props.cellBase }, String(row.toolCalls)),
+				react.default.createElement("td", { style: props.cellBase }, row.inputTokens.toLocaleString("zh-CN")),
+				react.default.createElement("td", { style: props.cellBase }, `${props.symbol}${money(row.inputCost)}`),
+				react.default.createElement("td", { style: props.cellBase }, (row.cacheReadTokens + row.cacheWriteTokens).toLocaleString("zh-CN")),
+				react.default.createElement("td", { style: props.cellBase }, `${props.symbol}${money(row.cacheReadCost + row.cacheWriteCost)}`),
+				react.default.createElement("td", { style: props.cellBase }, row.outputTokens.toLocaleString("zh-CN")),
+				react.default.createElement("td", { style: props.cellBase }, `${props.symbol}${money(row.outputCost)}`),
+				react.default.createElement("td", { style: props.cellBase }, `${(row.cacheRate * 100).toFixed(1)}%`),
 				react.default.createElement("td", { style: {
-					...cellBase,
+					...props.cellBase,
 					fontWeight: 600
-				} }, `${symbol}${money(row.cost)}`)
+				} }, `${props.symbol}${money(row.cost)}`)
 			];
+			const hours = [...new Set(props.hourly.map((row) => row.hour))].sort();
+			const totals = sumRows(props.hourly);
+			return react.default.createElement("table", { style: {
+				width: "100%",
+				borderCollapse: "collapse",
+				whiteSpace: "nowrap",
+				marginTop: 8
+			} }, react.default.createElement("thead", null, react.default.createElement("tr", null, react.default.createElement("th", { style: props.headerLeft }, "时间段"), react.default.createElement("th", { style: props.headerStyle }, "轮次"), react.default.createElement("th", { style: props.headerStyle }, "步骤"), react.default.createElement("th", { style: props.headerStyle }, "工具调用"), react.default.createElement("th", { style: props.headerStyle }, "输入 tokens"), react.default.createElement("th", { style: props.headerStyle }, "输入价格"), react.default.createElement("th", { style: props.headerStyle }, "缓存 tokens"), react.default.createElement("th", { style: props.headerStyle }, "缓存价格"), react.default.createElement("th", { style: props.headerStyle }, "输出 tokens"), react.default.createElement("th", { style: props.headerStyle }, "输出价格"), react.default.createElement("th", { style: props.headerStyle }, "缓存率"), react.default.createElement("th", { style: props.headerStyle }, "总价"), react.default.createElement("th", { style: props.headerStyle }, "时段名称"), react.default.createElement("th", { style: props.headerStyle }, "模型"))), react.default.createElement("tbody", null, ...hours.flatMap((hour) => {
+				const hourRows = props.hourly.filter((row) => row.hour === hour);
+				const total = sumRows(hourRows);
+				if (total === null) return [];
+				const timeKey = `${props.sessionId}:time:${hour}`;
+				const timeExpanded = props.expandedHours.has(timeKey);
+				const routes = [...new Set(hourRows.map(routeOf))];
+				const timeRow = react.default.createElement("tr", {
+					key: timeKey,
+					style: {
+						borderBottom: "1px solid var(--dsw-alias-border-l2, #eee)",
+						fontWeight: 600
+					}
+				}, react.default.createElement("td", { style: props.cellLeft }, react.default.createElement("button", {
+					type: "button",
+					"aria-expanded": timeExpanded,
+					onClick: () => props.toggleHour(timeKey),
+					style: {
+						border: 0,
+						background: "transparent",
+						cursor: "pointer",
+						padding: "0 6px 0 0",
+						fontSize: 13,
+						color: "inherit"
+					}
+				}, timeExpanded ? "−" : "+"), total.hourLabel), ...dataCells(total), react.default.createElement("td", { style: props.cellBase }, "-"), react.default.createElement("td", { style: props.cellBase }, `${routes.length} 个模型`));
+				if (!timeExpanded) return [timeRow];
+				return [timeRow, ...routes.flatMap((route) => {
+					const entries = hourRows.filter((row) => routeOf(row) === route);
+					const modelTotal = sumRows(entries);
+					if (modelTotal === null) return [];
+					const modelKey = `${props.sessionId}:model:${hour}:${route}`;
+					return [react.default.createElement("tr", {
+						key: modelKey,
+						style: {
+							borderBottom: "1px solid var(--dsw-alias-border-l2, #eee)",
+							background: "var(--dsw-alias-bg-layer-2, #fafafa)"
+						}
+					}, react.default.createElement("td", { style: {
+						...props.cellLeft,
+						paddingLeft: 28
+					} }, `↳ ${route}`), ...dataCells(modelTotal), react.default.createElement("td", { style: props.cellBase }, entries[0]?.periodName ?? "-"), react.default.createElement("td", { style: props.cellBase }, route))];
+				})];
+			}), totals ? react.default.createElement("tr", { style: {
+				fontWeight: 600,
+				borderTop: "2px solid var(--dsw-alias-border-l1, #bbb)"
+			} }, react.default.createElement("td", { style: {
+				...props.cellLeft,
+				fontWeight: 600
+			} }, "合计"), ...dataCells(totals), react.default.createElement("td", { style: props.cellBase }), react.default.createElement("td", { style: props.cellBase })) : react.default.createElement("tr", null, react.default.createElement("td", {
+				style: {
+					...props.cellLeft,
+					color: "var(--dsw-alias-label-tertiary)"
+				},
+				colSpan: 14
+			}, "该会话暂无按时段明细"))));
+		}
+		function CostDock(props) {
+			const [state, setState] = react.default.useState(null);
+			const [tooltip, setTooltip] = react.default.useState(false);
+			const [showModal, setShowModal] = react.default.useState(false);
+			const [sessionRows, setSessionRows] = react.default.useState([]);
+			const [sessionLoadError, setSessionLoadError] = react.default.useState(null);
+			const [sessionLoading, setSessionLoading] = react.default.useState(false);
+			const [expandedSessions, setExpandedSessions] = react.default.useState(() => /* @__PURE__ */ new Set());
+			const [expandedHours, setExpandedHours] = react.default.useState(() => /* @__PURE__ */ new Set());
+			const [sessionFilter, setSessionFilter] = react.default.useState(EMPTY_SESSION_FILTER);
+			const [sessionSort, setSessionSort] = react.default.useState(DEFAULT_SESSION_SORT);
+			const tooltipTimerRef = react.default.useRef(null);
+			react.default.useEffect(() => {
+				const load = () => {
+					if (typeof props.sessionId !== "string") return;
+					props.costMeter.sessionCost(props.sessionId).then((response) => {
+						if (response.ok && response.value && typeof response.value === "object") setState(response.value);
+					}).catch(() => {});
+				};
+				load();
+				return props.interval(load, 2e3);
+			}, [props.sessionId]);
+			react.default.useEffect(() => () => {
+				if (tooltipTimerRef.current) clearTimeout(tooltipTimerRef.current);
+			}, []);
+			const loadSessionCosts = () => {
+				setSessionLoading(true);
+				setSessionLoadError(null);
+				props.costMeter.sessionCosts().then((response) => {
+					if (response.ok && Array.isArray(response.value)) {
+						setSessionRows(response.value);
+						setSessionLoadError(null);
+					} else setSessionLoadError("会话费用加载失败");
+				}).catch(() => {
+					setSessionLoadError("会话费用加载失败");
+				}).finally(() => {
+					setSessionLoading(false);
+				});
+			};
+			const openModal = () => {
+				setShowModal(true);
+				setTooltip(false);
+				loadSessionCosts();
+			};
+			if (!state || !(state.cost > 0)) return null;
+			const symbol = currencySymbol(state.currency);
+			const parts = [
+				`API费用 ≈${symbol}${money(state.cost)}`,
+				`输入 ${symbol}${money(state.inputCost)}`,
+				`缓存读 ${symbol}${money(state.cacheReadCost)}`,
+				`缓存写 ${symbol}${money(state.cacheWriteCost)}`,
+				`输出 ${symbol}${money(state.outputCost)}`
+			];
+			const showTooltip = () => {
+				if (tooltipTimerRef.current) clearTimeout(tooltipTimerRef.current);
+				tooltipTimerRef.current = setTimeout(() => setTooltip(true), 300);
+			};
+			const hideTooltip = () => {
+				if (tooltipTimerRef.current) clearTimeout(tooltipTimerRef.current);
+				tooltipTimerRef.current = setTimeout(() => setTooltip(false), 200);
+			};
+			const route = state.route ?? "未知模型";
+			const pricingInfo = state.pricingPeriod ? `${state.pricingPeriod} · ${state.pricingSource === "model-period" ? "模型时段价" : state.pricingSource === "model" ? "模型基准价" : state.pricingSource === "default-period" ? "默认时段价" : "默认价格"}` : "默认价格";
+			const cellBase = {
+				fontSize: 12,
+				padding: "4px 8px",
+				textAlign: "right",
+				whiteSpace: "nowrap"
+			};
+			const cellLeft = {
+				...cellBase,
+				textAlign: "left"
+			};
+			const headerStyle = {
+				...cellBase,
+				fontWeight: 600,
+				background: "var(--dsw-alias-bg-layer-3, #f5f5f5)",
+				borderBottom: "1px solid var(--dsw-alias-border-l2, #ddd)",
+				position: "sticky",
+				top: 0,
+				zIndex: 1
+			};
+			const headerLeft = {
+				...headerStyle,
+				textAlign: "left"
+			};
+			const toggleExpanded = (store, id) => store((previous) => {
+				const next = new Set(previous);
+				if (next.has(id)) next.delete(id);
+				else next.add(id);
+				return next;
+			});
+			const toggleHour = (id) => toggleExpanded(setExpandedHours, id);
+			const toggleSession = (id) => toggleExpanded(setExpandedSessions, id);
+			const originOptions = [...new Set(sessionRows.map((row) => row.origin).filter((value) => Boolean(value)))].sort();
+			const routeOptions = [...new Set(sessionRows.flatMap((row) => sessionRoutes(row)))].sort();
+			const visibleRows = querySessionRows(sessionRows, sessionFilter, sessionSort);
+			const parseBound = (value) => value === "" ? void 0 : Number(value);
+			const sortMark = (key) => sessionSort.key === key ? sessionSort.dir === "asc" ? " ↑" : " ↓" : "";
+			const sortHeader = (key, label, align = "right") => react.default.createElement("th", {
+				style: {
+					...align === "left" ? headerLeft : headerStyle,
+					cursor: "pointer",
+					userSelect: "none"
+				},
+				"aria-sort": sessionSort.key === key ? sessionSort.dir === "asc" ? "ascending" : "descending" : "none",
+				onClick: () => setSessionSort((current) => toggleSessionTableSort(current, key))
+			}, `${label}${sortMark(key)}`);
+			const compactId = (value) => value ? value.length > 12 ? `${value.slice(0, 8)}…` : value : "-";
+			const filterInput = (value, placeholder, onChange) => react.default.createElement("input", {
+				style: {
+					...inputStyle,
+					height: 28,
+					fontSize: 11
+				},
+				value,
+				placeholder,
+				onChange: (event) => onChange(event.target.value)
+			});
+			const filterSelect = (value, options, onChange) => react.default.createElement("select", {
+				style: {
+					...inputStyle,
+					height: 28,
+					fontSize: 11
+				},
+				value,
+				onChange: (event) => onChange(event.target.value)
+			}, react.default.createElement("option", { value: "" }, "全部"), ...options.map((option) => react.default.createElement("option", {
+				key: option,
+				value: option
+			}, option)));
 			return react.default.createElement(react.default.Fragment, null, react.default.createElement("div", {
 				style: {
 					position: "relative",
@@ -831,10 +1029,7 @@ window.__ModuleLoader__.load({
 				},
 				onMouseEnter: showTooltip,
 				onMouseLeave: hideTooltip,
-				onClick: () => {
-					setShowModal(true);
-					setTooltip(false);
-				}
+				onClick: openModal
 			}, react.default.createElement("div", { style: {
 				textAlign: "center",
 				boxSizing: "border-box",
@@ -984,7 +1179,7 @@ window.__ModuleLoader__.load({
 			}, react.default.createElement("span", { style: { fontWeight: 600 } }, "合计"), react.default.createElement("span", { style: {
 				textAlign: "right",
 				fontWeight: 600
-			} }, `${symbol}${money(state.cost)}`))) : null), showModal && state.hourly && state.hourly.length > 0 ? react.default.createElement("div", {
+			} }, `${symbol}${money(state.cost)}`))) : null), showModal && state ? react.default.createElement("div", {
 				style: {
 					position: "fixed",
 					inset: 0,
@@ -1001,8 +1196,8 @@ window.__ModuleLoader__.load({
 					background: "var(--dsw-alias-bg-layer-1, #fff)",
 					borderRadius: 12,
 					padding: 24,
-					maxWidth: "90vw",
-					maxHeight: "80vh",
+					maxWidth: "94vw",
+					maxHeight: "86vh",
 					overflow: "auto",
 					boxShadow: "0 8px 32px rgba(0,0,0,0.3)",
 					display: "flex",
@@ -1029,122 +1224,145 @@ window.__ModuleLoader__.load({
 					borderRadius: 4
 				},
 				onClick: () => setShowModal(false)
-			}, "✕")), react.default.createElement("div", { style: {
+			}, "✕")), react.default.createElement("section", { style: {
+				display: "flex",
+				flexDirection: "column",
+				gap: 10
+			} }, react.default.createElement("h3", { style: {
+				margin: 0,
+				fontSize: 13,
+				fontWeight: 600
+			} }, "会话费用总览"), react.default.createElement("div", { style: {
+				display: "grid",
+				gridTemplateColumns: "repeat(6, minmax(110px, 1fr))",
+				gap: 8
+			} }, react.default.createElement("label", { style: {
+				display: "flex",
+				flexDirection: "column",
+				gap: 4,
+				fontSize: 11,
+				color: "var(--dsw-alias-label-tertiary)"
+			} }, "会话 ID", filterInput(sessionFilter.sessionId, "包含…", (value) => setSessionFilter((current) => ({
+				...current,
+				sessionId: value
+			})))), react.default.createElement("label", { style: {
+				display: "flex",
+				flexDirection: "column",
+				gap: 4,
+				fontSize: 11,
+				color: "var(--dsw-alias-label-tertiary)"
+			} }, "来源", filterSelect(sessionFilter.origin, originOptions, (value) => setSessionFilter((current) => ({
+				...current,
+				origin: value
+			})))), react.default.createElement("label", { style: {
+				display: "flex",
+				flexDirection: "column",
+				gap: 4,
+				fontSize: 11,
+				color: "var(--dsw-alias-label-tertiary)"
+			} }, "父会话", filterInput(sessionFilter.parentSession, "包含…", (value) => setSessionFilter((current) => ({
+				...current,
+				parentSession: value
+			})))), react.default.createElement("label", { style: {
+				display: "flex",
+				flexDirection: "column",
+				gap: 4,
+				fontSize: 11,
+				color: "var(--dsw-alias-label-tertiary)"
+			} }, "模型/路由", filterSelect(sessionFilter.route, routeOptions, (value) => setSessionFilter((current) => ({
+				...current,
+				route: value
+			})))), react.default.createElement("label", { style: {
+				display: "flex",
+				flexDirection: "column",
+				gap: 4,
+				fontSize: 11,
+				color: "var(--dsw-alias-label-tertiary)"
+			} }, "最低费用", filterInput(sessionFilter.minCost === void 0 ? "" : String(sessionFilter.minCost), "≥", (value) => setSessionFilter((current) => ({
+				...current,
+				minCost: parseBound(value)
+			})))), react.default.createElement("label", { style: {
+				display: "flex",
+				flexDirection: "column",
+				gap: 4,
+				fontSize: 11,
+				color: "var(--dsw-alias-label-tertiary)"
+			} }, "最高费用", filterInput(sessionFilter.maxCost === void 0 ? "" : String(sessionFilter.maxCost), "≤", (value) => setSessionFilter((current) => ({
+				...current,
+				maxCost: parseBound(value)
+			}))))), sessionLoading ? react.default.createElement("p", { style: {
+				margin: 0,
+				fontSize: 12,
+				color: "var(--dsw-alias-label-tertiary)"
+			} }, "正在加载会话费用…") : null, sessionLoadError ? react.default.createElement("p", {
+				role: "alert",
+				style: {
+					margin: 0,
+					fontSize: 12,
+					color: "var(--dsw-alias-label-error)"
+				}
+			}, sessionLoadError) : null, !sessionLoading && !sessionLoadError && visibleRows.length === 0 ? react.default.createElement("p", { style: {
+				margin: 0,
+				fontSize: 12,
+				color: "var(--dsw-alias-label-tertiary)"
+			} }, "暂无匹配的会话费用") : null, react.default.createElement("div", { style: {
 				overflowX: "auto",
 				fontSize: 12
 			} }, react.default.createElement("table", { style: {
 				width: "100%",
 				borderCollapse: "collapse",
 				whiteSpace: "nowrap"
-			} }, react.default.createElement("thead", null, react.default.createElement("tr", null, react.default.createElement("th", { style: headerLeft }, "时间段"), react.default.createElement("th", { style: headerStyle }, "轮次"), react.default.createElement("th", { style: headerStyle }, "步骤"), react.default.createElement("th", { style: headerStyle }, "工具调用"), react.default.createElement("th", { style: headerStyle }, "输入 tokens"), react.default.createElement("th", { style: headerStyle }, "输入价格"), react.default.createElement("th", { style: headerStyle }, "缓存 tokens"), react.default.createElement("th", { style: headerStyle }, "缓存价格"), react.default.createElement("th", { style: headerStyle }, "输出 tokens"), react.default.createElement("th", { style: headerStyle }, "输出价格"), react.default.createElement("th", { style: headerStyle }, "缓存率"), react.default.createElement("th", { style: headerStyle }, "总价"), react.default.createElement("th", { style: headerStyle }, "时段名称"), react.default.createElement("th", { style: headerStyle }, "模型"))), react.default.createElement("tbody", null, ...(() => {
-				const flatten = (rows) => rows.flatMap((row) => [...(row.hourly ?? []).map((entry) => ({
+			} }, react.default.createElement("thead", null, react.default.createElement("tr", null, react.default.createElement("th", { style: headerLeft }), sortHeader("sessionId", "会话 ID", "left"), sortHeader("origin", "来源", "left"), sortHeader("parentSession", "父会话", "left"), sortHeader("cost", "总费用"), sortHeader("inputTokens", "输入 Token"), sortHeader("cacheReadTokens", "缓存读取 Token"), react.default.createElement("th", { style: headerStyle }, "缓存写入 Token"), sortHeader("outputTokens", "输出 Token"), sortHeader("totalTokens", "总 Token"), react.default.createElement("th", { style: headerStyle }, "模型/路由"))), react.default.createElement("tbody", null, ...visibleRows.flatMap((row) => {
+				const expanded = expandedSessions.has(row.sessionId);
+				const routes = sessionRoutes(row);
+				const summary = react.default.createElement("tr", {
+					key: row.sessionId,
+					style: {
+						borderBottom: "1px solid var(--dsw-alias-border-l2, #eee)",
+						cursor: "pointer"
+					},
+					onClick: () => toggleSession(row.sessionId)
+				}, react.default.createElement("td", { style: cellLeft }, react.default.createElement("button", {
+					type: "button",
+					"aria-expanded": expanded,
+					onClick: (event) => {
+						event.stopPropagation();
+						toggleSession(row.sessionId);
+					},
+					style: {
+						border: 0,
+						background: "transparent",
+						cursor: "pointer",
+						padding: "0 6px 0 0",
+						fontSize: 13,
+						color: "inherit"
+					}
+				}, expanded ? "−" : "+")), react.default.createElement("td", {
+					style: cellLeft,
+					title: row.sessionId
+				}, compactId(row.sessionId)), react.default.createElement("td", { style: cellLeft }, row.origin ?? "-"), react.default.createElement("td", {
+					style: cellLeft,
+					title: row.parentSession ?? void 0
+				}, compactId(row.parentSession)), react.default.createElement("td", { style: {
+					...cellBase,
+					fontWeight: 600
+				} }, `${symbol}${money(row.cost.cost)}`), react.default.createElement("td", { style: cellBase }, row.cost.inputTokens.toLocaleString("zh-CN")), react.default.createElement("td", { style: cellBase }, row.cost.cacheReadTokens.toLocaleString("zh-CN")), react.default.createElement("td", { style: cellBase }, row.cost.cacheWriteTokens.toLocaleString("zh-CN")), react.default.createElement("td", { style: cellBase }, row.cost.outputTokens.toLocaleString("zh-CN")), react.default.createElement("td", { style: cellBase }, sessionTotalTokens(row).toLocaleString("zh-CN")), react.default.createElement("td", { style: cellBase }, routes.length === 0 ? "-" : routes.length === 1 ? routes[0] : `${routes.length} 个模型`));
+				if (!expanded) return [summary];
+				return [summary, react.default.createElement("tr", { key: `${row.sessionId}:detail` }, react.default.createElement("td", {
+					colSpan: 11,
+					style: { padding: "0 8px 12px" }
+				}, react.default.createElement(HourlyTable, {
 					sessionId: row.sessionId,
-					entry
-				})), ...flatten(row.children)]);
-				const childRows = flatten(state.subagents ?? []);
-				return [.../* @__PURE__ */ new Set([...state.hourly.map((row) => row.hour), ...childRows.map((row) => row.entry.hour)])].sort().flatMap((hour) => {
-					const allRows = [...(state.hourly ?? []).filter((row) => row.hour === hour), ...childRows.filter((row) => row.entry.hour === hour).map((row) => row.entry)];
-					const total = sumRows(allRows);
-					if (total === null) return [];
-					const timeKey = `time:${hour}`;
-					const timeExpanded = expandedSubagents.has(timeKey);
-					const routes = [...new Set(allRows.map(routeKey))];
-					const timeRow = react.default.createElement("tr", {
-						key: timeKey,
-						style: {
-							borderBottom: "1px solid var(--dsw-alias-border-l2, #eee)",
-							fontWeight: 600
-						}
-					}, react.default.createElement("td", { style: cellLeft }, react.default.createElement("button", {
-						type: "button",
-						"aria-expanded": timeExpanded,
-						onClick: () => toggleSubagent(timeKey),
-						style: {
-							border: 0,
-							background: "transparent",
-							cursor: "pointer",
-							padding: "0 6px 0 0",
-							fontSize: 13,
-							color: "inherit"
-						}
-					}, timeExpanded ? "−" : "+"), total.hourLabel), ...dataCells(total), react.default.createElement("td", { style: cellBase }, "-"), react.default.createElement("td", { style: cellBase }, `${routes.length} 个模型`));
-					if (!timeExpanded) return [timeRow];
-					return [timeRow, ...routes.flatMap((route) => {
-						const entries = allRows.filter((row) => routeKey(row) === route);
-						const modelTotal = sumRows(entries);
-						if (modelTotal === null) return [];
-						const modelKey = `model:${hour}:${route}`;
-						const modelExpanded = expandedSubagents.has(modelKey);
-						const children = childRows.filter((row) => row.entry.hour === hour && routeKey(row.entry) === route);
-						const modelRow = react.default.createElement("tr", {
-							key: modelKey,
-							style: {
-								borderBottom: "1px solid var(--dsw-alias-border-l2, #eee)",
-								background: "var(--dsw-alias-bg-layer-2, #fafafa)"
-							}
-						}, react.default.createElement("td", { style: {
-							...cellLeft,
-							paddingLeft: 28
-						} }, children.length > 0 ? react.default.createElement("button", {
-							type: "button",
-							"aria-expanded": modelExpanded,
-							onClick: () => toggleSubagent(modelKey),
-							style: {
-								border: 0,
-								background: "transparent",
-								cursor: "pointer",
-								padding: "0 6px 0 0",
-								fontSize: 13,
-								color: "inherit"
-							}
-						}, modelExpanded ? "−" : "+") : react.default.createElement("span", { style: {
-							display: "inline-block",
-							width: 19
-						} }), `↳ ${route}`), ...dataCells(modelTotal), react.default.createElement("td", { style: cellBase }, "-"), react.default.createElement("td", { style: cellBase }, route));
-						if (!modelExpanded) return [modelRow];
-						return [modelRow, ...children.map(({ sessionId, entry }) => react.default.createElement("tr", {
-							key: `child:${hour}:${route}:${sessionId}`,
-							style: {
-								borderBottom: "1px solid var(--dsw-alias-border-l2, #eee)",
-								color: "var(--dsw-alias-label-secondary)"
-							}
-						}, react.default.createElement("td", { style: {
-							...cellLeft,
-							paddingLeft: 52
-						} }, `↳ 子代理 ${sessionId.slice(0, 8)}`), ...dataCells(entry), react.default.createElement("td", { style: cellBase }, entry.periodName ?? "-"), react.default.createElement("td", { style: cellBase }, `${entry.provider ?? "?"}/${entry.model ?? "?"}`)))];
-					})];
-				});
-			})(), react.default.createElement("tr", { style: {
-				fontWeight: 600,
-				borderTop: "2px solid var(--dsw-alias-border-l1, #bbb)"
-			} }, react.default.createElement("td", { style: {
-				...cellLeft,
-				fontWeight: 600
-			} }, "合计"), react.default.createElement("td", { style: cellBase }), react.default.createElement("td", { style: cellBase }), react.default.createElement("td", { style: cellBase }), react.default.createElement("td", { style: {
-				...cellBase,
-				fontWeight: 600
-			} }, totalInput.toLocaleString("zh-CN")), react.default.createElement("td", { style: {
-				...cellBase,
-				fontWeight: 600
-			} }, `${symbol}${money(totalInputCost)}`), react.default.createElement("td", { style: {
-				...cellBase,
-				fontWeight: 600
-			} }, (totalCacheRead + totalCacheWrite).toLocaleString("zh-CN")), react.default.createElement("td", { style: {
-				...cellBase,
-				fontWeight: 600
-			} }, `${symbol}${money(totalCacheReadCost + totalCacheWriteCost)}`), react.default.createElement("td", { style: {
-				...cellBase,
-				fontWeight: 600
-			} }, totalOutput.toLocaleString("zh-CN")), react.default.createElement("td", { style: {
-				...cellBase,
-				fontWeight: 600
-			} }, `${symbol}${money(totalOutputCost)}`), react.default.createElement("td", { style: {
-				...cellBase,
-				fontWeight: 600
-			} }, `${(totalCacheRate * 100).toFixed(1)}%`), react.default.createElement("td", { style: {
-				...cellBase,
-				fontWeight: 600
-			} }, `${symbol}${money(totalCost)}`), react.default.createElement("td", { style: cellBase }), react.default.createElement("td", { style: cellBase }))))))) : null);
+					hourly: row.cost.hourly ?? [],
+					expandedHours,
+					toggleHour,
+					symbol,
+					cellBase,
+					cellLeft,
+					headerStyle,
+					headerLeft
+				})))];
+			}))))))) : null);
 		}
 		async function apply(ctx) {
 			const remote = ctx.get("remote");
@@ -1173,6 +1391,21 @@ window.__ModuleLoader__.load({
 					result: {
 						mode: "strict",
 						typeSymbol: "dsh-cost-meter#sessionCost#result",
+						schema: {
+							_zod: true,
+							parse: (value) => value
+						}
+					}
+				}, {
+					id: "dsh-cost-meter#costMeter/sessionCosts",
+					service: "costMeter",
+					namespace: "costMeter",
+					method: "sessionCosts",
+					invocation: { kind: "direct" },
+					parameters: [],
+					result: {
+						mode: "strict",
+						typeSymbol: "dsh-cost-meter#sessionCosts#result",
 						schema: {
 							_zod: true,
 							parse: (value) => value

@@ -15,7 +15,22 @@ import {
 } from './pricing.js'
 
 export { DEFAULT_PRICING, foldSession, normalizeUsage, resolvePricing, routeKey, validatePricing }
+export {
+  filterSessionRows,
+  querySessionRows,
+  sessionRoutes,
+  sessionTotalTokens,
+  sortSessionRows,
+  toggleSessionTableSort,
+} from './session-table.js'
 export type { CostDetail, CostFold, CostSubagent, HourlyDetail, PartialTokenRates, PricingConfig, PricingPeriod, PricingPlan, TokenRates } from './pricing.js'
+export type {
+  SessionTableFilter,
+  SessionTableRow,
+  SessionTableSort,
+  SessionTableSortDir,
+  SessionTableSortKey,
+} from './session-table.js'
 
 const ratesSchema = z.object({
   input: z.number().min(0),
@@ -74,6 +89,14 @@ interface SessionRecord {
   }
 }
 
+/** One listed session's own fold, without merging descendant subagents. */
+export interface SessionCostRecord {
+  sessionId: string
+  parentSession: string | null
+  origin: string | null
+  cost: ReturnType<typeof foldSession>
+}
+
 interface SessionQueryFace {
   listSessions(): Promise<readonly SessionRecord[]>
   readSession(id: string): Promise<{ events: readonly CostEvent[] }>
@@ -126,6 +149,41 @@ function mergeCostInto(target: ReturnType<typeof foldSession>, cost: ReturnType<
   target.details.push(...cost.details)
 }
 
+/**
+ * Fold every listed session independently.
+ * @param query Durable session listing/read face, or undefined when the host has none.
+ * @param config Live pricing used for every session.
+ * @returns Listed sessions in original order, skipping duplicate ids and unreadable logs.
+ */
+export async function collectSessionCosts(
+  query: SessionQueryFace | undefined,
+  config: PricingConfig,
+): Promise<SessionCostRecord[]> {
+  if (query === undefined) return []
+  const records = await query.listSessions()
+  const seen = new Set<string>()
+  const rows: SessionCostRecord[] = []
+  for (const record of records) {
+    const sessionId = record.header.id
+    if (sessionId === '' || seen.has(sessionId)) continue
+    seen.add(sessionId)
+    let events: readonly CostEvent[]
+    try {
+      events = (await query.readSession(sessionId)).events
+    } catch {
+      // Skip one unreadable session so the remaining overview still returns.
+      continue
+    }
+    rows.push({
+      sessionId,
+      parentSession: record.header.parentSession ?? null,
+      origin: record.header.origin ?? null,
+      cost: foldSession(events, config),
+    })
+  }
+  return rows
+}
+
 function mergeCosts(primary: ReturnType<typeof foldSession>, subagents: readonly CostSubagent[]): ReturnType<typeof foldSession> {
   const out = structuredClone(primary)
   out.subagents = structuredClone([...subagents])
@@ -165,5 +223,12 @@ export default class CostMeterService extends TypertRemoteService {
     const children = subagentChildren(await query.listSessions())
     const subagents = await readSubagentTree(query, children, sessionId, config, new Set<string>([sessionId]))
     return mergeCosts(cost, subagents)
+  }
+
+  /** Fold every listed session independently for the all-session overview. */
+  async sessionCosts(): Promise<SessionCostRecord[]> {
+    const query = this.ctx.get('sessionQuery') as SessionQueryFace | undefined
+    const pricing = (this.ctx as Context & { settings: SettingsReaderFace }).settings.get(SETTINGS_NS) as PricingConfig | undefined
+    return collectSessionCosts(query, pricing ?? DEFAULT_PRICING)
   }
 }

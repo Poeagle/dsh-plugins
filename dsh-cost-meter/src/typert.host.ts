@@ -42,6 +42,7 @@ export const TYPERT = {
   schemas: [],
   invocations: [
     inv('sessionCost', [strParam('sessionCost', 'sessionId')]),
+    inv('sessionCosts', []),
   ],
   model: {
     services: [],

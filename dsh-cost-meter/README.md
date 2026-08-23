@@ -45,7 +45,7 @@ The UI lists every model in the live `llm.models` catalog. A model without an ov
 
 ## Accounting
 
-The Host folds the session log in sequence order. Each `request/header` selects the actual provider/model for later usage in that request epoch. `assistant/chunk` and `assistant/message` usage reports use last-writer-wins for the same turn/step, matching the Harness token projection and preventing duplicate accounting. A parent session's total includes every descendant session whose durable header identifies it as a subagent; each child log is folded once, so nested delegation is included without replaying a child through multiple parents.
+The Host folds the session log in sequence order. Each `request/header` selects the actual provider/model for later usage in that request epoch. `assistant/chunk` and `assistant/message` usage reports use last-writer-wins for the same turn/step, matching the Harness token projection and preventing duplicate accounting. A parent session's total includes every descendant session whose durable header identifies it as a subagent; each child log is folded once, so nested delegation is included without replaying a child through multiple parents. The composer modal also lists every durable session independently through `sessionCosts()`, so the overview table does not inherit a parent session's merged subagent totals.
 
 Token usage fields are disjoint:
 
@@ -70,9 +70,10 @@ npm test
 | Path | Role |
 | --- | --- |
 | `src/pricing.ts` | Shared config validation, time-window matching, and rate resolution |
+| `src/session-table.ts` | Session overview filter and sort helpers |
 | `src/index.ts` | Host settings namespace, session fold, and Remote service |
 | `src/typert.host.ts` | Host wire manifest |
-| `src/client.ts` | Composer cost line and Plugins settings card |
+| `src/client.ts` | Composer cost line, all-session modal, and Plugins settings card |
 | `cordis.patch.yml` | Host bundle row |
 
 ## Known Limitations and Deferred Work
