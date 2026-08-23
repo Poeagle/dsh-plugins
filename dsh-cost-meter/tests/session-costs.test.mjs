@@ -2,14 +2,17 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   DEFAULT_PRICING,
+  SessionFoldCache,
   collectSessionCosts,
   filterHourlyEntries,
   filterSessionRows,
   flattenHourlyEntries,
   foldSession,
   localDateOfHour,
+  logFingerprint,
   mapWithConcurrency,
   mergeListedSessionCost,
+  pricingFingerprint,
   queryHourlyOverview,
   querySessionRows,
   sortSessionRows,
@@ -88,6 +91,86 @@ test('collectSessionCosts returns an empty list when listing sessions fails', as
     async listSessions() { throw new Error('listing failed') },
     async readSession() { throw new Error('should not read') },
   }, DEFAULT_PRICING), [])
+})
+
+test('own-fold cache reuses unchanged historical sessions and skips reread', async () => {
+  let reads = 0
+  const sessions = [
+    { header: { id: 'hist', origin: 'user' }, events: parentEvents },
+    { header: { id: 'live', origin: 'user' }, events: childEvents },
+  ]
+  const query = {
+    async listSessions() {
+      return sessions.map(session => ({ header: session.header }))
+    },
+    async readSession(id) {
+      reads += 1
+      const session = sessions.find(item => item.header.id === id)
+      if (!session) throw new Error(`missing ${id}`)
+      return { events: session.events }
+    },
+  }
+  const liveMap = { get(id) { return id === 'live' ? { events: childEvents } : undefined } }
+  const store = new SessionFoldCache()
+  const first = await collectSessionCosts(query, DEFAULT_PRICING, store, liveMap)
+  assert.equal(reads, 1)
+  assert.equal(store.stats.misses, 2)
+  assert.equal(store.stats.hits, 0)
+  const second = await collectSessionCosts(query, DEFAULT_PRICING, store, liveMap)
+  assert.equal(reads, 1)
+  assert.equal(store.stats.hits, 2)
+  assert.equal(store.stats.misses, 2)
+  assert.equal(second[0].cost.cost, first[0].cost.cost)
+  assert.equal(second[1].cost.cost, first[1].cost.cost)
+})
+
+test('own-fold cache invalidates on pricing change, live rewrite, and deleted sessions', async () => {
+  const keep = { header: { id: 'keep', origin: 'user' }, events: parentEvents }
+  const gone = { header: { id: 'gone', origin: 'user' }, events: childEvents }
+  const listed = [keep, gone]
+  const query = {
+    async listSessions() {
+      return listed.map(session => ({ header: session.header }))
+    },
+    async readSession(id) {
+      const session = listed.find(item => item.header.id === id)
+      if (!session) throw new Error(`missing ${id}`)
+      return { events: session.events }
+    },
+  }
+  const liveMap = {
+    get(id) {
+      return id === 'keep' ? { events: keep.events } : undefined
+    },
+  }
+  const store = new SessionFoldCache()
+  const first = await collectSessionCosts(query, DEFAULT_PRICING, store, liveMap)
+  assert.equal(first.length, 2)
+  assert.equal(store.size, 2)
+  listed.pop()
+  keep.events = usageEvents('vendor', 'model-a', peak, { inputTokens: 2_000_000, outputTokens: 500_000 })
+  const afterRewrite = await collectSessionCosts(query, DEFAULT_PRICING, store, liveMap)
+  assert.equal(afterRewrite.length, 1)
+  assert.equal(store.size, 1)
+  assert.equal(afterRewrite[0].cost.inputTokens, 2_000_000)
+  const cheaper = structuredClone(DEFAULT_PRICING)
+  cheaper.default.rates.input = 0.5
+  const afterPrice = await collectSessionCosts(query, cheaper, store, liveMap)
+  assert.equal(afterPrice[0].cost.inputCost, 1)
+  assert.equal(afterRewrite[0].cost.inputCost, 2)
+  assert.notEqual(pricingFingerprint(DEFAULT_PRICING), pricingFingerprint(cheaper))
+})
+
+test('log fingerprint changes when later usage replaces the same step', () => {
+  const first = [
+    { type: 'request/header', time: 0, data: { header: { config: { provider: 'vendor', model: 'a' } } } },
+    { type: 'assistant/message', time: 1, data: { turn: 1, step: 1, usage: { inputTokens: 300_000, outputTokens: 10 } } },
+  ]
+  const replaced = [
+    first[0],
+    { type: 'assistant/message', time: 1, data: { turn: 1, step: 1, usage: { inputTokens: 100_000, outputTokens: 10 } } },
+  ]
+  assert.notEqual(logFingerprint(first), logFingerprint(replaced))
 })
 
 const tableRows = [

@@ -1178,14 +1178,16 @@ window.__ModuleLoader__.load({
 			react.default.useEffect(() => () => {
 				if (tooltipTimerRef.current) clearTimeout(tooltipTimerRef.current);
 			}, []);
-			const loadSessionCosts = () => {
-				setSessionLoading(true);
-				setSessionLoadError(null);
+			const loadSessionCosts = (reuse) => {
+				if (!reuse) {
+					setSessionLoading(true);
+					setSessionLoadError(null);
+				}
 				loadAllSessionCosts(props.costMeter, props.sessions).then((rows) => {
 					setSessionRows(rows);
 					setSessionLoadError(null);
 				}).catch((error) => {
-					setSessionLoadError(`会话费用加载失败：${remoteErrorText(error)}`);
+					if (!reuse || sessionRows.length === 0) setSessionLoadError(`会话费用加载失败：${remoteErrorText(error)}`);
 				}).finally(() => {
 					setSessionLoading(false);
 				});
@@ -1198,7 +1200,7 @@ window.__ModuleLoader__.load({
 			};
 			const openAllSessions = () => {
 				setShowAllSessions(true);
-				loadSessionCosts();
+				loadSessionCosts(sessionRows.length > 0);
 			};
 			if (!state || !(state.cost > 0)) return null;
 			const symbol = currencySymbol(state.currency);

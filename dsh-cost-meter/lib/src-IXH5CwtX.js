@@ -1257,6 +1257,116 @@ function foldSession(events, config = DEFAULT_PRICING) {
 	return out;
 }
 //#endregion
+//#region src/session-fold-cache.ts
+/** In-process cache of each session's own fold, keyed by pricing and log fingerprints. */
+function stableValue(value) {
+	if (Array.isArray(value)) return value.map(stableValue);
+	if (value !== null && typeof value === "object") return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stableValue(value[key])]));
+	return value;
+}
+/** Deterministic fingerprint of the live pricing used to value a fold. */
+function pricingFingerprint(config) {
+	return JSON.stringify(stableValue(config));
+}
+function usageMix(event) {
+	const usage = event.data.usage ?? (event.data.chunk?.type === "usage" ? event.data.chunk.usage : void 0);
+	if (usage === void 0) return 0;
+	let mix = 0;
+	for (const value of Object.values(usage)) if (typeof value === "number" && Number.isFinite(value)) mix = Math.imul(mix, 33) + (value | 0) >>> 0;
+	return mix;
+}
+/**
+* Cheap identity of one session log. Length, a rolling mix of type/time/usage,
+* and the last event distinguish appends and last-writer-wins usage
+* replacements without hashing the whole payload.
+*/
+function logFingerprint(events) {
+	let mix = events.length >>> 0;
+	for (const event of events) {
+		mix = Math.imul(mix, 33) + event.type.length >>> 0;
+		mix = Math.imul(mix, 33) + (event.time | 0) >>> 0;
+		const turn = event.data.turn;
+		const step = event.data.step;
+		if (typeof turn === "number") mix = Math.imul(mix, 33) + (turn | 0) >>> 0;
+		if (typeof step === "number") mix = Math.imul(mix, 33) + (step | 0) >>> 0;
+		mix = Math.imul(mix, 33) + usageMix(event) >>> 0;
+	}
+	const last = events[events.length - 1];
+	return `${events.length}:${mix}:${last?.type ?? ""}:${last?.time ?? 0}:${last?.data.turn ?? ""}:${last?.data.step ?? ""}:${usageMix(last ?? {
+		type: "",
+		time: 0,
+		data: {}
+	})}`;
+}
+/**
+* Reuse a session's own fold when the pricing config and log fingerprint match.
+* A pricing change drops every entry. Deleted ids are dropped by `retain()`.
+*/
+var SessionFoldCache = class {
+	compute;
+	entries = /* @__PURE__ */ new Map();
+	pricing = "";
+	stats = {
+		hits: 0,
+		misses: 0
+	};
+	constructor(compute = foldSession) {
+		this.compute = compute;
+	}
+	get size() {
+		return this.entries.size;
+	}
+	alignPricing(config) {
+		const pricing = pricingFingerprint(config);
+		if (this.pricing !== "" && this.pricing !== pricing) this.entries.clear();
+		this.pricing = pricing;
+		return pricing;
+	}
+	/**
+	* Return a previously stored own-fold when the live pricing still matches.
+	* Callers that already know the session is not live may skip a durable reread.
+	* @param sessionId Durable session id.
+	* @param config Live pricing. A different fingerprint clears the cache first.
+	* @returns The cached own-fold, or undefined on a miss.
+	*/
+	peek(sessionId, config) {
+		const pricing = this.alignPricing(config);
+		const hit = this.entries.get(sessionId);
+		if (hit === void 0 || hit.pricing !== pricing) return void 0;
+		this.stats.hits += 1;
+		return hit.cost;
+	}
+	/**
+	* Return the cached own-fold or compute and store a new one.
+	* @param sessionId Durable session id.
+	* @param events Complete log used for the fingerprint and, on a miss, the fold.
+	* @param config Live pricing. A different fingerprint clears the cache first.
+	* @returns The session's own fold, never a parent-merged total.
+	*/
+	fold(sessionId, events, config) {
+		const pricing = this.alignPricing(config);
+		const log = logFingerprint(events);
+		const hit = this.entries.get(sessionId);
+		if (hit !== void 0 && hit.pricing === pricing && hit.log === log) {
+			this.stats.hits += 1;
+			return hit.cost;
+		}
+		this.stats.misses += 1;
+		const cost = this.compute(events, config);
+		this.entries.set(sessionId, {
+			pricing,
+			log,
+			cost
+		});
+		return cost;
+	}
+	/** Drop entries whose session is no longer in the listed corpus. */
+	retain(sessionIds) {
+		const keep = new Set(sessionIds);
+		for (const id of this.entries.keys()) if (!keep.has(id)) this.entries.delete(id);
+	}
+};
+//#endregion
 //#region src/session-table.ts
 /** Combine one listed session with its independently folded cost. */
 function mergeListedSessionCost(item, cost) {
@@ -1529,17 +1639,37 @@ function subagentChildren(records) {
 	}
 	return children;
 }
-async function readSubagentTree(query, children, sessionId, config, seen) {
+function resolveEvents(sessionId, sessions, query) {
+	const live = sessions?.get(sessionId)?.events;
+	if (live !== void 0) return live;
+	if (query === void 0) return void 0;
+	return query.readSession(sessionId).then((snapshot) => snapshot.events);
+}
+async function foldOwnSession(sessionId, events, config, store) {
+	return store === void 0 ? foldSession(events, config) : store.fold(sessionId, events, config);
+}
+async function ownFoldFor(sessionId, config, sessions, query, store) {
+	const live = sessions?.get(sessionId)?.events;
+	if (live === void 0 && store?.peek !== void 0) {
+		const cached = store.peek(sessionId, config);
+		if (cached !== void 0) return cached;
+	}
+	const events = live ?? await resolveEvents(sessionId, void 0, query);
+	if (events === void 0) return void 0;
+	return foldOwnSession(sessionId, events, config, store);
+}
+async function readSubagentTree(query, children, sessionId, config, seen, sessions, store) {
 	const ids = children.get(sessionId) ?? [];
 	const rows = [];
 	for (const id of ids) {
 		if (seen.has(id)) continue;
 		seen.add(id);
-		const cost = foldSession((await query.readSession(id)).events, config);
+		const cost = await ownFoldFor(id, config, sessions, query, store);
+		if (cost === void 0) continue;
 		rows.push({
 			...cost,
 			sessionId: id,
-			children: await readSubagentTree(query, children, id, config, seen)
+			children: await readSubagentTree(query, children, id, config, seen, sessions, store)
 		});
 	}
 	return rows;
@@ -1560,9 +1690,11 @@ function mergeCostInto(target, cost) {
 * Fold every listed session independently.
 * @param query Durable session listing/read face, or undefined when the host has none.
 * @param config Live pricing used for every session.
+* @param store Optional own-fold cache. Hits reuse the previous fold for an unchanged log and pricing.
+* @param sessions Optional live session map. Live events take precedence over a durable read.
 * @returns Listed sessions in original order, skipping duplicate ids and unreadable logs. A listing failure returns [].
 */
-async function collectSessionCosts(query, config) {
+async function collectSessionCosts(query, config, store, sessions) {
 	if (query === void 0) return [];
 	let records;
 	try {
@@ -1576,19 +1708,21 @@ async function collectSessionCosts(query, config) {
 		const sessionId = record.header.id;
 		if (sessionId === "" || seen.has(sessionId)) continue;
 		seen.add(sessionId);
-		let events;
+		let cost;
 		try {
-			events = (await query.readSession(sessionId)).events;
+			cost = await ownFoldFor(sessionId, config, sessions, query, store);
 		} catch {
 			continue;
 		}
+		if (cost === void 0) continue;
 		rows.push({
 			sessionId,
 			parentSession: record.header.parentSession ?? null,
 			origin: record.header.origin ?? null,
-			cost: foldSession(events, config)
+			cost
 		});
 	}
+	store?.retain?.(seen);
 	return rows;
 }
 function mergeCosts(primary, subagents) {
@@ -1607,6 +1741,7 @@ function mergeCosts(primary, subagents) {
 var CostMeterService = class extends TypertRemoteService {
 	static Config = Config;
 	static inject = ["settings"];
+	folds = new SessionFoldCache();
 	constructor(ctx) {
 		super(ctx, "costMeter");
 	}
@@ -1615,20 +1750,18 @@ var CostMeterService = class extends TypertRemoteService {
 		if (typeof sessionId !== "string" || sessionId.length === 0) return null;
 		const sessions = this.ctx.get("sessions");
 		const query = this.ctx.get("sessionQuery");
-		let events = sessions?.get(sessionId)?.events;
-		if (events === void 0) {
-			if (query === void 0) return null;
-			events = (await query.readSession(sessionId)).events;
-		}
 		const config = this.ctx.settings.get(SETTINGS_NS) ?? DEFAULT_PRICING;
-		const cost = foldSession(events, config);
+		const cost = await ownFoldFor(sessionId, config, sessions, query, this.folds);
+		if (cost === void 0) return null;
 		if (query === void 0) return cost;
-		return mergeCosts(cost, await readSubagentTree(query, subagentChildren(await query.listSessions()), sessionId, config, /* @__PURE__ */ new Set([sessionId])));
+		return mergeCosts(cost, await readSubagentTree(query, subagentChildren(await query.listSessions()), sessionId, config, /* @__PURE__ */ new Set([sessionId]), sessions, this.folds));
 	}
 	/** Fold every listed session independently for the all-session overview. */
 	async sessionCosts() {
-		return collectSessionCosts(this.ctx.get("sessionQuery"), this.ctx.settings.get(SETTINGS_NS) ?? DEFAULT_PRICING);
+		const query = this.ctx.get("sessionQuery");
+		const sessions = this.ctx.get("sessions");
+		return collectSessionCosts(query, this.ctx.settings.get(SETTINGS_NS) ?? DEFAULT_PRICING, this.folds, sessions);
 	}
 };
 //#endregion
-export { normalizeUsage as C, routeKey as D, resolvePricing as E, validatePricing as O, formatTokenThreshold as S, resolveContextSurcharge as T, toggleSessionTableSort as _, filterSessionRows as a, foldSession as b, localDateOfHour as c, queryHourlyOverview as d, querySessionRows as f, sumHourlySlices as g, sortSessionRows as h, filterHourlyEntries as i, mapWithConcurrency as l, sessionTotalTokens as m, CostMeterService as n, flattenHourlyEntries as o, sessionRoutes as p, collectSessionCosts as r, groupHourlyEntries as s, Config as t, mergeListedSessionCost as u, DEFAULT_PRICING as v, resolveContextMultiplier as w, formatContextSurcharge as x, contextTokensOf as y };
+export { routeKey as A, foldSession as C, resolveContextMultiplier as D, normalizeUsage as E, resolveContextSurcharge as O, contextTokensOf as S, formatTokenThreshold as T, toggleSessionTableSort as _, filterSessionRows as a, pricingFingerprint as b, localDateOfHour as c, queryHourlyOverview as d, querySessionRows as f, sumHourlySlices as g, sortSessionRows as h, filterHourlyEntries as i, validatePricing as j, resolvePricing as k, mapWithConcurrency as l, sessionTotalTokens as m, CostMeterService as n, flattenHourlyEntries as o, sessionRoutes as p, collectSessionCosts as r, groupHourlyEntries as s, Config as t, mergeListedSessionCost as u, SessionFoldCache as v, formatContextSurcharge as w, DEFAULT_PRICING as x, logFingerprint as y };

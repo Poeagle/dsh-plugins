@@ -53,6 +53,8 @@ The UI lists every model in the live `llm.models` catalog. A model without an ov
 
 The Host folds the session log in sequence order. Each `request/header` selects the actual provider/model for later usage in that request epoch. `assistant/chunk` and `assistant/message` usage reports use last-writer-wins for the same turn/step, matching the Harness token projection and preventing duplicate accounting. After the resolved rates, a matching `contextSurcharge` multiplies that request's entire cost. A parent session's total includes every descendant session whose durable header identifies it as a subagent; each child log is folded once, so nested delegation is included without replaying a child through multiple parents. The composer modal first shows the current session. An explicit control then loads every durable session through `sessionCosts()` when the host exports it; if that endpoint is unavailable, the overview falls back to `session.list` plus concurrent per-session `sessionCost()` calls. The all-session view groups those independent hourly buckets by local date and hour, so expanding a period lists every matching session without inheriting a parent session's merged subagent totals.
 
+The Host keeps an in-process cache of each session's own fold, keyed by a pricing fingerprint and a log fingerprint. A later all-session load reuses an unchanged historical session without rereading or refolding it, refolds a live or rewritten log, and drops deleted ids. A pricing edit invalidates every cached fold so retained history is revalued. The cache does not survive a host restart and does not persist a parent session's merged subagent total.
+
 Token usage fields are disjoint:
 
 - `inputTokens` uses `input`.
@@ -77,6 +79,7 @@ npm test
 | --- | --- |
 | `src/pricing.ts` | Shared config validation, time-window matching, and rate resolution |
 | `src/session-table.ts` | Session overview filter and sort helpers |
+| `src/session-fold-cache.ts` | In-process own-fold cache keyed by pricing and log fingerprints |
 | `src/index.ts` | Host settings namespace, session fold, and Remote service |
 | `src/typert.host.ts` | Host wire manifest |
 | `src/client.ts` | Composer cost line, current-session modal, all-session overview, and Plugins settings card |
@@ -87,3 +90,4 @@ npm test
 - The result is an estimate from provider usage fields and configured prices, not a provider invoice.
 - Price edits revalue retained history because no per-request pricing snapshot is appended to the session log.
 - Models absent from the current catalog remain editable only when they already have an override; new dormant routes cannot be added by hand in the settings card.
+- The own-fold cache is process-local. A historical session rewritten on disk while it is not live stays cached until the next pricing change or host restart.
