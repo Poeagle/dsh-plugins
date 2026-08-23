@@ -1178,6 +1178,15 @@ function foldSession(events, config = DEFAULT_PRICING) {
 }
 //#endregion
 //#region src/session-table.ts
+/** Combine one listed session with its independently folded cost. */
+function mergeListedSessionCost(item, cost) {
+	return {
+		sessionId: item.sessionId,
+		parentSession: item.parentSessionId ?? null,
+		origin: item.origin ?? null,
+		cost
+	};
+}
 function routeLabel(provider, model) {
 	if (provider && model) return `${provider}/${model}`;
 	return model ?? provider ?? null;
@@ -1394,4 +1403,4 @@ var CostMeterService = class extends TypertRemoteService {
 	}
 };
 //#endregion
-export { querySessionRows as a, sortSessionRows as c, foldSession as d, normalizeUsage as f, validatePricing as h, filterSessionRows as i, toggleSessionTableSort as l, routeKey as m, CostMeterService as n, sessionRoutes as o, resolvePricing as p, collectSessionCosts as r, sessionTotalTokens as s, Config as t, DEFAULT_PRICING as u };
+export { mergeListedSessionCost as a, sessionTotalTokens as c, DEFAULT_PRICING as d, foldSession as f, validatePricing as g, routeKey as h, filterSessionRows as i, sortSessionRows as l, resolvePricing as m, CostMeterService as n, querySessionRows as o, normalizeUsage as p, collectSessionCosts as r, sessionRoutes as s, Config as t, toggleSessionTableSort as u };

@@ -107,6 +107,15 @@ window.__ModuleLoader__.load({
 		}
 		//#endregion
 		//#region src/session-table.ts
+		/** Combine one listed session with its independently folded cost. */
+		function mergeListedSessionCost(item, cost) {
+			return {
+				sessionId: item.sessionId,
+				parentSession: item.parentSessionId ?? null,
+				origin: item.origin ?? null,
+				cost
+			};
+		}
 		function routeLabel(provider, model) {
 			if (provider && model) return `${provider}/${model}`;
 			return model ?? provider ?? null;
@@ -183,6 +192,26 @@ window.__ModuleLoader__.load({
 			"timer",
 			"connection"
 		];
+		function remoteErrorText(error) {
+			if (error && typeof error === "object" && "message" in error && typeof error.message === "string") return error.message;
+			return error === void 0 ? "未知错误" : String(error);
+		}
+		async function loadAllSessionCosts(costMeter, sessions) {
+			const remote = await costMeter.sessionCosts();
+			if (remote.ok && Array.isArray(remote.value)) return remote.value;
+			const listed = await sessions.list({});
+			if (!listed.result.ok || listed.result.value === void 0) throw new Error(remoteErrorText(remote.error ?? listed.result.error) || "会话费用加载失败");
+			const rows = [];
+			const seen = /* @__PURE__ */ new Set();
+			for (const item of listed.result.value.items) {
+				if (item.sessionId === "" || seen.has(item.sessionId)) continue;
+				seen.add(item.sessionId);
+				const response = await costMeter.sessionCost(item.sessionId);
+				if (!response.ok || response.value === null || response.value === void 0) continue;
+				rows.push(mergeListedSessionCost(item, response.value));
+			}
+			return rows;
+		}
 		const PRICING_ROUTE = "/cost-meter/pricing";
 		/**
 		* Pricing config source backed by the plugin's own host route. dsh's settings
@@ -953,13 +982,11 @@ window.__ModuleLoader__.load({
 			const loadSessionCosts = () => {
 				setSessionLoading(true);
 				setSessionLoadError(null);
-				props.costMeter.sessionCosts().then((response) => {
-					if (response.ok && Array.isArray(response.value)) {
-						setSessionRows(response.value);
-						setSessionLoadError(null);
-					} else setSessionLoadError("会话费用加载失败");
-				}).catch(() => {
-					setSessionLoadError("会话费用加载失败");
+				loadAllSessionCosts(props.costMeter, props.sessions).then((rows) => {
+					setSessionRows(rows);
+					setSessionLoadError(null);
+				}).catch((error) => {
+					setSessionLoadError(`会话费用加载失败：${remoteErrorText(error)}`);
 				}).finally(() => {
 					setSessionLoading(false);
 				});
@@ -1508,6 +1535,7 @@ window.__ModuleLoader__.load({
 			}, (props) => react.default.createElement(CostDock, {
 				...props,
 				costMeter,
+				sessions: connection.api.sessions,
 				interval: (callback, delay) => ctx.interval(callback, delay)
 			})));
 			slots.inject("settings.plugin.item", () => slots.register({

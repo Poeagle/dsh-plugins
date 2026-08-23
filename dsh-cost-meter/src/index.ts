@@ -17,6 +17,7 @@ import {
 export { DEFAULT_PRICING, foldSession, normalizeUsage, resolvePricing, routeKey, validatePricing }
 export {
   filterSessionRows,
+  mergeListedSessionCost,
   querySessionRows,
   sessionRoutes,
   sessionTotalTokens,

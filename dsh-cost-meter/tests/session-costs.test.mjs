@@ -4,6 +4,7 @@ import {
   DEFAULT_PRICING,
   collectSessionCosts,
   filterSessionRows,
+  mergeListedSessionCost,
   querySessionRows,
   sortSessionRows,
 } from '../lib/index.js'
@@ -134,6 +135,19 @@ test('sorts session rows by cost and tokens', () => {
   assert.deepEqual(sortSessionRows(tableRows, { key: 'cacheReadTokens', dir: 'desc' }).map(row => row.sessionId), ['sess-a', 'sess-b', 'sess-c'])
   assert.deepEqual(sortSessionRows(tableRows, { key: 'outputTokens', dir: 'asc' }).map(row => row.sessionId), ['sess-c', 'sess-b', 'sess-a'])
   assert.deepEqual(sortSessionRows(tableRows, { key: 'totalTokens', dir: 'desc' }).map(row => row.sessionId), ['sess-a', 'sess-c', 'sess-b'])
+})
+
+test('mergeListedSessionCost keeps listing metadata with an independent fold', () => {
+  const row = mergeListedSessionCost(
+    { sessionId: 'child', parentSessionId: 'parent', origin: 'subagent' },
+    { cost: 3, inputTokens: 10, cacheReadTokens: 2, cacheWriteTokens: 0, outputTokens: 4, route: 'wz/gpt-5.6-terra' },
+  )
+  assert.deepEqual(row, {
+    sessionId: 'child',
+    parentSession: 'parent',
+    origin: 'subagent',
+    cost: { cost: 3, inputTokens: 10, cacheReadTokens: 2, cacheWriteTokens: 0, outputTokens: 4, route: 'wz/gpt-5.6-terra' },
+  })
 })
 
 test('filters session rows by text, origin, and route', () => {

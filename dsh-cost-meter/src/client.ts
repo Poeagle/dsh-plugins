@@ -5,6 +5,7 @@ import React from 'react'
 import type { PricingConfig, PricingPeriod, PricingPlan, TokenRates } from './pricing.js'
 import { DEFAULT_PRICING, routeKey, validatePricing } from './pricing.js'
 import {
+  mergeListedSessionCost,
   querySessionRows,
   sessionRoutes,
   sessionTotalTokens,
@@ -108,10 +109,42 @@ interface ModelItem { id: string; name: string }
 interface ModelGroup { id: string; name: string; models: ModelItem[] }
 interface CatalogSnapshot { status: 'loading' | 'ready' | 'error'; groups: ModelGroup[] }
 interface Observable<T> { getSnapshot(): T; subscribe(listener: () => void): () => void }
+interface SessionListItem {
+  sessionId: string
+  parentSessionId?: string
+  origin?: string
+}
 interface ApiFace {
   llm: { models(input: {}): Promise<{ result: { ok: boolean; value?: { groups: ModelGroup[] } } }> }
+  sessions: { list(input: {}): Promise<{ result: { ok: boolean; value?: { items: SessionListItem[] }; error?: unknown } }> }
 }
 interface ConnectionFace { api: ApiFace }
+
+function remoteErrorText(error: unknown): string {
+  if (error && typeof error === 'object' && 'message' in error && typeof (error as { message: unknown }).message === 'string') {
+    return (error as { message: string }).message
+  }
+  return error === undefined ? '未知错误' : String(error)
+}
+
+async function loadAllSessionCosts(costMeter: CostMeterFace, sessions: ApiFace['sessions']): Promise<SessionCostRecord[]> {
+  const remote = await costMeter.sessionCosts()
+  if (remote.ok && Array.isArray(remote.value)) return remote.value
+  const listed = await sessions.list({})
+  if (!listed.result.ok || listed.result.value === undefined) {
+    throw new Error(remoteErrorText(remote.error ?? listed.result.error) || '会话费用加载失败')
+  }
+  const rows: SessionCostRecord[] = []
+  const seen = new Set<string>()
+  for (const item of listed.result.value.items) {
+    if (item.sessionId === '' || seen.has(item.sessionId)) continue
+    seen.add(item.sessionId)
+    const response = await costMeter.sessionCost(item.sessionId)
+    if (!response.ok || response.value === null || response.value === undefined) continue
+    rows.push(mergeListedSessionCost(item, response.value))
+  }
+  return rows
+}
 
 const PRICING_ROUTE = '/cost-meter/pricing'
 
@@ -495,7 +528,7 @@ function HourlyTable(props: {
   )
 }
 
-function CostDock(props: { sessionId: string; costMeter: CostMeterFace; interval(callback: () => void, delay: number): () => void }) {
+function CostDock(props: { sessionId: string; costMeter: CostMeterFace; sessions: ApiFace['sessions']; interval(callback: () => void, delay: number): () => void }) {
   const [state, setState] = React.useState<CostFold | null>(null)
   const [tooltip, setTooltip] = React.useState(false)
   const [showModal, setShowModal] = React.useState(false)
@@ -522,15 +555,11 @@ function CostDock(props: { sessionId: string; costMeter: CostMeterFace; interval
   const loadSessionCosts = () => {
     setSessionLoading(true)
     setSessionLoadError(null)
-    props.costMeter.sessionCosts().then(response => {
-      if (response.ok && Array.isArray(response.value)) {
-        setSessionRows(response.value)
-        setSessionLoadError(null)
-      } else {
-        setSessionLoadError('会话费用加载失败')
-      }
-    }).catch(() => {
-      setSessionLoadError('会话费用加载失败')
+    loadAllSessionCosts(props.costMeter, props.sessions).then(rows => {
+      setSessionRows(rows)
+      setSessionLoadError(null)
+    }).catch((error: unknown) => {
+      setSessionLoadError(`会话费用加载失败：${remoteErrorText(error)}`)
     }).finally(() => {
       setSessionLoading(false)
     })
@@ -809,7 +838,7 @@ export async function apply(ctx: Context) {
 
   slots.inject('conversation.composer.dock', () => slots.register(
     { name: 'conversation.composer.dock', id: 'cost-meter', order: 100 },
-    (props: { sessionId: string }) => React.createElement(CostDock, { ...props, costMeter, interval: (callback, delay) => (ctx as any).interval(callback, delay) }),
+    (props: { sessionId: string }) => React.createElement(CostDock, { ...props, costMeter, sessions: connection.api.sessions, interval: (callback, delay) => (ctx as any).interval(callback, delay) }),
   ))
   slots.inject('settings.plugin.item', () => slots.register({
     name: 'settings.plugin.item', key: 'cost-meter', id: 'cost-meter', order: 30,

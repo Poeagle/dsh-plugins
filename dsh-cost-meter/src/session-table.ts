@@ -44,6 +44,31 @@ export interface SessionTableSort {
   dir: SessionTableSortDir
 }
 
+export interface SessionListItem {
+  sessionId: string
+  parentSessionId?: string
+  origin?: string
+}
+
+export interface RemoteEnvelope<T> {
+  ok: boolean
+  value?: T
+  error?: unknown
+}
+
+/** Combine one listed session with its independently folded cost. */
+export function mergeListedSessionCost<T extends SessionTableCost>(
+  item: SessionListItem,
+  cost: T,
+): SessionTableRow & { cost: T } {
+  return {
+    sessionId: item.sessionId,
+    parentSession: item.parentSessionId ?? null,
+    origin: item.origin ?? null,
+    cost,
+  }
+}
+
 function routeLabel(provider: string | null | undefined, model: string | null | undefined): string | null {
   if (provider && model) return `${provider}/${model}`
   return model ?? provider ?? null
