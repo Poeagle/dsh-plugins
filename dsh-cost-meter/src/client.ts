@@ -261,6 +261,7 @@ function ModelPricingRow(props: { provider: ModelGroup; model: ModelItem; config
 function PricingSettingsCard(props: {
   usePricing<T>(selector: (snapshot: SettingsSnapshot) => T): T
   useCatalog<T>(selector: (snapshot: CatalogSnapshot) => T): T
+  refreshCatalog(): Promise<void>
   save(config: PricingConfig, revision?: number): Promise<boolean>
 }) {
   const settings = props.usePricing(snapshot => snapshot)
@@ -278,6 +279,9 @@ function PricingSettingsCard(props: {
       setFailure(null)
     }
   }, [settings.revision, settings.value, seedRevision])
+  React.useEffect(() => {
+    if (open) void props.refreshCatalog()
+  }, [open, props.refreshCatalog])
   if (settings.status === 'unavailable') return null
   const baseline = cloneConfig(settings.value)
   const dirty = JSON.stringify(draft) !== JSON.stringify(baseline)
@@ -609,6 +613,7 @@ export async function apply(ctx: Context) {
     name: 'settings.plugin.item', key: 'cost-meter', id: 'cost-meter', order: 30,
     inject: () => ({
       hooks: { pricing, catalog },
+      refreshCatalog: catalog.load,
       save: (config: PricingConfig) => pricing.save(config),
     }),
   }, PricingSettingsCard))
