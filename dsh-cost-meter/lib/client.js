@@ -780,6 +780,11 @@ window.__ModuleLoader__.load({
 		};
 		function HourlyTable(props) {
 			const routeOf = (row) => `${row.provider ?? ""}/${row.model ?? ""}`;
+			const flatten = (rows) => rows.flatMap((row) => [...(row.hourly ?? []).map((entry) => ({
+				sessionId: row.sessionId,
+				entry
+			})), ...flatten(row.children)]);
+			const childRows = flatten(props.subagents ?? []);
 			const sumRows = (rows) => {
 				const first = rows[0];
 				if (first === void 0) return null;
@@ -825,15 +830,17 @@ window.__ModuleLoader__.load({
 					fontWeight: 600
 				} }, `${props.symbol}${money(row.cost)}`)
 			];
-			const hours = [...new Set(props.hourly.map((row) => row.hour))].sort();
-			const totals = sumRows(props.hourly);
+			const hours = [.../* @__PURE__ */ new Set([...props.hourly.map((row) => row.hour), ...childRows.map((row) => row.entry.hour)])].sort();
+			const totals = sumRows([...props.hourly, ...childRows.map((row) => row.entry)]);
 			return react.default.createElement("table", { style: {
 				width: "100%",
 				borderCollapse: "collapse",
 				whiteSpace: "nowrap",
 				marginTop: 8
 			} }, react.default.createElement("thead", null, react.default.createElement("tr", null, react.default.createElement("th", { style: props.headerLeft }, "时间段"), react.default.createElement("th", { style: props.headerStyle }, "轮次"), react.default.createElement("th", { style: props.headerStyle }, "步骤"), react.default.createElement("th", { style: props.headerStyle }, "工具调用"), react.default.createElement("th", { style: props.headerStyle }, "输入 tokens"), react.default.createElement("th", { style: props.headerStyle }, "输入价格"), react.default.createElement("th", { style: props.headerStyle }, "缓存 tokens"), react.default.createElement("th", { style: props.headerStyle }, "缓存价格"), react.default.createElement("th", { style: props.headerStyle }, "输出 tokens"), react.default.createElement("th", { style: props.headerStyle }, "输出价格"), react.default.createElement("th", { style: props.headerStyle }, "缓存率"), react.default.createElement("th", { style: props.headerStyle }, "总价"), react.default.createElement("th", { style: props.headerStyle }, "时段名称"), react.default.createElement("th", { style: props.headerStyle }, "模型"))), react.default.createElement("tbody", null, ...hours.flatMap((hour) => {
-				const hourRows = props.hourly.filter((row) => row.hour === hour);
+				const rootRows = props.hourly.filter((row) => row.hour === hour);
+				const hourChildren = childRows.filter((row) => row.entry.hour === hour);
+				const hourRows = [...rootRows, ...hourChildren.map((row) => row.entry)];
 				const total = sumRows(hourRows);
 				if (total === null) return [];
 				const timeKey = `${props.sessionId}:time:${hour}`;
@@ -864,7 +871,9 @@ window.__ModuleLoader__.load({
 					const modelTotal = sumRows(entries);
 					if (modelTotal === null) return [];
 					const modelKey = `${props.sessionId}:model:${hour}:${route}`;
-					return [react.default.createElement("tr", {
+					const modelExpanded = props.expandedHours.has(modelKey);
+					const children = hourChildren.filter((row) => routeOf(row.entry) === route);
+					const modelRow = react.default.createElement("tr", {
 						key: modelKey,
 						style: {
 							borderBottom: "1px solid var(--dsw-alias-border-l2, #eee)",
@@ -873,7 +882,33 @@ window.__ModuleLoader__.load({
 					}, react.default.createElement("td", { style: {
 						...props.cellLeft,
 						paddingLeft: 28
-					} }, `↳ ${route}`), ...dataCells(modelTotal), react.default.createElement("td", { style: props.cellBase }, entries[0]?.periodName ?? "-"), react.default.createElement("td", { style: props.cellBase }, route))];
+					} }, children.length > 0 ? react.default.createElement("button", {
+						type: "button",
+						"aria-expanded": modelExpanded,
+						onClick: () => props.toggleHour(modelKey),
+						style: {
+							border: 0,
+							background: "transparent",
+							cursor: "pointer",
+							padding: "0 6px 0 0",
+							fontSize: 13,
+							color: "inherit"
+						}
+					}, modelExpanded ? "−" : "+") : react.default.createElement("span", { style: {
+						display: "inline-block",
+						width: 19
+					} }), `↳ ${route}`), ...dataCells(modelTotal), react.default.createElement("td", { style: props.cellBase }, "-"), react.default.createElement("td", { style: props.cellBase }, route));
+					if (!modelExpanded) return [modelRow];
+					return [modelRow, ...children.map(({ sessionId, entry }) => react.default.createElement("tr", {
+						key: `${props.sessionId}:child:${hour}:${route}:${sessionId}`,
+						style: {
+							borderBottom: "1px solid var(--dsw-alias-border-l2, #eee)",
+							color: "var(--dsw-alias-label-secondary)"
+						}
+					}, react.default.createElement("td", { style: {
+						...props.cellLeft,
+						paddingLeft: 52
+					} }, `↳ 子代理 ${sessionId.slice(0, 8)}`), ...dataCells(entry), react.default.createElement("td", { style: props.cellBase }, entry.periodName ?? "-"), react.default.createElement("td", { style: props.cellBase }, `${entry.provider ?? "?"}/${entry.model ?? "?"}`)))];
 				})];
 			}), totals ? react.default.createElement("tr", { style: {
 				fontWeight: 600,
@@ -898,6 +933,7 @@ window.__ModuleLoader__.load({
 			const [sessionLoading, setSessionLoading] = react.default.useState(false);
 			const [expandedSessions, setExpandedSessions] = react.default.useState(() => /* @__PURE__ */ new Set());
 			const [expandedHours, setExpandedHours] = react.default.useState(() => /* @__PURE__ */ new Set());
+			const [showAllSessions, setShowAllSessions] = react.default.useState(false);
 			const [sessionFilter, setSessionFilter] = react.default.useState(EMPTY_SESSION_FILTER);
 			const [sessionSort, setSessionSort] = react.default.useState(DEFAULT_SESSION_SORT);
 			const tooltipTimerRef = react.default.useRef(null);
@@ -930,7 +966,12 @@ window.__ModuleLoader__.load({
 			};
 			const openModal = () => {
 				setShowModal(true);
+				setShowAllSessions(false);
+				setSessionLoadError(null);
 				setTooltip(false);
+			};
+			const openAllSessions = () => {
+				setShowAllSessions(true);
 				loadSessionCosts();
 			};
 			if (!state || !(state.cost > 0)) return null;
@@ -1208,12 +1249,25 @@ window.__ModuleLoader__.load({
 			}, react.default.createElement("div", { style: {
 				display: "flex",
 				justifyContent: "space-between",
-				alignItems: "center"
+				alignItems: "center",
+				gap: 12
 			} }, react.default.createElement("h2", { style: {
 				margin: 0,
 				fontSize: 18,
 				fontWeight: 600
-			} }, "API 费用统计明细"), react.default.createElement("button", {
+			} }, "API 费用统计明细"), react.default.createElement("div", { style: {
+				display: "flex",
+				alignItems: "center",
+				gap: 8
+			} }, showAllSessions ? react.default.createElement("button", {
+				type: "button",
+				style: buttonStyle,
+				onClick: () => setShowAllSessions(false)
+			}, "返回本会话") : react.default.createElement("button", {
+				type: "button",
+				style: buttonStyle,
+				onClick: openAllSessions
+			}, "查看全部会话"), react.default.createElement("button", {
 				style: {
 					background: "none",
 					border: "none",
@@ -1224,7 +1278,7 @@ window.__ModuleLoader__.load({
 					borderRadius: 4
 				},
 				onClick: () => setShowModal(false)
-			}, "✕")), react.default.createElement("section", { style: {
+			}, "✕"))), showAllSessions ? react.default.createElement("section", { style: {
 				display: "flex",
 				flexDirection: "column",
 				gap: 10
@@ -1362,7 +1416,29 @@ window.__ModuleLoader__.load({
 					headerStyle,
 					headerLeft
 				})))];
-			}))))))) : null);
+			}))))) : react.default.createElement("section", { style: {
+				display: "flex",
+				flexDirection: "column",
+				gap: 10
+			} }, react.default.createElement("h3", { style: {
+				margin: 0,
+				fontSize: 13,
+				fontWeight: 600
+			} }, "当前会话"), react.default.createElement("div", { style: {
+				overflowX: "auto",
+				fontSize: 12
+			} }, react.default.createElement(HourlyTable, {
+				sessionId: props.sessionId,
+				hourly: state.hourly ?? [],
+				subagents: state.subagents ?? [],
+				expandedHours,
+				toggleHour,
+				symbol,
+				cellBase,
+				cellLeft,
+				headerStyle,
+				headerLeft
+			}))))) : null);
 		}
 		async function apply(ctx) {
 			const remote = ctx.get("remote");

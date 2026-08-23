@@ -153,14 +153,20 @@ function mergeCostInto(target: ReturnType<typeof foldSession>, cost: ReturnType<
  * Fold every listed session independently.
  * @param query Durable session listing/read face, or undefined when the host has none.
  * @param config Live pricing used for every session.
- * @returns Listed sessions in original order, skipping duplicate ids and unreadable logs.
+ * @returns Listed sessions in original order, skipping duplicate ids and unreadable logs. A listing failure returns [].
  */
 export async function collectSessionCosts(
   query: SessionQueryFace | undefined,
   config: PricingConfig,
 ): Promise<SessionCostRecord[]> {
   if (query === undefined) return []
-  const records = await query.listSessions()
+  let records: readonly SessionRecord[]
+  try {
+    records = await query.listSessions()
+  } catch {
+    // A listing failure must not fail the Remote method; the overview stays empty.
+    return []
+  }
   const seen = new Set<string>()
   const rows: SessionCostRecord[] = []
   for (const record of records) {

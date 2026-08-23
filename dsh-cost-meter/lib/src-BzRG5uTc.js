@@ -1323,11 +1323,16 @@ function mergeCostInto(target, cost) {
 * Fold every listed session independently.
 * @param query Durable session listing/read face, or undefined when the host has none.
 * @param config Live pricing used for every session.
-* @returns Listed sessions in original order, skipping duplicate ids and unreadable logs.
+* @returns Listed sessions in original order, skipping duplicate ids and unreadable logs. A listing failure returns [].
 */
 async function collectSessionCosts(query, config) {
 	if (query === void 0) return [];
-	const records = await query.listSessions();
+	let records;
+	try {
+		records = await query.listSessions();
+	} catch {
+		return [];
+	}
 	const seen = /* @__PURE__ */ new Set();
 	const rows = [];
 	for (const record of records) {

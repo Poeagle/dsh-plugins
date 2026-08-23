@@ -75,6 +75,13 @@ test('collectSessionCosts returns an empty list without sessionQuery', async () 
   assert.deepEqual(await collectSessionCosts(undefined, DEFAULT_PRICING), [])
 })
 
+test('collectSessionCosts returns an empty list when listing sessions fails', async () => {
+  assert.deepEqual(await collectSessionCosts({
+    async listSessions() { throw new Error('listing failed') },
+    async readSession() { throw new Error('should not read') },
+  }, DEFAULT_PRICING), [])
+})
+
 const tableRows = [
   {
     sessionId: 'sess-b',

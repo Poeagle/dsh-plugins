@@ -366,6 +366,7 @@ const DEFAULT_SESSION_SORT: SessionTableSort = { key: 'cost', dir: 'desc' }
 function HourlyTable(props: {
   sessionId: string
   hourly: readonly HourlyDetail[]
+  subagents?: readonly CostSubagent[]
   expandedHours: ReadonlySet<string>
   toggleHour(id: string): void
   symbol: string
@@ -375,6 +376,11 @@ function HourlyTable(props: {
   headerLeft: React.CSSProperties
 }) {
   const routeOf = (row: HourlyDetail): string => `${row.provider ?? ''}/${row.model ?? ''}`
+  const flatten = (rows: readonly CostSubagent[]): Array<{ sessionId: string; entry: HourlyDetail }> => rows.flatMap(row => [
+    ...(row.hourly ?? []).map(entry => ({ sessionId: row.sessionId, entry })),
+    ...flatten(row.children),
+  ])
+  const childRows = flatten(props.subagents ?? [])
   const sumRows = (rows: readonly HourlyDetail[]): HourlyDetail | null => {
     const first = rows[0]
     if (first === undefined) return null
@@ -417,8 +423,8 @@ function HourlyTable(props: {
     React.createElement('td', { style: props.cellBase }, `${(row.cacheRate * 100).toFixed(1)}%`),
     React.createElement('td', { style: { ...props.cellBase, fontWeight: 600 } }, `${props.symbol}${money(row.cost)}`),
   ]
-  const hours = [...new Set(props.hourly.map(row => row.hour))].sort()
-  const totals = sumRows(props.hourly)
+  const hours = [...new Set([...props.hourly.map(row => row.hour), ...childRows.map(row => row.entry.hour)])].sort()
+  const totals = sumRows([...props.hourly, ...childRows.map(row => row.entry)])
   return React.createElement('table', { style: { width: '100%', borderCollapse: 'collapse', whiteSpace: 'nowrap', marginTop: 8 } },
     React.createElement('thead', null,
       React.createElement('tr', null,
@@ -440,7 +446,9 @@ function HourlyTable(props: {
     ),
     React.createElement('tbody', null,
       ...hours.flatMap(hour => {
-        const hourRows = props.hourly.filter(row => row.hour === hour)
+        const rootRows = props.hourly.filter(row => row.hour === hour)
+        const hourChildren = childRows.filter(row => row.entry.hour === hour)
+        const hourRows = [...rootRows, ...hourChildren.map(row => row.entry)]
         const total = sumRows(hourRows)
         if (total === null) return []
         const timeKey = `${props.sessionId}:time:${hour}`
@@ -458,12 +466,21 @@ function HourlyTable(props: {
           const modelTotal = sumRows(entries)
           if (modelTotal === null) return []
           const modelKey = `${props.sessionId}:model:${hour}:${route}`
-          return [React.createElement('tr', { key: modelKey, style: { borderBottom: '1px solid var(--dsw-alias-border-l2, #eee)', background: 'var(--dsw-alias-bg-layer-2, #fafafa)' } },
-            React.createElement('td', { style: { ...props.cellLeft, paddingLeft: 28 } }, `↳ ${route}`),
+          const modelExpanded = props.expandedHours.has(modelKey)
+          const children = hourChildren.filter(row => routeOf(row.entry) === route)
+          const modelRow = React.createElement('tr', { key: modelKey, style: { borderBottom: '1px solid var(--dsw-alias-border-l2, #eee)', background: 'var(--dsw-alias-bg-layer-2, #fafafa)' } },
+            React.createElement('td', { style: { ...props.cellLeft, paddingLeft: 28 } }, children.length > 0 ? React.createElement('button', { type: 'button', 'aria-expanded': modelExpanded, onClick: () => props.toggleHour(modelKey), style: { border: 0, background: 'transparent', cursor: 'pointer', padding: '0 6px 0 0', fontSize: 13, color: 'inherit' } }, modelExpanded ? '−' : '+') : React.createElement('span', { style: { display: 'inline-block', width: 19 } }), `↳ ${route}`),
             ...dataCells(modelTotal),
-            React.createElement('td', { style: props.cellBase }, entries[0]?.periodName ?? '-'),
+            React.createElement('td', { style: props.cellBase }, '-'),
             React.createElement('td', { style: props.cellBase }, route),
-          )]
+          )
+          if (!modelExpanded) return [modelRow]
+          return [modelRow, ...children.map(({ sessionId, entry }) => React.createElement('tr', { key: `${props.sessionId}:child:${hour}:${route}:${sessionId}`, style: { borderBottom: '1px solid var(--dsw-alias-border-l2, #eee)', color: 'var(--dsw-alias-label-secondary)' } },
+            React.createElement('td', { style: { ...props.cellLeft, paddingLeft: 52 } }, `↳ 子代理 ${sessionId.slice(0, 8)}`),
+            ...dataCells(entry),
+            React.createElement('td', { style: props.cellBase }, entry.periodName ?? '-'),
+            React.createElement('td', { style: props.cellBase }, `${entry.provider ?? '?'}/${entry.model ?? '?'}`),
+          ))]
         })]
       }),
       totals ? React.createElement('tr', { style: { fontWeight: 600, borderTop: '2px solid var(--dsw-alias-border-l1, #bbb)' } },
@@ -487,6 +504,7 @@ function CostDock(props: { sessionId: string; costMeter: CostMeterFace; interval
   const [sessionLoading, setSessionLoading] = React.useState(false)
   const [expandedSessions, setExpandedSessions] = React.useState<Set<string>>(() => new Set())
   const [expandedHours, setExpandedHours] = React.useState<Set<string>>(() => new Set())
+  const [showAllSessions, setShowAllSessions] = React.useState(false)
   const [sessionFilter, setSessionFilter] = React.useState<SessionTableFilter>(EMPTY_SESSION_FILTER)
   const [sessionSort, setSessionSort] = React.useState<SessionTableSort>(DEFAULT_SESSION_SORT)
   const tooltipTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -519,7 +537,12 @@ function CostDock(props: { sessionId: string; costMeter: CostMeterFace; interval
   }
   const openModal = () => {
     setShowModal(true)
+    setShowAllSessions(false)
+    setSessionLoadError(null)
     setTooltip(false)
+  }
+  const openAllSessions = () => {
+    setShowAllSessions(true)
     loadSessionCosts()
   }
   if (!state || !(state.cost > 0)) return null
@@ -649,11 +672,16 @@ function CostDock(props: { sessionId: string; costMeter: CostMeterFace; interval
         style: { background: 'var(--dsw-alias-bg-layer-1, #fff)', borderRadius: 12, padding: 24, maxWidth: '94vw', maxHeight: '86vh', overflow: 'auto', boxShadow: '0 8px 32px rgba(0,0,0,0.3)', display: 'flex', flexDirection: 'column', gap: 16 },
         onClick: (e: React.MouseEvent) => e.stopPropagation(),
       },
-        React.createElement('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center' } },
+        React.createElement('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 } },
           React.createElement('h2', { style: { margin: 0, fontSize: 18, fontWeight: 600 } }, 'API 费用统计明细'),
-          React.createElement('button', { style: { background: 'none', border: 'none', color: 'inherit', fontSize: 20, cursor: 'pointer', padding: '4px 8px', borderRadius: 4 }, onClick: () => setShowModal(false) }, '✕'),
+          React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
+            showAllSessions
+              ? React.createElement('button', { type: 'button', style: buttonStyle, onClick: () => setShowAllSessions(false) }, '返回本会话')
+              : React.createElement('button', { type: 'button', style: buttonStyle, onClick: openAllSessions }, '查看全部会话'),
+            React.createElement('button', { style: { background: 'none', border: 'none', color: 'inherit', fontSize: 20, cursor: 'pointer', padding: '4px 8px', borderRadius: 4 }, onClick: () => setShowModal(false) }, '✕'),
+          ),
         ),
-        React.createElement('section', { style: { display: 'flex', flexDirection: 'column', gap: 10 } },
+        showAllSessions ? React.createElement('section', { style: { display: 'flex', flexDirection: 'column', gap: 10 } },
           React.createElement('h3', { style: { margin: 0, fontSize: 13, fontWeight: 600 } }, '会话费用总览'),
           React.createElement('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(6, minmax(110px, 1fr))', gap: 8 } },
             React.createElement('label', { style: { display: 'flex', flexDirection: 'column', gap: 4, fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, '会话 ID', filterInput(sessionFilter.sessionId, '包含…', value => setSessionFilter(current => ({ ...current, sessionId: value })))),
@@ -719,6 +747,22 @@ function CostDock(props: { sessionId: string; costMeter: CostMeterFace; interval
                 }),
               ),
             ),
+          ),
+        ) : React.createElement('section', { style: { display: 'flex', flexDirection: 'column', gap: 10 } },
+          React.createElement('h3', { style: { margin: 0, fontSize: 13, fontWeight: 600 } }, '当前会话'),
+          React.createElement('div', { style: { overflowX: 'auto', fontSize: 12 } },
+            React.createElement(HourlyTable, {
+              sessionId: props.sessionId,
+              hourly: state.hourly ?? [],
+              subagents: state.subagents ?? [],
+              expandedHours,
+              toggleHour,
+              symbol,
+              cellBase,
+              cellLeft,
+              headerStyle,
+              headerLeft,
+            }),
           ),
         ),
       ),
