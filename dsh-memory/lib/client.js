@@ -552,6 +552,7 @@ window.__ModuleLoader__.load({
 		}
 		function MemoryDock({ sessionId }) {
 			const [status, setStatus] = react.default.useState(null);
+			const [expandedReviews, setExpandedReviews] = react.default.useState(/* @__PURE__ */ new Set());
 			const [reviewProgress, setReviewProgress] = react.default.useState(null);
 			const [modalOpen, setModalOpen] = react.default.useState(false);
 			const [entries, setEntries] = react.default.useState({
@@ -591,11 +592,12 @@ window.__ModuleLoader__.load({
 				]);
 				const memVal = memEntries?.ok === true && memEntries.value?.entries ? memEntries.value.entries : [];
 				const userVal = userEntries?.ok === true && userEntries.value?.entries ? userEntries.value.entries : [];
+				const newestFirst = (items) => [...items].sort((a, b) => b.timestamp.localeCompare(a.timestamp));
 				setEntries({
-					memory: memVal,
-					user: userVal
+					memory: newestFirst(memVal),
+					user: newestFirst(userVal)
 				});
-				setReviewHistory(reviews);
+				setReviewHistory([...reviews].sort((a, b) => b.completedAt.localeCompare(a.completedAt)));
 				setLoading(false);
 			};
 			const closeModal = () => {
@@ -606,15 +608,16 @@ window.__ModuleLoader__.load({
 				const [memEntries, userEntries] = await Promise.all([fetchEntries("memory"), fetchEntries("user")]);
 				const memVal = memEntries?.ok === true && memEntries.value?.entries ? memEntries.value.entries : [];
 				const userVal = userEntries?.ok === true && userEntries.value?.entries ? userEntries.value.entries : [];
+				const newestFirst = (items) => [...items].sort((a, b) => b.timestamp.localeCompare(a.timestamp));
 				setEntries({
-					memory: memVal,
-					user: userVal
+					memory: newestFirst(memVal),
+					user: newestFirst(userVal)
 				});
 				const s = await fetchStatus();
 				if (s) setStatus(s);
 			};
 			const handleDeleteSelected = async () => {
-				const indices = [...selected].sort((a, b) => b - a);
+				const indices = currentEntries.filter((entry) => selected.has(entry.index)).map((entry) => entry.index).sort((a, b) => b - a);
 				if (indices.length === 0) return;
 				if (await deleteEntries(tab, indices)) {
 					setToast(`已删除 ${indices.length} 条`);
@@ -627,6 +630,14 @@ window.__ModuleLoader__.load({
 					setToast("已删除");
 					await reloadEntries();
 				} else setToast("删除失败");
+			};
+			const toggleReview = (key) => {
+				setExpandedReviews((previous) => {
+					const next = new Set(previous);
+					if (next.has(key)) next.delete(key);
+					else next.add(key);
+					return next;
+				});
 			};
 			const toggleSelected = (index) => {
 				setSelected((prev) => {
@@ -810,19 +821,47 @@ window.__ModuleLoader__.load({
 			} }, "结束状态"), react.default.createElement("th", { style: {
 				...cellStyle,
 				fontWeight: 600
-			} }, "变更详情"))), react.default.createElement("tbody", null, [...reviewHistory].reverse().map((record, index) => react.default.createElement("tr", { key: `${record.completedAt}-${index}` }, react.default.createElement("td", { style: {
-				...cellStyle,
-				color: "var(--dsw-alias-label-tertiary)"
-			} }, record.completedAt === "" ? "升级前未记录" : formatTime(record.completedAt)), react.default.createElement("td", { style: cellStyle }, record.changes.length > 0 ? `已保存 ${record.changes.length} 项` : "未修改记忆"), react.default.createElement("td", { style: {
-				...cellStyle,
-				color: "var(--dsw-alias-label-tertiary)"
-			} }, reviewReasonLabel(record.reason)), react.default.createElement("td", { style: cellStyle }, record.changes.length === 0 ? "现有记忆已覆盖本轮对话中的长期信息。" : record.changes.map((change, changeIndex) => react.default.createElement("div", {
-				key: `${changeIndex}-${change.content}`,
-				style: {
-					whiteSpace: "pre-wrap",
-					wordBreak: "break-word"
-				}
-			}, `${change.target === "user" ? "USER" : "MEMORY"} ${change.action === "added" ? "＋" : "−"} ${change.content}`))))))) : currentEntries.length === 0 ? react.default.createElement("div", { style: {
+			} }, "变更详情"))), react.default.createElement("tbody", null, reviewHistory.map((record, index) => {
+				const key = `${record.completedAt}-${index}`;
+				const expanded = expandedReviews.has(key);
+				const summary = record.changes.length === 0 ? "无变更" : record.changes.map((change) => `${change.target === "user" ? "USER" : "MEMORY"} ${change.action === "added" ? "+" : "−"} 1 项`).join(" · ");
+				return react.default.createElement("tr", { key }, react.default.createElement("td", { style: {
+					...cellStyle,
+					color: "var(--dsw-alias-label-tertiary)"
+				} }, record.completedAt === "" ? "升级前未记录" : formatTime(record.completedAt)), react.default.createElement("td", { style: cellStyle }, record.changes.length > 0 ? `已保存 ${record.changes.length} 项` : "未修改记忆"), react.default.createElement("td", { style: {
+					...cellStyle,
+					color: "var(--dsw-alias-label-tertiary)"
+				} }, reviewReasonLabel(record.reason)), react.default.createElement("td", { style: cellStyle }, react.default.createElement("button", {
+					type: "button",
+					onClick: () => toggleReview(key),
+					"aria-expanded": expanded,
+					style: {
+						border: 0,
+						padding: 0,
+						background: "transparent",
+						color: "var(--dsw-alias-state-business-primary)",
+						cursor: "pointer",
+						fontSize: 12,
+						textAlign: "left"
+					}
+				}, `${expanded ? "−" : "+"} ${expanded ? "收起详情" : summary}`), expanded ? react.default.createElement("div", { style: {
+					display: "grid",
+					gap: 5,
+					marginTop: 8,
+					padding: 8,
+					borderRadius: 4,
+					background: "var(--dsw-alias-bg-layer-2)"
+				} }, record.changes.length === 0 ? react.default.createElement("div", { style: { color: "var(--dsw-alias-label-secondary)" } }, "现有记忆已覆盖本轮对话中的长期信息。") : record.changes.map((change, changeIndex) => react.default.createElement("div", {
+					key: `${changeIndex}-${change.content}`,
+					style: {
+						display: "grid",
+						gridTemplateColumns: "76px 18px 1fr",
+						gap: 6,
+						whiteSpace: "pre-wrap",
+						wordBreak: "break-word"
+					}
+				}, react.default.createElement("span", { style: { color: "var(--dsw-alias-label-tertiary)" } }, change.target === "user" ? "USER" : "MEMORY"), react.default.createElement("span", { style: { color: change.action === "added" ? "var(--dsw-alias-color-success, #22c55e)" : "var(--dsw-alias-label-error)" } }, change.action === "added" ? "+" : "−"), react.default.createElement("span", null, change.content)))) : null));
+			}))) : currentEntries.length === 0 ? react.default.createElement("div", { style: {
 				fontSize: 12,
 				color: "var(--dsw-alias-label-tertiary)",
 				padding: 8
@@ -853,16 +892,16 @@ window.__ModuleLoader__.load({
 				width: 60,
 				textAlign: "center",
 				fontWeight: 600
-			} }, "操作"))), react.default.createElement("tbody", null, currentEntries.map((entry, i) => react.default.createElement("tr", {
-				key: i,
-				style: { background: selected.has(i) ? "var(--dsw-alias-bg-layer-2, rgba(0,0,0,0.05))" : void 0 }
+			} }, "操作"))), react.default.createElement("tbody", null, currentEntries.map((entry) => react.default.createElement("tr", {
+				key: entry.index,
+				style: { background: selected.has(entry.index) ? "var(--dsw-alias-bg-layer-2, rgba(0,0,0,0.05))" : void 0 }
 			}, react.default.createElement("td", { style: {
 				...cellStyle,
 				textAlign: "center"
 			} }, react.default.createElement("input", {
 				type: "checkbox",
-				checked: selected.has(i),
-				onChange: () => toggleSelected(i)
+				checked: selected.has(entry.index),
+				onChange: () => toggleSelected(entry.index)
 			})), react.default.createElement("td", { style: {
 				...cellStyle,
 				fontSize: 11,
@@ -872,7 +911,7 @@ window.__ModuleLoader__.load({
 				textAlign: "center"
 			} }, react.default.createElement("button", {
 				type: "button",
-				onClick: () => handleDeleteSingle(i),
+				onClick: () => handleDeleteSingle(entry.index),
 				style: {
 					...smallButtonStyle,
 					color: "var(--dsw-alias-label-error)",

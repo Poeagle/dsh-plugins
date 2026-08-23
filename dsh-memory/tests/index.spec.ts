@@ -13,6 +13,7 @@ import LlmRuntime, {
   type StreamChunk,
 } from '@deepseek-ai/dsh-llm'
 import { Session, SessionId, SessionStore, type SessionEvent } from '@deepseek-ai/dsh-session'
+import { agentEvents } from '@deepseek-ai/dsh-agent'
 import SystemPrompt, { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 import * as memory from '../src/index.ts'
@@ -177,6 +178,34 @@ describe('memory plugin wiring', () => {
     const prompt = renderPrompt(await c.systemPrompt.assemble())
     expect(prompt).toContain('Seeded memory fact')
     expect(prompt).toContain('Seeded user fact')
+  })
+
+  it('reinjects memory when compaction shadows its earlier surface node', async () => {
+    await seedFile('memory', 'Compaction-safe memory fact')
+    const c = await mount()
+    const session = c.sessions.create(SessionId('compacted-memory'))
+    const agent = makeAgent(c, session)
+    const signal = new AbortController().signal
+    const initial = await agentEvents(c, agent).waterfall(
+      'agent/pre-step', { messages: [], turn: 1, step: 1, signal },
+      () => Promise.resolve({ kind: 'enter', messages: [] }),
+    )
+    expect(initial.kind).toBe('enter')
+    if (initial.kind !== 'enter') return
+    const original = session.append('user/message', initial.messages[0]!, { surfaceOp: 'append' })
+    session.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'compressed context' }], source: { kind: 'plugin', plugin: 'compact' },
+    }), { surfaceOp: { op: 'replace', start: original.seq, end: original.seq }, sourceEventSeqs: [original.seq] })
+    const afterCompaction = await agentEvents(c, agent).waterfall(
+      'agent/pre-step', { messages: [], turn: 2, step: 1, signal },
+      () => Promise.resolve({ kind: 'enter', messages: [] }),
+    )
+    expect(afterCompaction).toMatchObject({ kind: 'enter' })
+    if (afterCompaction.kind === 'enter') {
+      expect(afterCompaction.messages).toContainEqual(expect.objectContaining({
+        source: { kind: 'plugin', plugin: 'memory' },
+      }))
+    }
   })
 
   it('executes the memory tool through the registry and persists to $DSH_HOME', async () => {

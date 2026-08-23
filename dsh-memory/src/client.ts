@@ -16,6 +16,8 @@ interface MemoryStatus {
 }
 
 interface MemoryEntry {
+  /** Stable current file position used by delete requests. */
+  index: number
   content: string
   timestamp: string
 }
@@ -634,6 +636,7 @@ function MemoryReviewNotice({ sessionId }: { sessionId: string }) {
 
 function MemoryDock({ sessionId }: { sessionId: string }) {
   const [status, setStatus] = React.useState<MemoryStatus | null>(null)
+  const [expandedReviews, setExpandedReviews] = React.useState<Set<string>>(new Set())
   const [reviewProgress, setReviewProgress] = React.useState<{ remainingTurns: number; reviewEnabled: boolean } | null>(null)
   const [modalOpen, setModalOpen] = React.useState(false)
   const [entries, setEntries] = React.useState<{ memory: MemoryEntry[]; user: MemoryEntry[] }>({ memory: [], user: [] })
@@ -672,8 +675,9 @@ function MemoryDock({ sessionId }: { sessionId: string }) {
     ])
     const memVal: MemoryEntry[] = memEntries?.ok === true && memEntries.value?.entries ? memEntries.value.entries : []
     const userVal: MemoryEntry[] = userEntries?.ok === true && userEntries.value?.entries ? userEntries.value.entries : []
-    setEntries({ memory: memVal, user: userVal })
-    setReviewHistory(reviews)
+    const newestFirst = (items: MemoryEntry[]): MemoryEntry[] => [...items].sort((a, b) => b.timestamp.localeCompare(a.timestamp))
+    setEntries({ memory: newestFirst(memVal), user: newestFirst(userVal) })
+    setReviewHistory([...reviews].sort((a, b) => b.completedAt.localeCompare(a.completedAt)))
     setLoading(false)
   }
 
@@ -686,13 +690,14 @@ function MemoryDock({ sessionId }: { sessionId: string }) {
     ])
     const memVal: MemoryEntry[] = memEntries?.ok === true && memEntries.value?.entries ? memEntries.value.entries : []
     const userVal: MemoryEntry[] = userEntries?.ok === true && userEntries.value?.entries ? userEntries.value.entries : []
-    setEntries({ memory: memVal, user: userVal })
+    const newestFirst = (items: MemoryEntry[]): MemoryEntry[] => [...items].sort((a, b) => b.timestamp.localeCompare(a.timestamp))
+    setEntries({ memory: newestFirst(memVal), user: newestFirst(userVal) })
     const s = await fetchStatus()
     if (s) setStatus(s)
   }
 
   const handleDeleteSelected = async () => {
-    const indices = [...selected].sort((a, b) => b - a)
+    const indices = currentEntries.filter(entry => selected.has(entry.index)).map(entry => entry.index).sort((a, b) => b - a)
     if (indices.length === 0) return
     const ok = await deleteEntries(tab, indices)
     if (ok) {
@@ -712,6 +717,15 @@ function MemoryDock({ sessionId }: { sessionId: string }) {
     } else {
       setToast('删除失败')
     }
+  }
+
+  const toggleReview = (key: string) => {
+    setExpandedReviews(previous => {
+      const next = new Set(previous)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
   }
 
   const toggleSelected = (index: number) => {
@@ -860,15 +874,33 @@ function MemoryDock({ sessionId }: { sessionId: string }) {
                   ),
                 ),
                 React.createElement('tbody', null,
-                  [...reviewHistory].reverse().map((record, index) => React.createElement('tr', { key: `${record.completedAt}-${index}` },
-                    React.createElement('td', { style: { ...cellStyle, color: 'var(--dsw-alias-label-tertiary)' } }, record.completedAt === '' ? '升级前未记录' : formatTime(record.completedAt)),
-                    React.createElement('td', { style: cellStyle }, record.changes.length > 0 ? `已保存 ${record.changes.length} 项` : '未修改记忆'),
-                    React.createElement('td', { style: { ...cellStyle, color: 'var(--dsw-alias-label-tertiary)' } }, reviewReasonLabel(record.reason)),
-                    React.createElement('td', { style: cellStyle }, record.changes.length === 0
-                      ? '现有记忆已覆盖本轮对话中的长期信息。'
-                      : record.changes.map((change, changeIndex) => React.createElement('div', { key: `${changeIndex}-${change.content}`, style: { whiteSpace: 'pre-wrap', wordBreak: 'break-word' } }, `${change.target === 'user' ? 'USER' : 'MEMORY'} ${change.action === 'added' ? '＋' : '−'} ${change.content}`)),
-                    ),
-                  )),
+                  reviewHistory.map((record, index) => {
+                    const key = `${record.completedAt}-${index}`
+                    const expanded = expandedReviews.has(key)
+                    const summary = record.changes.length === 0
+                      ? '无变更'
+                      : record.changes.map(change => `${change.target === 'user' ? 'USER' : 'MEMORY'} ${change.action === 'added' ? '+' : '−'} 1 项`).join(' · ')
+                    return React.createElement('tr', { key },
+                      React.createElement('td', { style: { ...cellStyle, color: 'var(--dsw-alias-label-tertiary)' } }, record.completedAt === '' ? '升级前未记录' : formatTime(record.completedAt)),
+                      React.createElement('td', { style: cellStyle }, record.changes.length > 0 ? `已保存 ${record.changes.length} 项` : '未修改记忆'),
+                      React.createElement('td', { style: { ...cellStyle, color: 'var(--dsw-alias-label-tertiary)' } }, reviewReasonLabel(record.reason)),
+                      React.createElement('td', { style: cellStyle },
+                        React.createElement('button', {
+                          type: 'button', onClick: () => toggleReview(key), 'aria-expanded': expanded,
+                          style: { border: 0, padding: 0, background: 'transparent', color: 'var(--dsw-alias-state-business-primary)', cursor: 'pointer', fontSize: 12, textAlign: 'left' },
+                        }, `${expanded ? '−' : '+'} ${expanded ? '收起详情' : summary}`),
+                        expanded ? React.createElement('div', { style: { display: 'grid', gap: 5, marginTop: 8, padding: 8, borderRadius: 4, background: 'var(--dsw-alias-bg-layer-2)' } },
+                          record.changes.length === 0
+                            ? React.createElement('div', { style: { color: 'var(--dsw-alias-label-secondary)' } }, '现有记忆已覆盖本轮对话中的长期信息。')
+                            : record.changes.map((change, changeIndex) => React.createElement('div', { key: `${changeIndex}-${change.content}`, style: { display: 'grid', gridTemplateColumns: '76px 18px 1fr', gap: 6, whiteSpace: 'pre-wrap', wordBreak: 'break-word' } },
+                              React.createElement('span', { style: { color: 'var(--dsw-alias-label-tertiary)' } }, change.target === 'user' ? 'USER' : 'MEMORY'),
+                              React.createElement('span', { style: { color: change.action === 'added' ? 'var(--dsw-alias-color-success, #22c55e)' : 'var(--dsw-alias-label-error)' } }, change.action === 'added' ? '+' : '−'),
+                              React.createElement('span', null, change.content),
+                            )),
+                        ) : null,
+                      ),
+                    )
+                  }),
                 ),
             )
             : currentEntries.length === 0
@@ -883,13 +915,13 @@ function MemoryDock({ sessionId }: { sessionId: string }) {
                   ),
                 ),
                 React.createElement('tbody', null,
-                  currentEntries.map((entry: MemoryEntry, i: number) =>
+                  currentEntries.map((entry: MemoryEntry) =>
                     React.createElement('tr', {
-                      key: i,
-                      style: { background: selected.has(i) ? 'var(--dsw-alias-bg-layer-2, rgba(0,0,0,0.05))' : undefined },
+                      key: entry.index,
+                      style: { background: selected.has(entry.index) ? 'var(--dsw-alias-bg-layer-2, rgba(0,0,0,0.05))' : undefined },
                     },
                       React.createElement('td', { style: { ...cellStyle, textAlign: 'center' } },
-                        React.createElement('input', { type: 'checkbox', checked: selected.has(i), onChange: () => toggleSelected(i) }),
+                        React.createElement('input', { type: 'checkbox', checked: selected.has(entry.index), onChange: () => toggleSelected(entry.index) }),
                       ),
                       React.createElement('td', { style: { ...cellStyle, fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } },
                         formatTime(entry.timestamp),
@@ -897,7 +929,7 @@ function MemoryDock({ sessionId }: { sessionId: string }) {
                       React.createElement('td', { style: cellStyle }, entry.content),
                       React.createElement('td', { style: { ...cellStyle, textAlign: 'center' } },
                         React.createElement('button', {
-                          type: 'button', onClick: () => handleDeleteSingle(i),
+                          type: 'button', onClick: () => handleDeleteSingle(entry.index),
                           style: { ...smallButtonStyle, color: 'var(--dsw-alias-label-error)', borderColor: 'var(--dsw-alias-label-error)' },
                           title: '删除此条',
                         }, '删除'),

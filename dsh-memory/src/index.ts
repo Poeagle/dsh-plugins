@@ -222,16 +222,16 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     injectionLocks.set(sid, lock)
 
     try {
-      // Fast path: already injected in an earlier turn.
-      if (injected.has(sid)) return decision
-
-      // After a restart the in-memory Set is empty, so check the session log.
-      const alreadyInLog = agent.session.events.some(e => {
-        if (e.type !== 'user/message') return false
-        const msg = e.data as { source?: { kind?: string; plugin?: string } }
-        return msg.source?.kind === 'plugin' && msg.source?.plugin === name
+      // A compaction keeps the original event in the durable log but may shadow
+      // it from the current model-visible surface. Only a surviving surface node
+      // proves that this session still carries the memory context.
+      const alreadyOnSurface = agent.session.surface.nodes.some(seq => {
+        const event = agent.session.events[seq]
+        if (event?.type !== 'user/message') return false
+        const message = event.data as { source?: { kind?: string; plugin?: string } }
+        return message.source?.kind === 'plugin' && message.source?.plugin === name
       })
-      if (alreadyInLog) {
+      if (alreadyOnSurface) {
         injected.add(sid)
         return decision
       }

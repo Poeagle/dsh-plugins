@@ -1,4 +1,4 @@
-import { d as MemoryStore, l as memoryReviewProgress, t as Config, u as memoryReviewNotices } from "./src-DhFY--Uk.js";
+import { d as MemoryStore, l as memoryReviewProgress, t as Config, u as memoryReviewNotices } from "./src-Bym_kend.js";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 //#region src/settings.ts
@@ -102,7 +102,8 @@ function apply(ctx) {
 						ok: true,
 						value: {
 							target,
-							entries: entries.map((e) => ({
+							entries: entries.map((e, index) => ({
+								index,
 								content: e.content,
 								timestamp: e.timestamp
 							})),

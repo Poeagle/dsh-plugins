@@ -126,7 +126,7 @@ export function apply(ctx: Context): void {
             ok: true,
             value: {
               target,
-              entries: entries.map(e => ({ content: e.content, timestamp: e.timestamp })),
+              entries: entries.map((e, index) => ({ index, content: e.content, timestamp: e.timestamp })),
               usage: store.usageString(target),
             },
           })

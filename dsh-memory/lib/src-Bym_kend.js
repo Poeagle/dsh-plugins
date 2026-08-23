@@ -1614,11 +1614,11 @@ async function apply(ctx, config) {
 		});
 		injectionLocks.set(sid, lock);
 		try {
-			if (injected.has(sid)) return decision;
-			if (agent.session.events.some((e) => {
-				if (e.type !== "user/message") return false;
-				const msg = e.data;
-				return msg.source?.kind === "plugin" && msg.source?.plugin === "memory";
+			if (agent.session.surface.nodes.some((seq) => {
+				const event = agent.session.events[seq];
+				if (event?.type !== "user/message") return false;
+				const message = event.data;
+				return message.source?.kind === "plugin" && message.source?.plugin === "memory";
 			})) {
 				injected.add(sid);
 				return decision;
@@ -1750,4 +1750,4 @@ async function apply(ctx, config) {
 //#endregion
 export { DEFAULT_USER_CHAR_LIMIT as a, name as c, MemoryStore as d, DEFAULT_REVIEW_MAX_ITERATIONS as i, memoryReviewProgress as l, DEFAULT_MEMORY_CHAR_LIMIT as n, apply as o, DEFAULT_NUDGE_INTERVAL as r, inject as s, Config as t, memoryReviewNotices as u };
 
-//# sourceMappingURL=src-DhFY--Uk.js.map
+//# sourceMappingURL=src-Bym_kend.js.map
