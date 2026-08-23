@@ -47,6 +47,11 @@ interface MemoryReviewNoticeResponse {
   value?: MemoryReviewNotice | null
 }
 
+interface MemoryReviewProgressResponse {
+  ok: boolean
+  value?: { remainingTurns: number; reviewEnabled: boolean } | null
+}
+
 const MEMORY_ROUTE = '/memory/api'
 
 const formatBytes = (bytes: number): string => {
@@ -63,10 +68,18 @@ const formatTime = (iso: string): string => {
   } catch { return iso }
 }
 
-const consumeReviewNotice = async (sessionId: string): Promise<MemoryReviewNotice | null> => {
+const fetchReviewNotice = async (sessionId: string): Promise<MemoryReviewNotice | null> => {
   try {
     const response = await fetch(`${MEMORY_ROUTE}/review-notice?sessionId=${encodeURIComponent(sessionId)}`)
     const body = await response.json() as MemoryReviewNoticeResponse
+    return body.ok ? body.value ?? null : null
+  } catch { return null }
+}
+
+const fetchReviewProgress = async (sessionId: string): Promise<{ remainingTurns: number; reviewEnabled: boolean } | null> => {
+  try {
+    const response = await fetch(`${MEMORY_ROUTE}/review-progress?sessionId=${encodeURIComponent(sessionId)}`)
+    const body = await response.json() as MemoryReviewProgressResponse
     return body.ok ? body.value ?? null : null
   } catch { return null }
 }
@@ -526,7 +539,7 @@ function MemoryReviewNotice({ sessionId }: { sessionId: string }) {
     let disposed = false
     setNotice(undefined)
     const read = (): void => {
-      void consumeReviewNotice(sessionId).then((next) => {
+      void fetchReviewNotice(sessionId).then((next) => {
         if (!disposed && next !== null) setNotice(next)
       })
     }
@@ -539,11 +552,16 @@ function MemoryReviewNotice({ sessionId }: { sessionId: string }) {
   const summary = `后台复核 · 已保存 ${notice.changes.length} 项变更`
   const toggle = (): void => { setExpanded(value => !value) }
   return React.createElement('div', {
-    style: { borderBottom: '1px solid var(--dsw-alias-border-l2)', marginBottom: 4 },
+    style: { display: 'flex', justifyContent: 'center', width: '100%', maxWidth: '100%', margin: '0 0 6px' },
+  },
+  React.createElement('div', {
+    style: { width: 'min(100%, 560px)' },
   },
   React.createElement('div', {
     style: {
-      display: 'flex', alignItems: 'center', gap: 8, padding: '6px 0',
+      display: 'inline-flex', maxWidth: '100%', alignItems: 'center', gap: 8, padding: '5px 9px',
+      border: '1px solid var(--dsw-alias-border-l2)', borderRadius: 6,
+      background: 'var(--dsw-alias-bg-layer-2)',
       fontSize: 13, lineHeight: '20px', color: 'var(--dsw-alias-label-primary)',
       cursor: 'pointer', userSelect: 'none',
     },
@@ -576,7 +594,7 @@ function MemoryReviewNotice({ sessionId }: { sessionId: string }) {
   ),
   expanded ? React.createElement('div', {
     style: {
-      margin: '0 0 8px 16px', padding: 8, border: '1px solid var(--dsw-alias-border-l2)',
+      margin: '4px 0 0', padding: 8, border: '1px solid var(--dsw-alias-border-l2)',
       borderRadius: 6, background: 'var(--dsw-alias-bg-layer-2)', fontSize: 12, lineHeight: '1.5',
       display: 'grid', gap: 6,
     },
@@ -598,13 +616,15 @@ function MemoryReviewNotice({ sessionId }: { sessionId: string }) {
   }, change.action === 'added' ? '＋' : '−'),
   React.createElement('span', null, change.content),
   )),
-  ) : null)
+  ) : null),
+  )
 }
 
 // ── Dock indicator (memory usage under composer) ────────────────────────
 
-function MemoryDock(_props: { sessionId: string }) {
+function MemoryDock({ sessionId }: { sessionId: string }) {
   const [status, setStatus] = React.useState<MemoryStatus | null>(null)
+  const [reviewProgress, setReviewProgress] = React.useState<{ remainingTurns: number; reviewEnabled: boolean } | null>(null)
   const [modalOpen, setModalOpen] = React.useState(false)
   const [entries, setEntries] = React.useState<{ memory: MemoryEntry[]; user: MemoryEntry[] }>({ memory: [], user: [] })
   const [tab, setTab] = React.useState<'memory' | 'user'>('memory')
@@ -613,10 +633,14 @@ function MemoryDock(_props: { sessionId: string }) {
   const [toast, setToast] = React.useState<string | null>(null)
 
   React.useEffect(() => {
-    fetchStatus().then(setStatus)
-    const interval = setInterval(() => { fetchStatus().then(setStatus) }, 10000)
+    const refresh = (): void => {
+      void fetchStatus().then(setStatus)
+      void fetchReviewProgress(sessionId).then(setReviewProgress)
+    }
+    refresh()
+    const interval = setInterval(refresh, 2000)
     return () => clearInterval(interval)
-  }, [])
+  }, [sessionId])
 
   React.useEffect(() => {
     if (toast) {
@@ -710,7 +734,7 @@ function MemoryDock(_props: { sessionId: string }) {
       onClick: openModal,
       title: '点击查看记忆详情',
     },
-      `📝 MEMORY: ${status.memory.entries} 条 · USER: ${status.user.entries} 条`,
+      `📝 MEMORY: ${status.memory.entries} 条 · USER: ${status.user.entries} 条${reviewProgress?.reviewEnabled ? `（距下次后台更新 ${reviewProgress.remainingTurns} 轮）` : ''}`,
     ),
 
     // Modal overlay

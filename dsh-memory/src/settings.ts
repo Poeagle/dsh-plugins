@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { Config } from './index.ts'
 import { memoryReviewNotices } from './review-notices.ts'
+import { memoryReviewProgress } from './review-progress.ts'
 import { MemoryStore } from './store.ts'
 
 const MEMORY_ROUTE = '/memory/api'
@@ -132,14 +133,25 @@ export function apply(ctx: Context): void {
           return
         }
 
-        // GET /memory/api/review-notice?sessionId=<id> — consume one source-session review receipt
+        // GET /memory/api/review-notice?sessionId=<id> — read the persisted source-session review receipt
         if (method === 'GET' && url.pathname === '/memory/api/review-notice') {
           const sessionId = url.searchParams.get('sessionId')
           if (sessionId === null || sessionId === '') {
             send(res, 400, { ok: false, error: 'sessionId is required.' })
             return
           }
-          send(res, 200, { ok: true, value: memoryReviewNotices.consume(sessionId) ?? null })
+          send(res, 200, { ok: true, value: await memoryReviewNotices.get(sessionId) ?? null })
+          return
+        }
+
+        // GET /memory/api/review-progress?sessionId=<id> — read the current source-session countdown
+        if (method === 'GET' && url.pathname === '/memory/api/review-progress') {
+          const sessionId = url.searchParams.get('sessionId')
+          if (sessionId === null || sessionId === '') {
+            send(res, 400, { ok: false, error: 'sessionId is required.' })
+            return
+          }
+          send(res, 200, { ok: true, value: memoryReviewProgress.get(sessionId) ?? null })
           return
         }
 

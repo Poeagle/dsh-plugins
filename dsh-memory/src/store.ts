@@ -8,7 +8,7 @@
  * @module dsh-memory/store
  */
 
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import { withFileLock, writeFileAtomic } from '@deepseek-ai/dsh-atomic-write'
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
@@ -72,6 +72,7 @@ export class MemoryStore {
   private readonly memoryCharLimit: number
   private readonly userCharLimit: number
   private entries: Record<MemoryTarget, string[]> = { memory: [], user: [] }
+  private timestamps: Record<MemoryTarget, Map<string, string>> = { memory: new Map(), user: new Map() }
   private snapshot: Record<MemoryTarget, string> = { memory: '', user: '' }
   private consolidationFailures = 0
 
@@ -111,6 +112,8 @@ export class MemoryStore {
       memory: dedupe(await this.readFile(this.pathFor('memory'))),
       user: dedupe(await this.readFile(this.pathFor('user'))),
     }
+    await this.loadMetadata('memory')
+    await this.loadMetadata('user')
     this.snapshot = {
       memory: this.renderBlock('memory', sanitizeForSnapshot(this.entries.memory, 'MEMORY.md')),
       user: this.renderBlock('user', sanitizeForSnapshot(this.entries.user, 'USER.md')),
@@ -137,6 +140,8 @@ export class MemoryStore {
       memory: dedupe(await this.readFile(this.pathFor('memory'))),
       user: dedupe(await this.readFile(this.pathFor('user'))),
     }
+    await this.loadMetadata('memory')
+    await this.loadMetadata('user')
     this.snapshot = {
       memory: this.renderBlock('memory', sanitizeForSnapshot(this.entries.memory, 'MEMORY.md')),
       user: this.renderBlock('user', sanitizeForSnapshot(this.entries.user, 'USER.md')),
@@ -174,10 +179,10 @@ export class MemoryStore {
    * @returns the live entry list with metadata.
    */
   entriesWithMeta(target: MemoryTarget): MemoryEntryMeta[] {
-    return this.entries[target].map(content => {
-      const timestamp = extractTimestamp(content) ?? ''
-      return { content: stripTimestamp(content), timestamp }
-    })
+    return this.entries[target].map(content => ({
+      content: stripTimestamp(content),
+      timestamp: this.timestamps[target].get(stripTimestamp(content)) ?? extractTimestamp(content) ?? '',
+    }))
   }
 
   /**
@@ -214,6 +219,15 @@ export class MemoryStore {
       if (entries.some(entry => stripTimestamp(entry) === trimmed)) {
         return this.successResponse(target, 'Entry already exists (no duplicate added).')
       }
+      const overlap = findSemanticOverlap(entries, trimmed)
+      if (overlap !== undefined) {
+        return {
+          success: false,
+          error: 'Entry semantically overlaps an existing memory. Use replace to merge or update it instead of adding a duplicate.',
+          current_entries: entries.map(stripTimestamp),
+          usage: this.usageString(target),
+        }
+      }
       const newTotal = [...entries, trimmed].join(ENTRY_DELIMITER).length
       if (newTotal > this.charLimit(target)) {
         const current = this.charCount(target)
@@ -231,6 +245,7 @@ export class MemoryStore {
         })
       }
       entries.push(trimmed)
+      this.timestamps[target].set(trimmed, new Date().toISOString())
       await this.saveToDisk(target)
       return this.successResponse(target, 'Entry added.')
     })
@@ -277,7 +292,10 @@ export class MemoryStore {
           usage: `${grouped(current)}/${grouped(this.charLimit(target))}`,
         })
       }
+      const previous = stripTimestamp(entries[match]!)
       entries[match] = trimmedNew
+      this.timestamps[target].delete(previous)
+      this.timestamps[target].set(trimmedNew, new Date().toISOString())
       await this.saveToDisk(target)
       return this.successResponse(target, 'Entry replaced.')
     })
@@ -299,7 +317,8 @@ export class MemoryStore {
       if (index < 0 || index >= entries.length) {
         return { success: false, error: `Index ${index} out of range (0-${entries.length - 1}).` }
       }
-      entries.splice(index, 1)
+      const [removed] = entries.splice(index, 1)
+      this.timestamps[target].delete(stripTimestamp(removed!))
       await this.saveToDisk(target)
       return this.successResponse(target, 'Entry removed.')
     })
@@ -324,7 +343,8 @@ export class MemoryStore {
         if (index < 0 || index >= entries.length) {
           return { success: false, error: `Index ${index} out of range (0-${entries.length - 1}). No changes applied.` }
         }
-        entries.splice(index, 1)
+        const [removed] = entries.splice(index, 1)
+        this.timestamps[target].delete(stripTimestamp(removed!))
       }
       await this.saveToDisk(target)
       return this.successResponse(target, `${indices.length} entry(s) removed.`)
@@ -341,7 +361,8 @@ export class MemoryStore {
       const entries = this.entries[target]
       const match = this.matchOrError(entries, trimmedOld, 'remove')
       if (typeof match !== 'number') return match
-      entries.splice(match, 1)
+      const [removed] = entries.splice(match, 1)
+      this.timestamps[target].delete(stripTimestamp(removed!))
       await this.saveToDisk(target)
       return this.successResponse(target, 'Entry removed.')
     })
@@ -384,6 +405,9 @@ export class MemoryStore {
         if (op.action === 'add') {
           if (content.length === 0) return this.batchError(target, `${pos}: content is required.`)
           if (working.some(entry => stripTimestamp(entry) === content)) continue // idempotent duplicate skip
+          if (findSemanticOverlap(working, content) !== undefined) {
+            return this.batchError(target, `${pos}: content semantically overlaps an existing memory; use replace to merge or update it.`)
+          }
           working.push(content)
         } else if (op.action === 'replace') {
           if (oldText.length === 0) return this.batchError(target, `${pos}: old_text is required.`)
@@ -433,15 +457,57 @@ export class MemoryStore {
         })
       }
 
+      const previousTimestamps = this.timestamps[target]
+      const now = new Date().toISOString()
       this.entries[target] = working
+      this.timestamps[target] = new Map(working.map(entry => {
+        const content = stripTimestamp(entry)
+        return [content, previousTimestamps.get(content) ?? now]
+      }))
       await this.saveToDisk(target)
       return this.successResponse(target, `Applied ${operations.length} operation(s).`)
     })
   }
 
-  /** Absolute path of one target's file. */
+  /** Absolute path of one target's plaintext entry file. */
   private pathFor(target: MemoryTarget): string {
     return join(this.dir, target === 'user' ? 'USER.md' : 'MEMORY.md')
+  }
+
+  /** Absolute path of one target's private timestamp sidecar. */
+  private metadataPathFor(target: MemoryTarget): string {
+    return join(this.dir, target === 'user' ? '.USER.meta.json' : '.MEMORY.meta.json')
+  }
+
+  /** Load valid sidecar timestamps and fall back to the plaintext file mtime for legacy entries. */
+  private async loadMetadata(target: MemoryTarget): Promise<void> {
+    const entries = new Set(this.entries[target].map(stripTimestamp))
+    const timestamps = new Map<string, string>()
+    try {
+      const raw = await readFile(this.metadataPathFor(target), 'utf8')
+      const parsed = JSON.parse(raw) as { version?: unknown; entries?: unknown }
+      if (parsed.version === 1 && Array.isArray(parsed.entries) && parsed.entries.length === this.entries[target].length) {
+        const metadata = parsed.entries as { content?: unknown; timestamp?: unknown }[]
+        const matches = metadata.every((entry, index) => {
+          const timestamp = entry.timestamp
+          return entry.content === stripTimestamp(this.entries[target][index]!)
+            && typeof timestamp === 'string'
+            && Number.isFinite(Date.parse(timestamp))
+        })
+        if (matches) {
+          for (const entry of metadata) timestamps.set(entry.content as string, entry.timestamp as string)
+        }
+      }
+    } catch {
+      // Missing or malformed metadata cannot block plaintext memory loading.
+    }
+    let fallback = ''
+    try { fallback = (await stat(this.pathFor(target))).mtime.toISOString() } catch { /* plaintext file is absent */ }
+    for (const entry of this.entries[target]) {
+      const content = stripTimestamp(entry)
+      if (!timestamps.has(content)) timestamps.set(content, extractTimestamp(entry) ?? fallback)
+    }
+    this.timestamps[target] = timestamps
   }
 
   private charLimit(target: MemoryTarget): number {
@@ -618,6 +684,7 @@ export class MemoryStore {
     if (read === READ_FAILED) return { kind: 'read-failed' }
     const backup = options?.skipDrift === true ? undefined : await this.detectExternalDrift(target, read.raw)
     this.entries[target] = dedupe(this.parseEntries(read.raw))
+    await this.loadMetadata(target)
     return backup === undefined ? { kind: 'clean' } : { kind: 'drift', backup }
   }
 
@@ -651,10 +718,16 @@ export class MemoryStore {
     return backupPath
   }
 
-  /** Persist live entries atomically (temp + rename, never truncate-before-lock). */
+  /** Persist plaintext entries, then their recoverable private timestamp sidecar. */
   private async saveToDisk(target: MemoryTarget): Promise<void> {
-    const content = this.entries[target].length > 0 ? this.entries[target].join(ENTRY_DELIMITER) : ''
+    const entries = this.entries[target].map(stripTimestamp)
+    const content = entries.length > 0 ? entries.join(ENTRY_DELIMITER) : ''
     await writeFileAtomic(this.pathFor(target), content, { mode: FILE_MODE, dirMode: DIR_MODE })
+    const metadata = {
+      version: 1,
+      entries: entries.map(entry => ({ content: entry, timestamp: this.timestamps[target].get(entry) ?? new Date().toISOString() })),
+    }
+    await writeFileAtomic(this.metadataPathFor(target), `${JSON.stringify(metadata)}\n`, { mode: FILE_MODE, dirMode: DIR_MODE })
   }
 
   /** Serialize a read-modify-write cycle through the per-file lock. */
@@ -740,6 +813,36 @@ function readFailedError(path: string): MemoryToolResult {
       + 'retry in a moment.'
     ),
   }
+}
+
+/**
+ * Identify a near-duplicate entry before it becomes separately persisted memory.
+ * Exact duplicate detection remains separate; this conservative lexical check
+ * catches rewrites that preserve most meaningful Chinese or Latin word fragments.
+ */
+function findSemanticOverlap(entries: readonly string[], candidate: string): string | undefined {
+  const candidateFragments = semanticFragments(candidate)
+  if (candidateFragments.size < 3) return undefined
+  for (const entry of entries) {
+    const existing = stripTimestamp(entry)
+    const existingFragments = semanticFragments(existing)
+    const shared = [...candidateFragments].filter(fragment => existingFragments.has(fragment)).length
+    const similarity = shared / Math.min(candidateFragments.size, existingFragments.size)
+    if (shared >= 5 && similarity >= 0.55) return existing
+  }
+  return undefined
+}
+
+/** Build normalized CJK bigrams and Latin words for near-duplicate matching. */
+function semanticFragments(value: string): Set<string> {
+  const normalized = value.toLowerCase().replace(/[\s\p{P}\p{S}]+/gu, '')
+  const fragments = new Set<string>()
+  for (let i = 0; i < normalized.length - 1; i += 1) {
+    const pair = normalized.slice(i, i + 2)
+    if (/^[\p{Script=Han}]{2}$/u.test(pair)) fragments.add(pair)
+  }
+  for (const word of value.toLowerCase().matchAll(/[a-z0-9]{3,}/g)) fragments.add(word[0])
+  return fragments
 }
 
 /** Replace threat-matching entries with placeholders for the snapshot only. */

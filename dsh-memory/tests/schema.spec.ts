@@ -59,6 +59,28 @@ describe('dispatchMemoryTool', () => {
     expect(r).toMatchObject({ success: true, message: 'Entry added.' })
   })
 
+  it('rejects semantically overlapping additions and gives the model merge guidance', async () => {
+    const store = await freshStore()
+    await store.add('user', '观影偏好：喜欢有理解难度、线索需逐步拼合且观后值得回味的扑朔迷离叙事。')
+    const result = await store.add('user', '观影偏好：喜欢具有理解难度、线索可反复拼合、观后值得回味的电影。')
+    expect(result).toMatchObject({ success: false })
+    expect(result.usage).toMatch(/^\d+\/1,375$/)
+    expect(result.error).toContain('semantically overlaps')
+    expect(store.entriesFor('user')).toHaveLength(1)
+  })
+
+  it('rejects semantically overlapping batch additions atomically', async () => {
+    const store = await freshStore()
+    await store.add('user', '观影偏好：喜欢有理解难度、线索需逐步拼合且观后值得回味的扑朔迷离叙事。')
+    const result = await store.applyBatch('user', [
+      { action: 'add', content: '观影偏好：喜欢具有理解难度、线索可反复拼合、观后值得回味的电影。' },
+      { action: 'add', content: '其他独立偏好。' },
+    ])
+    expect(result.success).toBe(false)
+    expect(result.error).toContain('semantically overlaps')
+    expect(store.entriesFor('user')).toHaveLength(1)
+  })
+
   it('rejects add without content with the upstream text', async () => {
     const store = await freshStore()
     for (const content of [undefined, '']) {

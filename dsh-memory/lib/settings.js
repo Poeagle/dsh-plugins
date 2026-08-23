@@ -1,4 +1,4 @@
-import { l as memoryReviewNotices, t as Config, u as MemoryStore } from "./src-CN2TttgI.js";
+import { d as MemoryStore, l as memoryReviewProgress, t as Config, u as memoryReviewNotices } from "./src-Dh_pIN17.js";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 //#region src/settings.ts
@@ -122,7 +122,22 @@ function apply(ctx) {
 					}
 					send(res, 200, {
 						ok: true,
-						value: memoryReviewNotices.consume(sessionId) ?? null
+						value: await memoryReviewNotices.get(sessionId) ?? null
+					});
+					return;
+				}
+				if (method === "GET" && url.pathname === "/memory/api/review-progress") {
+					const sessionId = url.searchParams.get("sessionId");
+					if (sessionId === null || sessionId === "") {
+						send(res, 400, {
+							ok: false,
+							error: "sessionId is required."
+						});
+						return;
+					}
+					send(res, 200, {
+						ok: true,
+						value: memoryReviewProgress.get(sessionId) ?? null
 					});
 					return;
 				}

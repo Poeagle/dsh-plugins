@@ -25,6 +25,7 @@ import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { JsonValue } from '@deepseek-ai/dsh-session'
 import { MemoryStore } from './store.ts'
 import { memoryReviewNotices } from './review-notices.ts'
+import { memoryReviewProgress } from './review-progress.ts'
 import type { MemoryReviewNotification } from './types.ts'
 import { MEMORY_TOOL_DESCRIPTION, MEMORY_TOOL_PARAMETERS, dispatchMemoryTool, toMemoryToolArgs } from './schema.ts'
 import { runMemoryReview } from './review.ts'
@@ -73,7 +74,9 @@ interface SessionNudgeState {
   turnsSinceMemory: number
   /** Prior history has not been folded into the counter yet. */
   hydrated: boolean
-  /** The gate fired on the latest user turn; the next completed turn reviews. */
+  /** The current turn received at least one real user message. */
+  pendingUserTurn: boolean
+  /** The gate fired on the current user turn; its completed turn launches review. */
   reviewPending: boolean
 }
 
@@ -104,10 +107,19 @@ function resolveReviewRoute(ctx: Context, session: Session): { provider: string;
  * @param session - the session to count.
  * @returns the user-message event count.
  */
-function priorUserTurns(session: Session): number {
+function isCountedUserMessage(event: SessionEvent): event is Extract<SessionEvent, { type: 'user/message' }> {
+  return event.type === 'user/message' && event.data.source.kind === 'user'
+}
+
+/** Count completed main-session user turns already present in a restored log. */
+function priorCompletedUserTurns(session: Session): number {
+  let pendingUserTurn = false
   let count = 0
   for (const event of session.events) {
-    if (event.type === 'user/message') count += 1
+    if (isCountedUserMessage(event)) pendingUserTurn = true
+    if (event.type !== 'turn/end') continue
+    if (pendingUserTurn && event.data.reason.kind === 'completed') count += 1
+    pendingUserTurn = false
   }
   return count
 }
@@ -251,50 +263,57 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   function stateFor(id: SessionId): SessionNudgeState {
     let state = states.get(id)
     if (state === undefined) {
-      state = { turnsSinceMemory: 0, hydrated: false, reviewPending: false }
+      state = { turnsSinceMemory: 0, hydrated: false, pendingUserTurn: false, reviewPending: false }
       states.set(id, state)
     }
     return state
   }
 
-  /**
-   * Count real user turns and fold the interval gate. The gate fires on the
-   * Nth user turn and arms a pending review; the review itself waits for the
-   * completed turn that follows, exactly like the upstream
-   * `should_review_memory` handoff from turn setup to the finalizer.
-   */
+  /** Publish the current countdown for the browser-only memory indicator. */
+  function publishReviewProgress(sessionId: SessionId, state: SessionNudgeState, nudgeInterval: number, reviewEnabled: boolean): void {
+    memoryReviewProgress.publish(String(sessionId), {
+      reviewEnabled,
+      remainingTurns: reviewEnabled && nudgeInterval > 0 ? nudgeInterval - state.turnsSinceMemory : 0,
+    })
+  }
+
+  /** Count only completed main-session user turns and arm review on the configured interval. */
   ctx.on('session/event', (session: Session, event: SessionEvent) => {
-    // Per-turn consolidation budget: every turn starts clean.
-    if (event.type === 'turn/start') store.resetConsolidationFailures()
-    if (event.type !== 'user/message') return
     if ((session.header.delegationDepth ?? 0) > 0) return
-    if (event.data.source.kind !== 'user') return
-    const state = stateFor(session.id)
+    if (event.type === 'turn/start') {
+      store.resetConsolidationFailures()
+      return
+    }
+    if (isCountedUserMessage(event)) {
+      const state = stateFor(session.id)
+      state.pendingUserTurn = true
+      return
+    }
+    if (event.type !== 'turn/end') return
+    const state = states.get(session.id)
+    if (state === undefined || !state.pendingUserTurn) return
+    state.pendingUserTurn = false
+    if (event.data.reason.kind !== 'completed') return
+    const { nudgeInterval, reviewEnabled } = effectiveSettings()
     if (!state.hydrated) {
       state.hydrated = true
-      // A resumed session already carries prior user turns in its log; fold
-      // them into the counter (minus this message) like the upstream
-      // `prior_user_turns % interval` hydration.
-      const prior = priorUserTurns(session) - 1
-      if (config.nudgeInterval > 0 && prior > 0) {
-        state.turnsSinceMemory = prior % config.nudgeInterval
-      }
+      const prior = priorCompletedUserTurns(session) - 1
+      state.turnsSinceMemory = nudgeInterval > 0 && prior > 0 ? prior % nudgeInterval : 0
     }
-    const { nudgeInterval, reviewEnabled } = effectiveSettings()
-    if (nudgeInterval > 0 && reviewEnabled) {
-      state.turnsSinceMemory += 1
-      if (state.turnsSinceMemory >= nudgeInterval) {
-        state.turnsSinceMemory = 0
-        state.reviewPending = true
-      }
+    if (!reviewEnabled || nudgeInterval === 0) {
+      publishReviewProgress(session.id, state, nudgeInterval, reviewEnabled)
+      return
     }
-  })
+    state.turnsSinceMemory += 1
+    if (state.turnsSinceMemory < nudgeInterval) {
+      publishReviewProgress(session.id, state, nudgeInterval, reviewEnabled)
+      return
+    }
+    state.turnsSinceMemory = 0
+    state.reviewPending = true
+    publishReviewProgress(session.id, state, nudgeInterval, reviewEnabled)
 
-  /** Spawn the armed review once the gated turn completes. */
-  ctx.on('session/event', (session: Session, event: SessionEvent) => {
-    if (event.type !== 'turn/end' || event.data.reason.kind !== 'completed') return
-    const state = states.get(session.id)
-    if (state === undefined || !state.reviewPending) return
+    if (!state.reviewPending) return
     state.reviewPending = false
     if (reviewing.has(session.id)) return
     const route = resolveReviewRoute(ctx, session)
@@ -316,7 +335,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         changes: outcome.changes,
         reason: outcome.reason,
       }
-      memoryReviewNotices.publish(update)
+      return memoryReviewNotices.publish(update)
     }).catch((error: unknown) => {
       ctx.logger.warn(`memory: background review for ${String(session.id)} failed: ${String(error)}`)
     }).finally(() => {
@@ -333,6 +352,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     states.delete(session.id)
     injected.delete(session.id)
     injectionLocks.delete(session.id)
-    memoryReviewNotices.discard(String(session.id))
+    void memoryReviewNotices.discard(String(session.id))
+    memoryReviewProgress.discard(String(session.id))
   })
 }

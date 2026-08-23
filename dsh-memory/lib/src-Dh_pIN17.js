@@ -1,7 +1,7 @@
 import z from "@deepseek-ai/schemastery";
 import { defineTool, parameterSchemaSpecToJsonSchema } from "@deepseek-ai/dsh-tools";
 import { BlockAssembler, createAssistantMessage, createToolResultMessage, createUserMessage } from "@deepseek-ai/dsh-llm";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { withFileLock, writeFileAtomic } from "@deepseek-ai/dsh-atomic-write";
 import { dshHomePath } from "@deepseek-ai/dsh-home-paths";
@@ -316,8 +316,8 @@ const MEMORY_BLOCK_HEADERS = {
 /** Sentinel: the target file exists on disk but could not be read. */
 const READ_FAILED = Symbol("read-failed");
 /** Permission bits for memory files and their directory (owner-private). */
-const FILE_MODE = 384;
-const DIR_MODE = 448;
+const FILE_MODE$1 = 384;
+const DIR_MODE$1 = 448;
 /**
 * After this many failed consolidation attempts (overflow / zero-match) in
 * one turn, stop instructing the model to retry and return a terminal result
@@ -343,6 +343,10 @@ var MemoryStore = class {
 	entries = {
 		memory: [],
 		user: []
+	};
+	timestamps = {
+		memory: /* @__PURE__ */ new Map(),
+		user: /* @__PURE__ */ new Map()
 	};
 	snapshot = {
 		memory: "",
@@ -382,6 +386,8 @@ var MemoryStore = class {
 			memory: dedupe(await this.readFile(this.pathFor("memory"))),
 			user: dedupe(await this.readFile(this.pathFor("user")))
 		};
+		await this.loadMetadata("memory");
+		await this.loadMetadata("user");
 		this.snapshot = {
 			memory: this.renderBlock("memory", sanitizeForSnapshot(this.entries.memory, "MEMORY.md")),
 			user: this.renderBlock("user", sanitizeForSnapshot(this.entries.user, "USER.md"))
@@ -406,6 +412,8 @@ var MemoryStore = class {
 			memory: dedupe(await this.readFile(this.pathFor("memory"))),
 			user: dedupe(await this.readFile(this.pathFor("user")))
 		};
+		await this.loadMetadata("memory");
+		await this.loadMetadata("user");
 		this.snapshot = {
 			memory: this.renderBlock("memory", sanitizeForSnapshot(this.entries.memory, "MEMORY.md")),
 			user: this.renderBlock("user", sanitizeForSnapshot(this.entries.user, "USER.md"))
@@ -438,13 +446,10 @@ var MemoryStore = class {
 	* @returns the live entry list with metadata.
 	*/
 	entriesWithMeta(target) {
-		return this.entries[target].map((content) => {
-			const timestamp = extractTimestamp(content) ?? "";
-			return {
-				content: stripTimestamp$1(content),
-				timestamp
-			};
-		});
+		return this.entries[target].map((content) => ({
+			content: stripTimestamp$1(content),
+			timestamp: this.timestamps[target].get(stripTimestamp$1(content)) ?? extractTimestamp(content) ?? ""
+		}));
 	}
 	/**
 	* The grouped `current/limit` usage string, matching the error-path usage
@@ -476,6 +481,12 @@ var MemoryStore = class {
 			if ((await this.reloadTarget(target, { skipDrift: true })).kind === "read-failed") return readFailedError(this.pathFor(target));
 			const entries = this.entries[target];
 			if (entries.some((entry) => stripTimestamp$1(entry) === trimmed)) return this.successResponse(target, "Entry already exists (no duplicate added).");
+			if (findSemanticOverlap(entries, trimmed) !== void 0) return {
+				success: false,
+				error: "Entry semantically overlaps an existing memory. Use replace to merge or update it instead of adding a duplicate.",
+				current_entries: entries.map(stripTimestamp$1),
+				usage: this.usageString(target)
+			};
 			if ([...entries, trimmed].join("\n§\n").length > this.charLimit(target)) {
 				const current = this.charCount(target);
 				return this.consolidationFailure({
@@ -486,6 +497,7 @@ var MemoryStore = class {
 				});
 			}
 			entries.push(trimmed);
+			this.timestamps[target].set(trimmed, (/* @__PURE__ */ new Date()).toISOString());
 			await this.saveToDisk(target);
 			return this.successResponse(target, "Entry added.");
 		});
@@ -531,7 +543,10 @@ var MemoryStore = class {
 					usage: `${grouped(current)}/${grouped(this.charLimit(target))}`
 				});
 			}
+			const previous = stripTimestamp$1(entries[match]);
 			entries[match] = trimmedNew;
+			this.timestamps[target].delete(previous);
+			this.timestamps[target].set(trimmedNew, (/* @__PURE__ */ new Date()).toISOString());
 			await this.saveToDisk(target);
 			return this.successResponse(target, "Entry replaced.");
 		});
@@ -552,7 +567,8 @@ var MemoryStore = class {
 				success: false,
 				error: `Index ${index} out of range (0-${entries.length - 1}).`
 			};
-			entries.splice(index, 1);
+			const [removed] = entries.splice(index, 1);
+			this.timestamps[target].delete(stripTimestamp$1(removed));
 			await this.saveToDisk(target);
 			return this.successResponse(target, "Entry removed.");
 		});
@@ -578,7 +594,8 @@ var MemoryStore = class {
 					success: false,
 					error: `Index ${index} out of range (0-${entries.length - 1}). No changes applied.`
 				};
-				entries.splice(index, 1);
+				const [removed] = entries.splice(index, 1);
+				this.timestamps[target].delete(stripTimestamp$1(removed));
 			}
 			await this.saveToDisk(target);
 			return this.successResponse(target, `${indices.length} entry(s) removed.`);
@@ -596,7 +613,8 @@ var MemoryStore = class {
 			const entries = this.entries[target];
 			const match = this.matchOrError(entries, trimmedOld, "remove");
 			if (typeof match !== "number") return match;
-			entries.splice(match, 1);
+			const [removed] = entries.splice(match, 1);
+			this.timestamps[target].delete(stripTimestamp$1(removed));
 			await this.saveToDisk(target);
 			return this.successResponse(target, "Entry removed.");
 		});
@@ -635,6 +653,7 @@ var MemoryStore = class {
 				if (op.action === "add") {
 					if (content.length === 0) return this.batchError(target, `${pos}: content is required.`);
 					if (working.some((entry) => stripTimestamp$1(entry) === content)) continue;
+					if (findSemanticOverlap(working, content) !== void 0) return this.batchError(target, `${pos}: content semantically overlaps an existing memory; use replace to merge or update it.`);
 					working.push(content);
 				} else if (op.action === "replace") {
 					if (oldText.length === 0) return this.batchError(target, `${pos}: old_text is required.`);
@@ -666,14 +685,49 @@ var MemoryStore = class {
 					usage: `${grouped(current)}/${grouped(this.charLimit(target))}`
 				});
 			}
+			const previousTimestamps = this.timestamps[target];
+			const now = (/* @__PURE__ */ new Date()).toISOString();
 			this.entries[target] = working;
+			this.timestamps[target] = new Map(working.map((entry) => {
+				const content = stripTimestamp$1(entry);
+				return [content, previousTimestamps.get(content) ?? now];
+			}));
 			await this.saveToDisk(target);
 			return this.successResponse(target, `Applied ${operations.length} operation(s).`);
 		});
 	}
-	/** Absolute path of one target's file. */
+	/** Absolute path of one target's plaintext entry file. */
 	pathFor(target) {
 		return join(this.dir, target === "user" ? "USER.md" : "MEMORY.md");
+	}
+	/** Absolute path of one target's private timestamp sidecar. */
+	metadataPathFor(target) {
+		return join(this.dir, target === "user" ? ".USER.meta.json" : ".MEMORY.meta.json");
+	}
+	/** Load valid sidecar timestamps and fall back to the plaintext file mtime for legacy entries. */
+	async loadMetadata(target) {
+		new Set(this.entries[target].map(stripTimestamp$1));
+		const timestamps = /* @__PURE__ */ new Map();
+		try {
+			const raw = await readFile(this.metadataPathFor(target), "utf8");
+			const parsed = JSON.parse(raw);
+			if (parsed.version === 1 && Array.isArray(parsed.entries) && parsed.entries.length === this.entries[target].length) {
+				const metadata = parsed.entries;
+				if (metadata.every((entry, index) => {
+					const timestamp = entry.timestamp;
+					return entry.content === stripTimestamp$1(this.entries[target][index]) && typeof timestamp === "string" && Number.isFinite(Date.parse(timestamp));
+				})) for (const entry of metadata) timestamps.set(entry.content, entry.timestamp);
+			}
+		} catch {}
+		let fallback = "";
+		try {
+			fallback = (await stat(this.pathFor(target))).mtime.toISOString();
+		} catch {}
+		for (const entry of this.entries[target]) {
+			const content = stripTimestamp$1(entry);
+			if (!timestamps.has(content)) timestamps.set(content, extractTimestamp(entry) ?? fallback);
+		}
+		this.timestamps[target] = timestamps;
 	}
 	charLimit(target) {
 		return target === "user" ? this.userCharLimit : this.memoryCharLimit;
@@ -816,6 +870,7 @@ var MemoryStore = class {
 		if (read === READ_FAILED) return { kind: "read-failed" };
 		const backup = options?.skipDrift === true ? void 0 : await this.detectExternalDrift(target, read.raw);
 		this.entries[target] = dedupe(this.parseEntries(read.raw));
+		await this.loadMetadata(target);
 		return backup === void 0 ? { kind: "clean" } : {
 			kind: "drift",
 			backup
@@ -839,18 +894,30 @@ var MemoryStore = class {
 		if (!(raw.trim() !== roundtrip || maxEntryLength > this.charLimit(target))) return void 0;
 		const backupPath = `${this.pathFor(target)}.bak.${Math.trunc(Date.now() / 1e3)}`;
 		try {
-			await writeFile(backupPath, raw, { mode: FILE_MODE });
+			await writeFile(backupPath, raw, { mode: FILE_MODE$1 });
 		} catch {
 			return `${backupPath} (BACKUP FAILED — file unchanged on disk)`;
 		}
 		return backupPath;
 	}
-	/** Persist live entries atomically (temp + rename, never truncate-before-lock). */
+	/** Persist plaintext entries, then their recoverable private timestamp sidecar. */
 	async saveToDisk(target) {
-		const content = this.entries[target].length > 0 ? this.entries[target].join(ENTRY_DELIMITER) : "";
+		const entries = this.entries[target].map(stripTimestamp$1);
+		const content = entries.length > 0 ? entries.join(ENTRY_DELIMITER) : "";
 		await writeFileAtomic(this.pathFor(target), content, {
-			mode: FILE_MODE,
-			dirMode: DIR_MODE
+			mode: FILE_MODE$1,
+			dirMode: DIR_MODE$1
+		});
+		const metadata = {
+			version: 1,
+			entries: entries.map((entry) => ({
+				content: entry,
+				timestamp: this.timestamps[target].get(entry) ?? (/* @__PURE__ */ new Date()).toISOString()
+			}))
+		};
+		await writeFileAtomic(this.metadataPathFor(target), `${JSON.stringify(metadata)}\n`, {
+			mode: FILE_MODE$1,
+			dirMode: DIR_MODE$1
 		});
 	}
 	/** Serialize a read-modify-write cycle through the per-file lock. */
@@ -864,7 +931,7 @@ var MemoryStore = class {
 async function mkdirp(dir) {
 	await mkdir(dir, {
 		recursive: true,
-		mode: DIR_MODE
+		mode: DIR_MODE$1
 	});
 }
 /** Order-preserving dedupe keeping the first occurrence. */
@@ -910,6 +977,33 @@ function readFailedError(path) {
 		error: `Refusing to write ${basename(path)}: the file exists on disk but could not be read right now (temporarily locked by another program, a permission change, invalid/corrupt text encoding, or a filesystem error). Treating an unreadable file as empty and saving would wipe existing memory, so the write is refused. Nothing was changed — retry in a moment.`
 	};
 }
+/**
+* Identify a near-duplicate entry before it becomes separately persisted memory.
+* Exact duplicate detection remains separate; this conservative lexical check
+* catches rewrites that preserve most meaningful Chinese or Latin word fragments.
+*/
+function findSemanticOverlap(entries, candidate) {
+	const candidateFragments = semanticFragments(candidate);
+	if (candidateFragments.size < 3) return void 0;
+	for (const entry of entries) {
+		const existing = stripTimestamp$1(entry);
+		const existingFragments = semanticFragments(existing);
+		const shared = [...candidateFragments].filter((fragment) => existingFragments.has(fragment)).length;
+		const similarity = shared / Math.min(candidateFragments.size, existingFragments.size);
+		if (shared >= 5 && similarity >= .55) return existing;
+	}
+}
+/** Build normalized CJK bigrams and Latin words for near-duplicate matching. */
+function semanticFragments(value) {
+	const normalized = value.toLowerCase().replace(/[\s\p{P}\p{S}]+/gu, "");
+	const fragments = /* @__PURE__ */ new Set();
+	for (let i = 0; i < normalized.length - 1; i += 1) {
+		const pair = normalized.slice(i, i + 2);
+		if (/^[\p{Script=Han}]{2}$/u.test(pair)) fragments.add(pair);
+	}
+	for (const word of value.toLowerCase().matchAll(/[a-z0-9]{3,}/g)) fragments.add(word[0]);
+	return fragments;
+}
 /** Replace threat-matching entries with placeholders for the snapshot only. */
 function sanitizeForSnapshot(entries, filename) {
 	return entries.map((entry) => {
@@ -939,43 +1033,84 @@ function stripTimestamp$1(content) {
 }
 //#endregion
 //#region src/review-notices.ts
+/** Durable background-review notification storage. */
+/** Owner-only directory mode for persisted review receipts. */
+const DIR_MODE = 448;
+/** Owner-only file mode for persisted review receipts. */
+const FILE_MODE = 384;
 /**
-* Stores completed review receipts until the source session's browser reads one.
-* Entries live only in this process and are removed by {@link consume}.
+* Stores the latest completed review receipt per source session on disk.
+* Reading a receipt never deletes it, so a browser refresh or reconnect retains
+* the visible background-update result until a newer review supersedes it.
 */
 var MemoryReviewNotices = class {
+	path;
+	/** @param dir - directory holding the receipt file. */
+	constructor(dir = dshHomePath("memories")) {
+		this.path = join(dir, ".review-notices.json");
+	}
+	/** Persist a committed review receipt for its source session. */
+	async publish(notice) {
+		const notices = await this.read();
+		notices[notice.sessionId] = notice;
+		await this.write(notices);
+	}
+	/** Return the latest persisted receipt for one source session without consuming it. */
+	async get(sessionId) {
+		return (await this.read())[sessionId];
+	}
+	/** Delete a disposed session's persisted receipt. */
+	async discard(sessionId) {
+		const notices = await this.read();
+		if (notices[sessionId] === void 0) return;
+		delete notices[sessionId];
+		await this.write(notices);
+	}
+	async read() {
+		try {
+			const raw = await readFile(this.path, "utf8");
+			const parsed = JSON.parse(raw);
+			return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+		} catch {
+			return {};
+		}
+	}
+	async write(notices) {
+		await mkdir(dirname(this.path), {
+			recursive: true,
+			mode: DIR_MODE
+		});
+		await writeFileAtomic(this.path, JSON.stringify(notices), {
+			mode: FILE_MODE,
+			dirMode: DIR_MODE
+		});
+	}
+};
+/** Shared receipt store for the memory preset and host HTTP route. */
+const memoryReviewNotices = new MemoryReviewNotices();
+//#endregion
+//#region src/review-progress.ts
+/**
+* Holds the current source-session review countdown without writing session data.
+* Values disappear when the owning session disposes or the process restarts.
+*/
+var MemoryReviewProgressStore = class {
 	bySession = /* @__PURE__ */ new Map();
-	/**
-	* Publish a committed review receipt for its source session.
-	* @param notice - The already-persisted review result.
-	*/
-	publish(notice) {
-		this.bySession.set(notice.sessionId, notice);
+	/** Publish one session's current countdown. */
+	publish(sessionId, progress) {
+		this.bySession.set(sessionId, progress);
 	}
-	/**
-	* Return and delete the pending receipt for one session.
-	* @param sessionId - Source session that owns the receipt.
-	* @returns The pending receipt, if one exists.
-	*/
-	consume(sessionId) {
-		const notice = this.bySession.get(sessionId);
-		if (notice !== void 0) this.bySession.delete(sessionId);
-		return notice;
+	/** Read one session's current countdown without consuming it. */
+	get(sessionId) {
+		return this.bySession.get(sessionId);
 	}
-	/**
-	* Delete a disposed session's unread receipt.
-	* @param sessionId - Session whose transient receipt should be discarded.
-	*/
+	/** Forget a disposed session's countdown. */
 	discard(sessionId) {
 		this.bySession.delete(sessionId);
 	}
 };
-/**
-* The settings plugin and the memory agent preset run in different Cordis
-* realms. Module scope provides their process-local handoff without making a
-* preset publish a process-global Cordis service.
-*/
-const memoryReviewNotices = new MemoryReviewNotices();
+/** Shared across the preset and host settings plugin in this DSH process. */
+const memoryReviewProgress = new MemoryReviewProgressStore();
 //#endregion
 //#region src/schema.ts
 /** Model-facing description of the memory tool (single source for both the
@@ -1343,9 +1478,19 @@ function resolveReviewRoute(ctx, session) {
 * @param session - the session to count.
 * @returns the user-message event count.
 */
-function priorUserTurns(session) {
+function isCountedUserMessage(event) {
+	return event.type === "user/message" && event.data.source.kind === "user";
+}
+/** Count completed main-session user turns already present in a restored log. */
+function priorCompletedUserTurns(session) {
+	let pendingUserTurn = false;
 	let count = 0;
-	for (const event of session.events) if (event.type === "user/message") count += 1;
+	for (const event of session.events) {
+		if (isCountedUserMessage(event)) pendingUserTurn = true;
+		if (event.type !== "turn/end") continue;
+		if (pendingUserTurn && event.data.reason.kind === "completed") count += 1;
+		pendingUserTurn = false;
+	}
 	return count;
 }
 /**
@@ -1474,43 +1619,56 @@ async function apply(ctx, config) {
 			state = {
 				turnsSinceMemory: 0,
 				hydrated: false,
+				pendingUserTurn: false,
 				reviewPending: false
 			};
 			states.set(id, state);
 		}
 		return state;
 	}
-	/**
-	* Count real user turns and fold the interval gate. The gate fires on the
-	* Nth user turn and arms a pending review; the review itself waits for the
-	* completed turn that follows, exactly like the upstream
-	* `should_review_memory` handoff from turn setup to the finalizer.
-	*/
+	/** Publish the current countdown for the browser-only memory indicator. */
+	function publishReviewProgress(sessionId, state, nudgeInterval, reviewEnabled) {
+		memoryReviewProgress.publish(String(sessionId), {
+			reviewEnabled,
+			remainingTurns: reviewEnabled && nudgeInterval > 0 ? nudgeInterval - state.turnsSinceMemory : 0
+		});
+	}
+	/** Count only completed main-session user turns and arm review on the configured interval. */
 	ctx.on("session/event", (session, event) => {
-		if (event.type === "turn/start") store.resetConsolidationFailures();
-		if (event.type !== "user/message") return;
 		if ((session.header.delegationDepth ?? 0) > 0) return;
-		if (event.data.source.kind !== "user") return;
-		const state = stateFor(session.id);
+		if (event.type === "turn/start") {
+			store.resetConsolidationFailures();
+			return;
+		}
+		if (isCountedUserMessage(event)) {
+			const state = stateFor(session.id);
+			state.pendingUserTurn = true;
+			return;
+		}
+		if (event.type !== "turn/end") return;
+		const state = states.get(session.id);
+		if (state === void 0 || !state.pendingUserTurn) return;
+		state.pendingUserTurn = false;
+		if (event.data.reason.kind !== "completed") return;
+		const { nudgeInterval, reviewEnabled } = effectiveSettings();
 		if (!state.hydrated) {
 			state.hydrated = true;
-			const prior = priorUserTurns(session) - 1;
-			if (config.nudgeInterval > 0 && prior > 0) state.turnsSinceMemory = prior % config.nudgeInterval;
+			const prior = priorCompletedUserTurns(session) - 1;
+			state.turnsSinceMemory = nudgeInterval > 0 && prior > 0 ? prior % nudgeInterval : 0;
 		}
-		const { nudgeInterval, reviewEnabled } = effectiveSettings();
-		if (nudgeInterval > 0 && reviewEnabled) {
-			state.turnsSinceMemory += 1;
-			if (state.turnsSinceMemory >= nudgeInterval) {
-				state.turnsSinceMemory = 0;
-				state.reviewPending = true;
-			}
+		if (!reviewEnabled || nudgeInterval === 0) {
+			publishReviewProgress(session.id, state, nudgeInterval, reviewEnabled);
+			return;
 		}
-	});
-	/** Spawn the armed review once the gated turn completes. */
-	ctx.on("session/event", (session, event) => {
-		if (event.type !== "turn/end" || event.data.reason.kind !== "completed") return;
-		const state = states.get(session.id);
-		if (state === void 0 || !state.reviewPending) return;
+		state.turnsSinceMemory += 1;
+		if (state.turnsSinceMemory < nudgeInterval) {
+			publishReviewProgress(session.id, state, nudgeInterval, reviewEnabled);
+			return;
+		}
+		state.turnsSinceMemory = 0;
+		state.reviewPending = true;
+		publishReviewProgress(session.id, state, nudgeInterval, reviewEnabled);
+		if (!state.reviewPending) return;
 		state.reviewPending = false;
 		if (reviewing.has(session.id)) return;
 		const route = resolveReviewRoute(ctx, session);
@@ -1532,7 +1690,7 @@ async function apply(ctx, config) {
 				changes: outcome.changes,
 				reason: outcome.reason
 			};
-			memoryReviewNotices.publish(update);
+			return memoryReviewNotices.publish(update);
 		}).catch((error) => {
 			ctx.logger.warn(`memory: background review for ${String(session.id)} failed: ${String(error)}`);
 		}).finally(() => {
@@ -1549,9 +1707,10 @@ async function apply(ctx, config) {
 		injected.delete(session.id);
 		injectionLocks.delete(session.id);
 		memoryReviewNotices.discard(String(session.id));
+		memoryReviewProgress.discard(String(session.id));
 	});
 }
 //#endregion
-export { DEFAULT_USER_CHAR_LIMIT as a, name as c, DEFAULT_REVIEW_MAX_ITERATIONS as i, memoryReviewNotices as l, DEFAULT_MEMORY_CHAR_LIMIT as n, apply as o, DEFAULT_NUDGE_INTERVAL as r, inject as s, Config as t, MemoryStore as u };
+export { DEFAULT_USER_CHAR_LIMIT as a, name as c, MemoryStore as d, DEFAULT_REVIEW_MAX_ITERATIONS as i, memoryReviewProgress as l, DEFAULT_MEMORY_CHAR_LIMIT as n, apply as o, DEFAULT_NUDGE_INTERVAL as r, inject as s, Config as t, memoryReviewNotices as u };
 
-//# sourceMappingURL=src-CN2TttgI.js.map
+//# sourceMappingURL=src-Dh_pIN17.js.map

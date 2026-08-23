@@ -44,9 +44,17 @@ window.__ModuleLoader__.load({
 				return iso;
 			}
 		};
-		const consumeReviewNotice = async (sessionId) => {
+		const fetchReviewNotice = async (sessionId) => {
 			try {
 				const body = await (await fetch(`${MEMORY_ROUTE}/review-notice?sessionId=${encodeURIComponent(sessionId)}`)).json();
+				return body.ok ? body.value ?? null : null;
+			} catch {
+				return null;
+			}
+		};
+		const fetchReviewProgress = async (sessionId) => {
+			try {
+				const body = await (await fetch(`${MEMORY_ROUTE}/review-progress?sessionId=${encodeURIComponent(sessionId)}`)).json();
 				return body.ok ? body.value ?? null : null;
 			} catch {
 				return null;
@@ -541,7 +549,7 @@ window.__ModuleLoader__.load({
 				let disposed = false;
 				setNotice(void 0);
 				const read = () => {
-					consumeReviewNotice(sessionId).then((next) => {
+					fetchReviewNotice(sessionId).then((next) => {
 						if (!disposed && next !== null) setNotice(next);
 					});
 				};
@@ -561,14 +569,21 @@ window.__ModuleLoader__.load({
 				setExpanded((value) => !value);
 			};
 			return react.default.createElement("div", { style: {
-				borderBottom: "1px solid var(--dsw-alias-border-l2)",
-				marginBottom: 4
-			} }, react.default.createElement("div", {
+				display: "flex",
+				justifyContent: "center",
+				width: "100%",
+				maxWidth: "100%",
+				margin: "0 0 6px"
+			} }, react.default.createElement("div", { style: { width: "min(100%, 560px)" } }, react.default.createElement("div", {
 				style: {
-					display: "flex",
+					display: "inline-flex",
+					maxWidth: "100%",
 					alignItems: "center",
 					gap: 8,
-					padding: "6px 0",
+					padding: "5px 9px",
+					border: "1px solid var(--dsw-alias-border-l2)",
+					borderRadius: 6,
+					background: "var(--dsw-alias-bg-layer-2)",
 					fontSize: 13,
 					lineHeight: "20px",
 					color: "var(--dsw-alias-label-primary)",
@@ -613,7 +628,7 @@ window.__ModuleLoader__.load({
 				color: "var(--dsw-alias-label-secondary)",
 				fontSize: 12
 			} }, summary)), expanded ? react.default.createElement("div", { style: {
-				margin: "0 0 8px 16px",
+				margin: "4px 0 0",
 				padding: 8,
 				border: "1px solid var(--dsw-alias-border-l2)",
 				borderRadius: 6,
@@ -646,10 +661,11 @@ window.__ModuleLoader__.load({
 			} }, change.target === "user" ? "USER" : "MEMORY"), react.default.createElement("span", { style: {
 				color: change.action === "added" ? "var(--dsw-alias-color-success, #22c55e)" : "var(--dsw-alias-label-error)",
 				fontWeight: 600
-			} }, change.action === "added" ? "＋" : "−"), react.default.createElement("span", null, change.content)))) : null);
+			} }, change.action === "added" ? "＋" : "−"), react.default.createElement("span", null, change.content)))) : null));
 		}
-		function MemoryDock(_props) {
+		function MemoryDock({ sessionId }) {
 			const [status, setStatus] = react.default.useState(null);
+			const [reviewProgress, setReviewProgress] = react.default.useState(null);
 			const [modalOpen, setModalOpen] = react.default.useState(false);
 			const [entries, setEntries] = react.default.useState({
 				memory: [],
@@ -660,12 +676,14 @@ window.__ModuleLoader__.load({
 			const [loading, setLoading] = react.default.useState(false);
 			const [toast, setToast] = react.default.useState(null);
 			react.default.useEffect(() => {
-				fetchStatus().then(setStatus);
-				const interval = setInterval(() => {
+				const refresh = () => {
 					fetchStatus().then(setStatus);
-				}, 1e4);
+					fetchReviewProgress(sessionId).then(setReviewProgress);
+				};
+				refresh();
+				const interval = setInterval(refresh, 2e3);
 				return () => clearInterval(interval);
-			}, []);
+			}, [sessionId]);
 			react.default.useEffect(() => {
 				if (toast) {
 					const timer = setTimeout(() => setToast(null), 2e3);
@@ -747,7 +765,7 @@ window.__ModuleLoader__.load({
 				},
 				onClick: openModal,
 				title: "点击查看记忆详情"
-			}, `📝 MEMORY: ${status.memory.entries} 条 · USER: ${status.user.entries} 条`), modalOpen ? react.default.createElement("div", {
+			}, `📝 MEMORY: ${status.memory.entries} 条 · USER: ${status.user.entries} 条${reviewProgress?.reviewEnabled ? `（距下次后台更新 ${reviewProgress.remainingTurns} 轮）` : ""}`), modalOpen ? react.default.createElement("div", {
 				key: "memory-modal-overlay",
 				style: {
 					position: "fixed",

@@ -1,5 +1,19 @@
-import { describe, expect, it } from 'vitest'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { MemoryReviewNotices } from '../src/review-notices.ts'
+
+let dir: string | undefined
+
+beforeEach(async () => {
+  dir = await mkdtemp(join(tmpdir(), 'dsh-memory-notices-'))
+})
+
+afterEach(async () => {
+  if (dir !== undefined) await rm(dir, { recursive: true, force: true })
+  dir = undefined
+})
 
 const first = {
   sessionId: 'session-a',
@@ -16,21 +30,24 @@ const second = {
 }
 
 describe('MemoryReviewNotices', () => {
-  it('isolates receipts by session and consumes each receipt only once', () => {
-    const notices = new MemoryReviewNotices()
-    notices.publish(first)
-    notices.publish(second)
+  it('persists and isolates receipts by session without consuming them on read', async () => {
+    const notices = new MemoryReviewNotices(dir)
+    await notices.publish(first)
+    await notices.publish(second)
 
-    expect(notices.consume('session-a')).toEqual(first)
-    expect(notices.consume('session-a')).toBeUndefined()
-    expect(notices.consume('session-b')).toEqual(second)
-    expect(notices.consume('unknown')).toBeUndefined()
+    expect(await notices.get('session-a')).toEqual(first)
+    expect(await notices.get('session-a')).toEqual(first)
+    expect(await notices.get('session-b')).toEqual(second)
+    expect(await notices.get('unknown')).toBeUndefined()
+
+    const afterRefresh = new MemoryReviewNotices(dir)
+    expect(await afterRefresh.get('session-a')).toEqual(first)
   })
 
-  it('drops unread receipts when their source session disposes', () => {
-    const notices = new MemoryReviewNotices()
-    notices.publish(first)
-    notices.discard('session-a')
-    expect(notices.consume('session-a')).toBeUndefined()
+  it('drops a disposed session receipt', async () => {
+    const notices = new MemoryReviewNotices(dir)
+    await notices.publish(first)
+    await notices.discard('session-a')
+    expect(await notices.get('session-a')).toBeUndefined()
   })
 })

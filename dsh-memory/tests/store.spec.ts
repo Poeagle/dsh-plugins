@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile, mkdir, chmod, readFile, readdir } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile, mkdir, chmod, readFile, readdir, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -47,6 +47,37 @@ describe('MemoryStore', () => {
     it('groups current and limit with thousands separators', async () => {
       const s = await loaded({ memoryCharLimit: 2200 })
       expect(s.usageString('memory')).toBe('0/2,200')
+    })
+  })
+
+  describe('timestamps', () => {
+    it('persists independent entry metadata without changing plaintext memory or usage', async () => {
+      const s = await loaded()
+      await s.add('memory', 'Timestamped fact')
+      expect(await readFile(join(dir as string, 'MEMORY.md'), 'utf8')).toBe('Timestamped fact')
+      expect(s.usageString('memory')).toBe('16/2,200')
+      const metadata = JSON.parse(await readFile(join(dir as string, '.MEMORY.meta.json'), 'utf8')) as { version: number; entries: { content: string; timestamp: string }[] }
+      expect(metadata.version).toBe(1)
+      expect(metadata.entries[0]?.content).toBe('Timestamped fact')
+      expect(new Date(metadata.entries[0]?.timestamp ?? '').toISOString()).toBe(metadata.entries[0]?.timestamp)
+      const reloaded = await loaded()
+      expect(reloaded.entriesWithMeta('memory')).toEqual(metadata.entries)
+    })
+
+    it('uses the plaintext file mtime for legacy entries without metadata', async () => {
+      await seedFile('user', ['Legacy fact'])
+      const expected = (await stat(join(dir as string, 'USER.md'))).mtime.toISOString()
+      expect((await loaded()).entriesWithMeta('user')).toEqual([{ content: 'Legacy fact', timestamp: expected }])
+    })
+
+    it('rejects stale sidecar metadata when plaintext entries no longer match', async () => {
+      await seedFile('memory', ['New plaintext fact'])
+      await writeFile(join(dir as string, '.MEMORY.meta.json'), JSON.stringify({
+        version: 1,
+        entries: [{ content: 'Old plaintext fact', timestamp: '2026-01-01T00:00:00.000Z' }],
+      }), 'utf8')
+      const expected = (await stat(join(dir as string, 'MEMORY.md'))).mtime.toISOString()
+      expect((await loaded()).entriesWithMeta('memory')).toEqual([{ content: 'New plaintext fact', timestamp: expected }])
     })
   })
 

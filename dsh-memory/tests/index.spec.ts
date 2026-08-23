@@ -316,6 +316,56 @@ describe('nudge gating', () => {
     await vi.waitFor(() => { expect(adapter.requests).toHaveLength(1) })
   })
 
+  it('counts only completed real-user turns after restoring injected messages and a settings override', async () => {
+    const c = await mount({ nudgeInterval: 10 })
+    let settings = { nudgeInterval: 5, reviewEnabled: true }
+    c.provide('settings', { get: (namespace: string) => namespace === 'memory' ? settings : undefined })
+    const adapter = new ScriptedAdapter([textResponse('Nothing to save.')])
+    c.llm.registerAdapter(['mock'], adapter)
+    const seed: SessionEvent[] = [
+      { type: 'user/message', seq: 0, time: 1, data: createUserMessage({ content: [{ type: 'text', text: 'old real user' }], source: { kind: 'user' } }), surfaceOp: 'append' },
+      { type: 'turn/end', seq: 1, time: 2, data: { turn: 1, reason: { kind: 'completed' } } },
+      { type: 'user/message', seq: 2, time: 3, data: createUserMessage({ content: [{ type: 'text', text: 'injected' }], source: { kind: 'plugin', plugin: 'memory' } }), surfaceOp: 'append' },
+      { type: 'user/message', seq: 3, time: 4, data: createUserMessage({ content: [{ type: 'text', text: 'catalog' }], source: { kind: 'skill-catalog' } }), surfaceOp: 'append' },
+    ]
+    const session = c.sessions.create(SessionId('restored-settings'), { seed })
+    session.append('request/header', { header: { config: { provider: 'mock', model: 'mock-model' } }, reason: 'initial' })
+    for (let turn = 2; turn <= 4; turn += 1) {
+      session.append('turn/start', { turn })
+      appendUserMessage(session, `completed ${String(turn)}`)
+      session.append('turn/end', { turn, reason: { kind: 'completed' } })
+    }
+    await settle()
+    expect(adapter.requests).toHaveLength(0)
+    session.append('turn/start', { turn: 5 })
+    appendUserMessage(session, 'fifth completed real-user turn')
+    session.append('turn/end', { turn: 5, reason: { kind: 'completed' } })
+    await vi.waitFor(() => { expect(adapter.requests).toHaveLength(1) })
+    settings = { nudgeInterval: 5, reviewEnabled: true }
+  })
+
+  it('does not count interrupted user turns toward the review interval', async () => {
+    const c = await mount({ nudgeInterval: 5 })
+    const adapter = new ScriptedAdapter([textResponse('Nothing to save.')])
+    c.llm.registerAdapter(['mock'], adapter)
+    const session = c.sessions.create(SessionId('interrupted-turn'))
+    session.append('request/header', { header: { config: { provider: 'mock', model: 'mock-model' } }, reason: 'initial' })
+    session.append('turn/start', { turn: 1 })
+    appendUserMessage(session, 'interrupted user message')
+    session.append('turn/end', { turn: 1, reason: { kind: 'interrupted' } })
+    for (let turn = 2; turn <= 5; turn += 1) {
+      session.append('turn/start', { turn })
+      appendUserMessage(session, `completed ${String(turn)}`)
+      session.append('turn/end', { turn, reason: { kind: 'completed' } })
+    }
+    await settle()
+    expect(adapter.requests).toHaveLength(0)
+    session.append('turn/start', { turn: 6 })
+    appendUserMessage(session, 'fifth completed user message')
+    session.append('turn/end', { turn: 6, reason: { kind: 'completed' } })
+    await vi.waitFor(() => { expect(adapter.requests).toHaveLength(1) })
+  })
+
   it('never arms or counts when the interval is zero', async () => {
     const c = await mount({ nudgeInterval: 0 })
     const adapter = new ScriptedAdapter([textResponse('Nothing to save.')])
@@ -344,7 +394,7 @@ describe('nudge gating', () => {
 })
 
 describe('background review spawning', () => {
-  it('emits one transient receipt for committed background-review changes', async () => {
+  it('persists a review receipt for committed background-review changes', async () => {
     const c = await mount({ nudgeInterval: 1 })
     const adapter = new ScriptedAdapter([
       toolCallResponse('c1', 'memory', { action: 'add', target: 'memory', content: 'Background fact' }),
@@ -355,15 +405,16 @@ describe('background review spawning', () => {
     session.append('turn/start', { turn: 1 })
     appendUserMessage(session, 'Remember this')
     session.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
-    await vi.waitFor(() => {
-      expect(memoryReviewNotices.consume(String(session.id))).toEqual({
-        sessionId: String(session.id),
-        saved: 1,
-        changes: [{ target: 'memory', action: 'added', content: 'Background fact' }],
-        reason: 'finished',
-      })
+    const expected = {
+      sessionId: String(session.id),
+      saved: 1,
+      changes: [{ target: 'memory', action: 'added', content: 'Background fact' }],
+      reason: 'finished',
+    }
+    await vi.waitFor(async () => {
+      await expect(memoryReviewNotices.get(String(session.id))).resolves.toEqual(expected)
     })
-    expect(memoryReviewNotices.consume(String(session.id))).toBeUndefined()
+    await expect(memoryReviewNotices.get(String(session.id))).resolves.toEqual(expected)
     expect(session.events).not.toContainEqual(expect.objectContaining({ type: 'memory/review-updated' }))
   })
 
@@ -376,6 +427,7 @@ describe('background review spawning', () => {
     c.llm.registerAdapter(['mock'], adapter)
     const session = sessionWithRoute(c, 'review-spawn')
     session.append('turn/start', { turn: 1 })
+    appendUserMessage(session, 'A completed user turn starts the review.')
     session.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
     await vi.waitFor(async () => {
       const onDisk = await readFile(join(home as string, 'memories', 'USER.md'), 'utf8')
