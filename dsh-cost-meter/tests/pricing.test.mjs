@@ -1,6 +1,14 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { DEFAULT_PRICING, foldSession, normalizeUsage, resolvePricing, validatePricing } from '../lib/index.js'
+import {
+  DEFAULT_PRICING,
+  contextTokensOf,
+  foldSession,
+  normalizeUsage,
+  resolveContextMultiplier,
+  resolvePricing,
+  validatePricing,
+} from '../lib/index.js'
 
 const config = structuredClone(DEFAULT_PRICING)
 config.default.periods = [{
@@ -46,6 +54,21 @@ test('rejects overlapping and invalid pricing configuration', () => {
   assert.throws(() => validatePricing(badZone), /IANA time zone/)
 })
 
+test('rejects invalid context surcharge configuration', () => {
+  const duplicate = structuredClone(config)
+  duplicate.default.contextSurcharges = [
+    { afterTokens: 200_000, multiplier: 2 },
+    { afterTokens: 200_000, multiplier: 3 },
+  ]
+  assert.throws(() => validatePricing(duplicate), /duplicate afterTokens/)
+  const fractional = structuredClone(config)
+  fractional.default.contextSurcharges = [{ afterTokens: 200_000.5, multiplier: 2 }]
+  assert.throws(() => validatePricing(fractional), /afterTokens/)
+  const negative = structuredClone(config)
+  negative.models['vendor/model-a'].contextSurcharges = [{ afterTokens: 200_000, multiplier: -1 }]
+  assert.throws(() => validatePricing(negative), /multiplier/)
+})
+
 test('prices each request route and replaces duplicate step usage', () => {
   const events = [
     { type: 'request/header', time: 0, data: { header: { config: { provider: 'vendor', model: 'model-a' } } } },
@@ -62,4 +85,105 @@ test('prices each request route and replaces duplicate step usage', () => {
   assert.equal(result.cost, 8.52)
   assert.equal(result.route, 'vendor/unknown')
   assert.equal(result.pricingSource, 'default-period')
+})
+
+test('context surcharge multiplies the whole request after the threshold', () => {
+  const priced = structuredClone(DEFAULT_PRICING)
+  priced.default.contextSurcharges = [{ afterTokens: 200_000, multiplier: 2 }]
+  priced.models['grok/grok-4.6'] = {
+    rates: { input: 0.24, cacheRead: 0.024, cacheWrite: 0.24, output: 0.72 },
+    contextSurcharges: [{ afterTokens: 200_000, multiplier: 2 }],
+  }
+  const below = foldSession([
+    { type: 'request/header', time: 0, data: { header: { config: { provider: 'grok', model: 'grok-4.6' } } } },
+    { type: 'assistant/message', time: 1, data: { turn: 1, step: 1, usage: { inputTokens: 443, cacheReadTokens: 199_557, outputTokens: 1_316 } } },
+  ], priced)
+  const above = foldSession([
+    { type: 'request/header', time: 0, data: { header: { config: { provider: 'grok', model: 'grok-4.6' } } } },
+    { type: 'assistant/message', time: 1, data: { turn: 1, step: 1, usage: { inputTokens: 443, cacheReadTokens: 202_200, outputTokens: 1_316 } } },
+  ], priced)
+  const unit = 1_000_000
+  const costOf = (tokens, multiplier) => (
+    tokens.input * 0.24 / unit * multiplier
+    + tokens.cacheRead * 0.024 / unit * multiplier
+    + tokens.output * 0.72 / unit * multiplier
+  )
+  const belowTokens = { input: 443, cacheRead: 199_557, cacheWrite: 0, output: 1_316 }
+  const aboveTokens = { input: 443, cacheRead: 202_200, cacheWrite: 0, output: 1_316 }
+  assert.equal(contextTokensOf(belowTokens), 200_000)
+  assert.equal(resolveContextMultiplier(priced, 'grok', 'grok-4.6', 200_000), 1)
+  assert.equal(resolveContextMultiplier(priced, 'grok', 'grok-4.6', 202_643), 2)
+  assert.equal(below.inputCost, belowTokens.input * 0.24 / unit)
+  assert.equal(below.cacheReadCost, belowTokens.cacheRead * 0.024 / unit)
+  assert.equal(below.outputCost, belowTokens.output * 0.72 / unit)
+  assert.equal(below.cost, below.inputCost + below.cacheReadCost + below.outputCost)
+  assert.equal(below.cost, costOf(belowTokens, 1))
+  assert.equal(above.inputCost, aboveTokens.input * 0.24 / unit * 2)
+  assert.equal(above.cacheReadCost, aboveTokens.cacheRead * 0.024 / unit * 2)
+  assert.equal(above.outputCost, aboveTokens.output * 0.72 / unit * 2)
+  assert.equal(above.cost, above.inputCost + above.cacheReadCost + above.outputCost)
+  assert.equal(above.cost, costOf(aboveTokens, 2))
+  assert.equal(above.details[0].contextMultiplier, 2)
+  assert.equal(above.hourly[0].contextMultiplier, 2)
+  assert.equal(below.details[0].contextMultiplier, 1)
+})
+
+test('context surcharge uses the highest matching threshold and model lists replace default', () => {
+  const priced = structuredClone(DEFAULT_PRICING)
+  priced.default.contextSurcharges = [
+    { afterTokens: 200_000, multiplier: 2 },
+    { afterTokens: 400_000, multiplier: 4 },
+  ]
+  priced.models['vendor/plain'] = { rates: { input: 1 } }
+  priced.models['vendor/exempt'] = { rates: { input: 1 }, contextSurcharges: [] }
+  const mixed = foldSession([
+    { type: 'request/header', time: 0, data: { header: { config: { provider: 'vendor', model: 'plain' } } } },
+    { type: 'assistant/message', time: 1, data: { turn: 1, step: 1, usage: { inputTokens: 200_001, outputTokens: 1_000_000 } } },
+    { type: 'assistant/message', time: 2, data: { turn: 1, step: 2, usage: { inputTokens: 400_001, outputTokens: 1_000_000 } } },
+    { type: 'request/header', time: 3, data: { header: { config: { provider: 'vendor', model: 'exempt' } } } },
+    { type: 'assistant/message', time: 4, data: { turn: 1, step: 3, usage: { inputTokens: 500_000, outputTokens: 1_000_000 } } },
+  ], priced)
+  assert.equal(mixed.inputCost, 200_001 / 1_000_000 * 2 + 400_001 / 1_000_000 * 4 + 500_000 / 1_000_000)
+  assert.equal(mixed.outputCost, 2 * 2 + 2 * 4 + 2)
+  assert.equal(mixed.cost, mixed.inputCost + mixed.outputCost)
+  assert.deepEqual(mixed.details.map(detail => [detail.model, detail.contextMultiplier]).sort(), [
+    ['exempt', 1],
+    ['plain', 2],
+    ['plain', 4],
+  ])
+})
+
+test('context threshold counts cache write and ignores output tokens', () => {
+  const priced = structuredClone(DEFAULT_PRICING)
+  priced.default.contextSurcharges = [{ afterTokens: 200_000, multiplier: 2 }]
+  const cacheWriteOnly = foldSession([
+    { type: 'request/header', time: 0, data: { header: { config: { provider: 'vendor', model: 'plain' } } } },
+    { type: 'assistant/message', time: 1, data: { turn: 1, step: 1, usage: { inputTokens: 1, cacheWriteTokens: 200_000, outputTokens: 1_000_000 } } },
+  ], priced)
+  const outputHeavy = foldSession([
+    { type: 'request/header', time: 0, data: { header: { config: { provider: 'vendor', model: 'plain' } } } },
+    { type: 'assistant/message', time: 1, data: { turn: 1, step: 1, usage: { inputTokens: 200_000, outputTokens: 2_000_000 } } },
+  ], priced)
+  assert.equal(cacheWriteOnly.cacheWriteCost, 200_000 / 1_000_000 * 2)
+  assert.equal(cacheWriteOnly.outputCost, 4)
+  assert.equal(outputHeavy.inputCost, 0.2)
+  assert.equal(outputHeavy.outputCost, 4)
+  assert.equal(outputHeavy.details[0].contextMultiplier, 1)
+})
+
+test('later usage for the same step replaces a previous surcharge', () => {
+  const priced = structuredClone(DEFAULT_PRICING)
+  priced.default.contextSurcharges = [{ afterTokens: 200_000, multiplier: 2 }]
+  const result = foldSession([
+    { type: 'request/header', time: 0, data: { header: { config: { provider: 'vendor', model: 'plain' } } } },
+    { type: 'assistant/chunk', time: 1, data: { turn: 1, step: 1, chunk: { type: 'usage', usage: { inputTokens: 300_000, outputTokens: 1_000_000 } } } },
+    { type: 'assistant/message', time: 2, data: { turn: 1, step: 1, usage: { inputTokens: 100_000, outputTokens: 500_000 } } },
+  ], priced)
+  assert.equal(result.inputCost, 0.1)
+  assert.equal(result.outputCost, 1)
+  assert.equal(result.cost, 1.1)
+  assert.equal(result.details.length, 1)
+  assert.equal(result.details[0].contextMultiplier, 1)
+  assert.equal(result.hourly.length, 1)
+  assert.equal(result.hourly[0].contextMultiplier, 1)
 })

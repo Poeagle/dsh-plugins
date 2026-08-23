@@ -5,8 +5,11 @@ import z from '@deepseek-ai/schemastery'
 import { TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import {
   DEFAULT_PRICING,
+  contextTokensOf,
   foldSession,
   normalizeUsage,
+  resolveContextMultiplier,
+  resolveContextSurcharge,
   resolvePricing,
   routeKey,
   validatePricing,
@@ -14,7 +17,7 @@ import {
   type PricingConfig,
 } from './pricing.js'
 
-export { DEFAULT_PRICING, foldSession, normalizeUsage, resolvePricing, routeKey, validatePricing }
+export { DEFAULT_PRICING, contextTokensOf, foldSession, normalizeUsage, resolveContextMultiplier, resolveContextSurcharge, resolvePricing, routeKey, validatePricing }
 export {
   filterHourlyEntries,
   filterSessionRows,
@@ -31,7 +34,7 @@ export {
   sumHourlySlices,
   toggleSessionTableSort,
 } from './session-table.js'
-export type { CostDetail, CostFold, CostSubagent, HourlyDetail, PartialTokenRates, PricingConfig, PricingPeriod, PricingPlan, TokenRates } from './pricing.js'
+export type { ContextSurcharge, CostDetail, CostFold, CostSubagent, HourlyDetail, PartialTokenRates, PricingConfig, PricingPeriod, PricingPlan, TokenRates } from './pricing.js'
 export type {
   HourlyOverviewFilter,
   HourlyOverviewGroup,
@@ -57,7 +60,15 @@ const periodSchema = z.object({
   end: z.string().required(),
   rates: ratesSchema,
 })
-const planSchema = z.object({ rates: ratesSchema, periods: z.array(periodSchema) })
+const contextSurchargeSchema = z.object({
+  afterTokens: z.number().step(1).min(0),
+  multiplier: z.number().min(0),
+})
+const planSchema = z.object({
+  rates: ratesSchema,
+  periods: z.array(periodSchema),
+  contextSurcharges: z.union([z.array(contextSurchargeSchema), z.const(undefined)]),
+})
 
 export const Config: z<PricingConfig> = z.object({
   currency: z.string().default(DEFAULT_PRICING.currency),
@@ -71,6 +82,7 @@ export const Config: z<PricingConfig> = z.object({
       output: z.number().min(0).default(DEFAULT_PRICING.default.rates.output),
     }),
     periods: z.array(periodSchema),
+    contextSurcharges: z.array(contextSurchargeSchema),
   }),
   models: z.dict(planSchema).default({}),
 })

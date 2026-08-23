@@ -89,6 +89,17 @@ window.__ModuleLoader__.load({
 			}
 			for (let left = 0; left < periods.length; left += 1) for (let right = left + 1; right < periods.length; right += 1) if (overlaps(periods[left], periods[right])) throw new TypeError(`${path} contains overlapping periods`);
 		}
+		function assertContextSurcharges(tiers, path) {
+			if (tiers === void 0) return;
+			const thresholds = /* @__PURE__ */ new Set();
+			for (const [index, tier] of tiers.entries()) {
+				const itemPath = `${path}[${index}]`;
+				if (!Number.isSafeInteger(tier.afterTokens) || tier.afterTokens < 0) throw new TypeError(`${itemPath}.afterTokens must be a non-negative safe integer`);
+				if (thresholds.has(tier.afterTokens)) throw new TypeError(`${path} contains duplicate afterTokens`);
+				thresholds.add(tier.afterTokens);
+				if (!Number.isFinite(tier.multiplier) || tier.multiplier < 0) throw new TypeError(`${itemPath}.multiplier must be a non-negative finite number`);
+			}
+		}
 		function validatePricing(config) {
 			if (config.currency.trim() === "" || config.currency.length > 8) throw new TypeError("currency must contain 1-8 characters");
 			if (!Number.isSafeInteger(config.unitTokens) || config.unitTokens < 1) throw new TypeError("unitTokens must be a positive safe integer");
@@ -99,10 +110,12 @@ window.__ModuleLoader__.load({
 			}
 			assertRates(config.default.rates, "default.rates", true);
 			assertPeriods(config.default.periods, "default.periods");
+			assertContextSurcharges(config.default.contextSurcharges, "default.contextSurcharges");
 			for (const [key, plan] of Object.entries(config.models)) {
 				if (key.trim() === "" || !key.includes("/")) throw new TypeError(`model key "${key}" must be provider/model`);
 				if (plan.rates !== void 0) assertRates(plan.rates, `models.${key}.rates`, false);
 				assertPeriods(plan.periods, `models.${key}.periods`);
+				assertContextSurcharges(plan.contextSurcharges, `models.${key}.contextSurcharges`);
 			}
 		}
 		//#endregion
@@ -200,7 +213,8 @@ window.__ModuleLoader__.load({
 				cacheRate: value.cacheRate ?? 0,
 				model: value.model ?? null,
 				provider: value.provider ?? null,
-				periodName: value.periodName ?? null
+				periodName: value.periodName ?? null,
+				contextMultiplier: value.contextMultiplier
 			};
 		}
 		/** Flatten each session's own hourly buckets; parent rows do not include child sessions. */
@@ -587,6 +601,65 @@ window.__ModuleLoader__.load({
 				onClick: add
 			}, "+ 添加计价时段"));
 		}
+		function ContextSurchargesEditor(props) {
+			const add = () => props.onChange([...props.tiers, {
+				afterTokens: 2e5,
+				multiplier: 2
+			}]);
+			const set = (index, next) => props.onChange(props.tiers.map((item, at) => at === index ? next : item));
+			return react.default.createElement("div", { style: {
+				display: "flex",
+				flexDirection: "column",
+				gap: 8
+			} }, react.default.createElement("p", { style: {
+				margin: 0,
+				fontSize: 12,
+				color: "var(--dsw-alias-label-tertiary)"
+			} }, props.hint ?? "单次请求上下文（未缓存输入 + 缓存读 + 缓存写）超过阈值后，该请求整单费用按倍率计。输出不计入阈值。"), ...props.tiers.map((tier, index) => react.default.createElement("div", {
+				key: `${tier.afterTokens}-${index}`,
+				style: {
+					display: "grid",
+					gridTemplateColumns: "minmax(140px, 1fr) minmax(100px, 160px) auto",
+					gap: 8,
+					alignItems: "end"
+				}
+			}, react.default.createElement("label", { style: {
+				display: "flex",
+				flexDirection: "column",
+				gap: 5,
+				fontSize: 11,
+				color: "var(--dsw-alias-label-tertiary)"
+			} }, "超过 Token 数", react.default.createElement(NumberInput, {
+				value: tier.afterTokens,
+				onChange: (value) => set(index, {
+					...tier,
+					afterTokens: value ?? 0
+				})
+			})), react.default.createElement("label", { style: {
+				display: "flex",
+				flexDirection: "column",
+				gap: 5,
+				fontSize: 11,
+				color: "var(--dsw-alias-label-tertiary)"
+			} }, "整单倍率", react.default.createElement(NumberInput, {
+				value: tier.multiplier,
+				onChange: (value) => set(index, {
+					...tier,
+					multiplier: value ?? 0
+				})
+			})), react.default.createElement("button", {
+				type: "button",
+				style: buttonStyle,
+				onClick: () => props.onChange(props.tiers.filter((_item, at) => at !== index))
+			}, "删除"))), react.default.createElement("button", {
+				type: "button",
+				style: {
+					...buttonStyle,
+					alignSelf: "flex-start"
+				},
+				onClick: add
+			}, "+ 添加上下文翻倍"));
+		}
 		function ModelPricingRow(props) {
 			const key = routeKey(props.provider.id, props.model.id);
 			const plan = props.config.models[key];
@@ -669,6 +742,13 @@ window.__ModuleLoader__.load({
 				onChange: (periods) => setPlan({
 					...plan,
 					periods
+				})
+			}), react.default.createElement(ContextSurchargesEditor, {
+				tiers: plan.contextSurcharges ?? [],
+				hint: "未配置时沿用默认上下文翻倍；清空列表表示该模型不翻倍。单次请求上下文（未缓存输入 + 缓存读 + 缓存写）超过阈值后，该请求整单费用按倍率计。",
+				onChange: (contextSurcharges) => setPlan({
+					...plan,
+					contextSurcharges
 				})
 			})) : null);
 		}
@@ -831,6 +911,19 @@ window.__ModuleLoader__.load({
 						periods
 					}
 				})
+			}), react.default.createElement("h4", { style: {
+				margin: "6px 0 0",
+				fontSize: 12,
+				fontWeight: 600
+			} }, "上下文翻倍"), react.default.createElement(ContextSurchargesEditor, {
+				tiers: draft.default.contextSurcharges ?? [],
+				onChange: (contextSurcharges) => setDraft({
+					...draft,
+					default: {
+						...draft.default,
+						contextSurcharges
+					}
+				})
 			})), react.default.createElement("section", null, react.default.createElement("h3", { style: {
 				margin: "0 0 4px",
 				fontSize: 13,
@@ -956,7 +1049,7 @@ window.__ModuleLoader__.load({
 				borderCollapse: "collapse",
 				whiteSpace: "nowrap",
 				marginTop: 8
-			} }, react.default.createElement("thead", null, react.default.createElement("tr", null, react.default.createElement("th", { style: props.headerLeft }, "时间段"), react.default.createElement("th", { style: props.headerStyle }, "轮次"), react.default.createElement("th", { style: props.headerStyle }, "步骤"), react.default.createElement("th", { style: props.headerStyle }, "工具调用"), react.default.createElement("th", { style: props.headerStyle }, "输入 tokens"), react.default.createElement("th", { style: props.headerStyle }, "输入价格"), react.default.createElement("th", { style: props.headerStyle }, "缓存 tokens"), react.default.createElement("th", { style: props.headerStyle }, "缓存价格"), react.default.createElement("th", { style: props.headerStyle }, "输出 tokens"), react.default.createElement("th", { style: props.headerStyle }, "输出价格"), react.default.createElement("th", { style: props.headerStyle }, "缓存率"), react.default.createElement("th", { style: props.headerStyle }, "总价"), react.default.createElement("th", { style: props.headerStyle }, "时段名称"), react.default.createElement("th", { style: props.headerStyle }, "模型"))), react.default.createElement("tbody", null, ...hours.flatMap((hour) => {
+			} }, react.default.createElement("thead", null, react.default.createElement("tr", null, react.default.createElement("th", { style: props.headerLeft }, "时间段"), react.default.createElement("th", { style: props.headerStyle }, "轮次"), react.default.createElement("th", { style: props.headerStyle }, "步骤"), react.default.createElement("th", { style: props.headerStyle }, "工具调用"), react.default.createElement("th", { style: props.headerStyle }, "输入 tokens"), react.default.createElement("th", { style: props.headerStyle }, "输入价格"), react.default.createElement("th", { style: props.headerStyle }, "缓存 tokens"), react.default.createElement("th", { style: props.headerStyle }, "缓存价格"), react.default.createElement("th", { style: props.headerStyle }, "输出 tokens"), react.default.createElement("th", { style: props.headerStyle }, "输出价格"), react.default.createElement("th", { style: props.headerStyle }, "缓存率"), react.default.createElement("th", { style: props.headerStyle }, "总价"), react.default.createElement("th", { style: props.headerStyle }, "倍率"), react.default.createElement("th", { style: props.headerStyle }, "时段名称"), react.default.createElement("th", { style: props.headerStyle }, "模型"))), react.default.createElement("tbody", null, ...hours.flatMap((hour) => {
 				const rootRows = props.hourly.filter((row) => row.hour === hour);
 				const hourChildren = childRows.filter((row) => row.entry.hour === hour);
 				const hourRows = [...rootRows, ...hourChildren.map((row) => row.entry)];
@@ -983,7 +1076,7 @@ window.__ModuleLoader__.load({
 						fontSize: 13,
 						color: "inherit"
 					}
-				}, timeExpanded ? "−" : "+"), total.hourLabel), ...dataCells(total), react.default.createElement("td", { style: props.cellBase }, "-"), react.default.createElement("td", { style: props.cellBase }, `${routes.length} 个模型`));
+				}, timeExpanded ? "−" : "+"), total.hourLabel), ...dataCells(total), react.default.createElement("td", { style: props.cellBase }, "-"), react.default.createElement("td", { style: props.cellBase }, "-"), react.default.createElement("td", { style: props.cellBase }, `${routes.length} 个模型`));
 				if (!timeExpanded) return [timeRow];
 				return [timeRow, ...routes.flatMap((route) => {
 					const entries = hourRows.filter((row) => routeOf(row) === route);
@@ -1016,7 +1109,7 @@ window.__ModuleLoader__.load({
 					}, modelExpanded ? "−" : "+") : react.default.createElement("span", { style: {
 						display: "inline-block",
 						width: 19
-					} }), `↳ ${route}`), ...dataCells(modelTotal), react.default.createElement("td", { style: props.cellBase }, "-"), react.default.createElement("td", { style: props.cellBase }, route));
+					} }), `↳ ${route}`), ...dataCells(modelTotal), react.default.createElement("td", { style: props.cellBase }, "-"), react.default.createElement("td", { style: props.cellBase }, "-"), react.default.createElement("td", { style: props.cellBase }, route));
 					if (!modelExpanded) return [modelRow];
 					return [modelRow, ...children.map(({ sessionId, entry }) => react.default.createElement("tr", {
 						key: `${props.sessionId}:child:${hour}:${route}:${sessionId}`,
@@ -1027,7 +1120,7 @@ window.__ModuleLoader__.load({
 					}, react.default.createElement("td", { style: {
 						...props.cellLeft,
 						paddingLeft: 52
-					} }, `↳ 子代理 ${sessionId.slice(0, 8)}`), ...dataCells(entry), react.default.createElement("td", { style: props.cellBase }, entry.periodName ?? "-"), react.default.createElement("td", { style: props.cellBase }, `${entry.provider ?? "?"}/${entry.model ?? "?"}`)))];
+					} }, `↳ 子代理 ${sessionId.slice(0, 8)}`), ...dataCells(entry), react.default.createElement("td", { style: props.cellBase }, entry.contextMultiplier && entry.contextMultiplier !== 1 ? `×${entry.contextMultiplier}` : "-"), react.default.createElement("td", { style: props.cellBase }, entry.periodName ?? "-"), react.default.createElement("td", { style: props.cellBase }, `${entry.provider ?? "?"}/${entry.model ?? "?"}`)))];
 				})];
 			}), totals ? react.default.createElement("tr", { style: {
 				fontWeight: 600,
@@ -1035,12 +1128,12 @@ window.__ModuleLoader__.load({
 			} }, react.default.createElement("td", { style: {
 				...props.cellLeft,
 				fontWeight: 600
-			} }, "合计"), ...dataCells(totals), react.default.createElement("td", { style: props.cellBase }), react.default.createElement("td", { style: props.cellBase })) : react.default.createElement("tr", null, react.default.createElement("td", {
+			} }, "合计"), ...dataCells(totals), react.default.createElement("td", { style: props.cellBase }), react.default.createElement("td", { style: props.cellBase }), react.default.createElement("td", { style: props.cellBase })) : react.default.createElement("tr", null, react.default.createElement("td", {
 				style: {
 					...props.cellLeft,
 					color: "var(--dsw-alias-label-tertiary)"
 				},
-				colSpan: 14
+				colSpan: 15
 			}, "该会话暂无按时段明细"))));
 		}
 		function CostDock(props) {
@@ -1244,7 +1337,7 @@ window.__ModuleLoader__.load({
 							fontSize: 12,
 							marginTop: di > 0 ? 2 : 0
 						}
-					}, `${ds.provider ?? "?"}/${ds.model ?? "?"} · ${sourceLabel}${ds.periodName ? ` · ${ds.periodName}` : ""}`),
+					}, `${ds.provider ?? "?"}/${ds.model ?? "?"} · ${sourceLabel}${ds.periodName ? ` · ${ds.periodName}` : ""}${ds.contextMultiplier && ds.contextMultiplier !== 1 ? ` · ×${ds.contextMultiplier}` : ""}`),
 					react.default.createElement("div", {
 						key: `rates-${di}`,
 						style: {
@@ -1480,7 +1573,7 @@ window.__ModuleLoader__.load({
 				width: "100%",
 				borderCollapse: "collapse",
 				whiteSpace: "nowrap"
-			} }, react.default.createElement("thead", null, react.default.createElement("tr", null, react.default.createElement("th", { style: headerLeft }, "时间段"), react.default.createElement("th", { style: headerStyle }, "轮次"), react.default.createElement("th", { style: headerStyle }, "步骤"), react.default.createElement("th", { style: headerStyle }, "工具调用"), react.default.createElement("th", { style: headerStyle }, "输入 tokens"), react.default.createElement("th", { style: headerStyle }, "输入价格"), react.default.createElement("th", { style: headerStyle }, "缓存 tokens"), react.default.createElement("th", { style: headerStyle }, "缓存价格"), react.default.createElement("th", { style: headerStyle }, "输出 tokens"), react.default.createElement("th", { style: headerStyle }, "输出价格"), react.default.createElement("th", { style: headerStyle }, "缓存率"), react.default.createElement("th", { style: headerStyle }, "总价"), react.default.createElement("th", { style: headerStyle }, "时段名称"), react.default.createElement("th", { style: headerStyle }, "模型"))), react.default.createElement("tbody", null, ...hourGroups.flatMap((group) => {
+			} }, react.default.createElement("thead", null, react.default.createElement("tr", null, react.default.createElement("th", { style: headerLeft }, "时间段"), react.default.createElement("th", { style: headerStyle }, "轮次"), react.default.createElement("th", { style: headerStyle }, "步骤"), react.default.createElement("th", { style: headerStyle }, "工具调用"), react.default.createElement("th", { style: headerStyle }, "输入 tokens"), react.default.createElement("th", { style: headerStyle }, "输入价格"), react.default.createElement("th", { style: headerStyle }, "缓存 tokens"), react.default.createElement("th", { style: headerStyle }, "缓存价格"), react.default.createElement("th", { style: headerStyle }, "输出 tokens"), react.default.createElement("th", { style: headerStyle }, "输出价格"), react.default.createElement("th", { style: headerStyle }, "缓存率"), react.default.createElement("th", { style: headerStyle }, "总价"), react.default.createElement("th", { style: headerStyle }, "倍率"), react.default.createElement("th", { style: headerStyle }, "时段名称"), react.default.createElement("th", { style: headerStyle }, "模型"))), react.default.createElement("tbody", null, ...hourGroups.flatMap((group) => {
 				const timeKey = `all:time:${group.hour}`;
 				const expanded = expandedHours.has(timeKey);
 				const routes = [...new Set(group.sessions.map((item) => `${item.entry.provider ?? ""}/${item.entry.model ?? ""}`).filter((value) => value !== "/"))];
@@ -1502,7 +1595,7 @@ window.__ModuleLoader__.load({
 						fontSize: 13,
 						color: "inherit"
 					}
-				}, expanded ? "−" : "+"), `${localDateOfHour(group.hour)} ${group.hourLabel}`), ...hourlyDataCells(group.totals), react.default.createElement("td", { style: cellBase }, `${group.sessions.length} 个会话`), react.default.createElement("td", { style: cellBase }, routes.length === 0 ? "-" : `${routes.length} 个模型`));
+				}, expanded ? "−" : "+"), `${localDateOfHour(group.hour)} ${group.hourLabel}`), ...hourlyDataCells(group.totals), react.default.createElement("td", { style: cellBase }, "-"), react.default.createElement("td", { style: cellBase }, `${group.sessions.length} 个会话`), react.default.createElement("td", { style: cellBase }, routes.length === 0 ? "-" : `${routes.length} 个模型`));
 				if (!expanded) return [timeRow];
 				return [timeRow, ...group.sessions.map((item) => react.default.createElement("tr", {
 					key: `${timeKey}:${item.sessionId}:${item.entry.provider ?? ""}/${item.entry.model ?? ""}`,
@@ -1516,14 +1609,14 @@ window.__ModuleLoader__.load({
 						paddingLeft: 28
 					},
 					title: item.sessionId
-				}, `↳ ${compactId(item.sessionId)}${item.origin ? ` · ${item.origin}` : ""}`), ...hourlyDataCells(item.entry), react.default.createElement("td", { style: cellBase }, item.entry.periodName ?? "-"), react.default.createElement("td", { style: cellBase }, item.entry.provider && item.entry.model ? `${item.entry.provider}/${item.entry.model}` : "-")))];
+				}, `↳ ${compactId(item.sessionId)}${item.origin ? ` · ${item.origin}` : ""}`), ...hourlyDataCells(item.entry), react.default.createElement("td", { style: cellBase }, item.entry.contextMultiplier && item.entry.contextMultiplier !== 1 ? `×${item.entry.contextMultiplier}` : "-"), react.default.createElement("td", { style: cellBase }, item.entry.periodName ?? "-"), react.default.createElement("td", { style: cellBase }, item.entry.provider && item.entry.model ? `${item.entry.provider}/${item.entry.model}` : "-")))];
 			}), hourGroups.length > 0 ? react.default.createElement("tr", { style: {
 				fontWeight: 600,
 				borderTop: "2px solid var(--dsw-alias-border-l1, #bbb)"
 			} }, react.default.createElement("td", { style: {
 				...cellLeft,
 				fontWeight: 600
-			} }, "合计"), ...hourlyDataCells(overviewTotals), react.default.createElement("td", { style: cellBase }, `${hourGroups.reduce((total, group) => total + group.sessions.length, 0)} 条明细`), react.default.createElement("td", { style: cellBase }, `${(overviewTotals.inputTokens + overviewTotals.cacheReadTokens + overviewTotals.cacheWriteTokens + overviewTotals.outputTokens).toLocaleString("zh-CN")} tokens`)) : null)))) : react.default.createElement("section", { style: {
+			} }, "合计"), ...hourlyDataCells(overviewTotals), react.default.createElement("td", { style: cellBase }), react.default.createElement("td", { style: cellBase }, `${hourGroups.reduce((total, group) => total + group.sessions.length, 0)} 条明细`), react.default.createElement("td", { style: cellBase }, `${(overviewTotals.inputTokens + overviewTotals.cacheReadTokens + overviewTotals.cacheWriteTokens + overviewTotals.outputTokens).toLocaleString("zh-CN")} tokens`)) : null)))) : react.default.createElement("section", { style: {
 				display: "flex",
 				flexDirection: "column",
 				gap: 10

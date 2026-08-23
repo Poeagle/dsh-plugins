@@ -26,6 +26,7 @@ cost-meter:
       cacheWrite: 1
       output: 2
     periods: []
+    contextSurcharges: []
   models:
     deepseek-official/deepseek-v4-flash:
       rates:
@@ -39,13 +40,18 @@ cost-meter:
           rates:
             input: 0.4
             output: 0.9
+      contextSurcharges:
+        - afterTokens: 200000
+          multiplier: 2
 ```
 
 The UI lists every model in the live `llm.models` catalog. A model without an override uses default pricing. Each rate resolves independently in this order: matching model period, model base rate, matching default period, default base rate. Periods use the configured IANA time zone, may cross midnight, and must not overlap within one plan.
 
+`contextSurcharges` apply after the base rates. A request whose prompt-side context (`input + cacheRead + cacheWrite`) is greater than `afterTokens` multiplies that request's entire cost, including output, by `multiplier`. Among matching tiers the highest threshold wins. A model list, including an empty list, replaces the default list instead of merging with it. Output tokens do not count toward the threshold.
+
 ## Accounting
 
-The Host folds the session log in sequence order. Each `request/header` selects the actual provider/model for later usage in that request epoch. `assistant/chunk` and `assistant/message` usage reports use last-writer-wins for the same turn/step, matching the Harness token projection and preventing duplicate accounting. A parent session's total includes every descendant session whose durable header identifies it as a subagent; each child log is folded once, so nested delegation is included without replaying a child through multiple parents. The composer modal first shows the current session. An explicit control then loads every durable session through `sessionCosts()` when the host exports it; if that endpoint is unavailable, the overview falls back to `session.list` plus concurrent per-session `sessionCost()` calls. The all-session view groups those independent hourly buckets by local date and hour, so expanding a period lists every matching session without inheriting a parent session's merged subagent totals.
+The Host folds the session log in sequence order. Each `request/header` selects the actual provider/model for later usage in that request epoch. `assistant/chunk` and `assistant/message` usage reports use last-writer-wins for the same turn/step, matching the Harness token projection and preventing duplicate accounting. After the resolved rates, a matching `contextSurcharge` multiplies that request's entire cost. A parent session's total includes every descendant session whose durable header identifies it as a subagent; each child log is folded once, so nested delegation is included without replaying a child through multiple parents. The composer modal first shows the current session. An explicit control then loads every durable session through `sessionCosts()` when the host exports it; if that endpoint is unavailable, the overview falls back to `session.list` plus concurrent per-session `sessionCost()` calls. The all-session view groups those independent hourly buckets by local date and hour, so expanding a period lists every matching session without inheriting a parent session's merged subagent totals.
 
 Token usage fields are disjoint:
 

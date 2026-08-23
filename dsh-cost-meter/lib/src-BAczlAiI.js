@@ -867,6 +867,45 @@ function resolvePricing(config, provider, model, time) {
 		source: "default"
 	};
 }
+/**
+* Prompt-side tokens that count as this request's context size.
+* @param tokens Disjoint prompt buckets from one usage report.
+* @returns `input + cacheRead + cacheWrite`. Output is excluded.
+*/
+function contextTokensOf(tokens) {
+	return tokens.input + tokens.cacheRead + tokens.cacheWrite;
+}
+/**
+* Resolve the request-wide cost multiplier for one context size.
+* A model list, including `[]`, replaces the default list. Among matching
+* tiers (`contextTokens > afterTokens`), the highest threshold wins.
+* @param config Live pricing, including optional default and model surcharge lists.
+* @param provider Request provider id, or null when unknown.
+* @param model Request model id, or null when unknown.
+* @param contextTokens Prompt-side token count from `contextTokensOf()`.
+* @returns The matching tier, or null when no surcharge applies.
+*/
+function resolveContextSurcharge(config, provider, model, contextTokens) {
+	const key = routeKey(provider, model);
+	const tiers = (key === null ? void 0 : config.models[key])?.contextSurcharges ?? config.default.contextSurcharges;
+	if (tiers === void 0) return null;
+	let matched;
+	for (const tier of tiers) {
+		if (contextTokens <= tier.afterTokens) continue;
+		if (matched === void 0 || tier.afterTokens > matched.afterTokens) matched = tier;
+	}
+	return matched ?? null;
+}
+/**
+* @param config Live pricing, including optional default and model surcharge lists.
+* @param provider Request provider id, or null when unknown.
+* @param model Request model id, or null when unknown.
+* @param contextTokens Prompt-side token count from `contextTokensOf()`.
+* @returns The matching multiplier, or 1 when no surcharge applies.
+*/
+function resolveContextMultiplier(config, provider, model, contextTokens) {
+	return resolveContextSurcharge(config, provider, model, contextTokens)?.multiplier ?? 1;
+}
 function assertRates(rates, path, complete) {
 	for (const key of RATE_KEYS) {
 		const value = rates[key];
@@ -898,6 +937,17 @@ function assertPeriods(periods, path) {
 	}
 	for (let left = 0; left < periods.length; left += 1) for (let right = left + 1; right < periods.length; right += 1) if (overlaps(periods[left], periods[right])) throw new TypeError(`${path} contains overlapping periods`);
 }
+function assertContextSurcharges(tiers, path) {
+	if (tiers === void 0) return;
+	const thresholds = /* @__PURE__ */ new Set();
+	for (const [index, tier] of tiers.entries()) {
+		const itemPath = `${path}[${index}]`;
+		if (!Number.isSafeInteger(tier.afterTokens) || tier.afterTokens < 0) throw new TypeError(`${itemPath}.afterTokens must be a non-negative safe integer`);
+		if (thresholds.has(tier.afterTokens)) throw new TypeError(`${path} contains duplicate afterTokens`);
+		thresholds.add(tier.afterTokens);
+		if (!Number.isFinite(tier.multiplier) || tier.multiplier < 0) throw new TypeError(`${itemPath}.multiplier must be a non-negative finite number`);
+	}
+}
 function validatePricing(config) {
 	if (config.currency.trim() === "" || config.currency.length > 8) throw new TypeError("currency must contain 1-8 characters");
 	if (!Number.isSafeInteger(config.unitTokens) || config.unitTokens < 1) throw new TypeError("unitTokens must be a positive safe integer");
@@ -908,10 +958,12 @@ function validatePricing(config) {
 	}
 	assertRates(config.default.rates, "default.rates", true);
 	assertPeriods(config.default.periods, "default.periods");
+	assertContextSurcharges(config.default.contextSurcharges, "default.contextSurcharges");
 	for (const [key, plan] of Object.entries(config.models)) {
 		if (key.trim() === "" || !key.includes("/")) throw new TypeError(`model key "${key}" must be provider/model`);
 		if (plan.rates !== void 0) assertRates(plan.rates, `models.${key}.rates`, false);
 		assertPeriods(plan.periods, `models.${key}.periods`);
+		assertContextSurcharges(plan.contextSurcharges, `models.${key}.contextSurcharges`);
 	}
 }
 function num(value) {
@@ -982,9 +1034,9 @@ function foldSession(events, config = DEFAULT_PRICING) {
 	let lastPricing = null;
 	let lastHourKey = null;
 	const detailMap = /* @__PURE__ */ new Map();
-	const detailKey = (p, m, s, pn) => `${p ?? ""}|${m ?? ""}|${s}|${pn ?? ""}`;
-	const ensureDetail = (pricing) => {
-		const key = detailKey(provider, model, pricing.source, pricing.periodName ?? null);
+	const detailKey = (p, m, s, pn, multiplier) => `${p ?? ""}|${m ?? ""}|${s}|${pn ?? ""}|${multiplier}`;
+	const ensureDetail = (pricing, multiplier) => {
+		const key = detailKey(provider, model, pricing.source, pricing.periodName ?? null, multiplier);
 		let detail = detailMap.get(key);
 		if (detail === void 0) {
 			detail = {
@@ -993,6 +1045,7 @@ function foldSession(events, config = DEFAULT_PRICING) {
 				provider,
 				model,
 				rates: { ...pricing.rates },
+				contextMultiplier: multiplier,
 				inputTokens: 0,
 				cacheReadTokens: 0,
 				cacheWriteTokens: 0,
@@ -1008,9 +1061,9 @@ function foldSession(events, config = DEFAULT_PRICING) {
 		return detail;
 	};
 	const hourMap = /* @__PURE__ */ new Map();
-	const hourBucketKey = (hKey, pricing) => `${hKey}|${provider ?? ""}|${model ?? ""}|${pricing.source}|${pricing.periodName ?? ""}`;
-	const ensureHour = (hKey, pricing) => {
-		const key = hourBucketKey(hKey, pricing);
+	const hourBucketKey = (hKey, pricing, multiplier) => `${hKey}|${provider ?? ""}|${model ?? ""}|${pricing.source}|${pricing.periodName ?? ""}|${multiplier}`;
+	const ensureHour = (hKey, pricing, multiplier) => {
+		const key = hourBucketKey(hKey, pricing, multiplier);
 		let bucket = hourMap.get(key);
 		if (bucket === void 0) {
 			bucket = {
@@ -1023,6 +1076,7 @@ function foldSession(events, config = DEFAULT_PRICING) {
 				provider,
 				pricingSource: pricing.source,
 				periodName: pricing.periodName ?? null,
+				contextMultiplier: multiplier,
 				inputTokens: 0,
 				cacheReadTokens: 0,
 				cacheWriteTokens: 0,
@@ -1046,7 +1100,7 @@ function foldSession(events, config = DEFAULT_PRICING) {
 		}
 		if (event.type === "tool/call") {
 			const pricing = resolvePricing(config, provider, model, event.time);
-			ensureHour(hourKey(event.time), pricing).toolCalls += 1;
+			ensureHour(hourKey(event.time), pricing, 1).toolCalls += 1;
 			continue;
 		}
 		let usage;
@@ -1062,11 +1116,12 @@ function foldSession(events, config = DEFAULT_PRICING) {
 			cacheWrite: normalized.cacheWriteTokens,
 			output: normalized.outputTokens
 		};
+		const contextMultiplier = resolveContextMultiplier(config, provider, model, contextTokensOf(tokens));
 		const costs = {
-			input: tokens.input * pricing.rates.input / config.unitTokens,
-			cacheRead: tokens.cacheRead * pricing.rates.cacheRead / config.unitTokens,
-			cacheWrite: tokens.cacheWrite * pricing.rates.cacheWrite / config.unitTokens,
-			output: tokens.output * pricing.rates.output / config.unitTokens
+			input: tokens.input * pricing.rates.input / config.unitTokens * contextMultiplier,
+			cacheRead: tokens.cacheRead * pricing.rates.cacheRead / config.unitTokens * contextMultiplier,
+			cacheWrite: tokens.cacheWrite * pricing.rates.cacheWrite / config.unitTokens * contextMultiplier,
+			output: tokens.output * pricing.rates.output / config.unitTokens * contextMultiplier
 		};
 		const hKey = hourKey(event.time);
 		if (last !== null && last.turn === event.data.turn && last.step === event.data.step) {
@@ -1079,7 +1134,7 @@ function foldSession(events, config = DEFAULT_PRICING) {
 			out.cacheWriteTokens -= last.tokens.cacheWrite;
 			out.outputTokens -= last.tokens.output;
 			if (lastPricing !== null) {
-				const prevDetail = ensureDetail(lastPricing);
+				const prevDetail = ensureDetail(lastPricing, last.contextMultiplier);
 				prevDetail.inputTokens -= last.tokens.input;
 				prevDetail.cacheReadTokens -= last.tokens.cacheRead;
 				prevDetail.cacheWriteTokens -= last.tokens.cacheWrite;
@@ -1091,7 +1146,7 @@ function foldSession(events, config = DEFAULT_PRICING) {
 				prevDetail.cost = prevDetail.inputCost + prevDetail.cacheReadCost + prevDetail.cacheWriteCost + prevDetail.outputCost;
 			}
 			if (lastHourKey !== null) {
-				const prevBucket = ensureHour(lastHourKey, lastPricing ?? pricing);
+				const prevBucket = ensureHour(lastHourKey, lastPricing ?? pricing, last.contextMultiplier);
 				prevBucket.inputTokens -= last.tokens.input;
 				prevBucket.cacheReadTokens -= last.tokens.cacheRead;
 				prevBucket.cacheWriteTokens -= last.tokens.cacheWrite;
@@ -1121,11 +1176,12 @@ function foldSession(events, config = DEFAULT_PRICING) {
 			step: event.data.step,
 			costs,
 			tokens,
-			hourBucketKey: hourBucketKey(hKey, pricing)
+			hourBucketKey: hourBucketKey(hKey, pricing, contextMultiplier),
+			contextMultiplier
 		};
 		lastPricing = pricing;
 		lastHourKey = hKey;
-		const bucket = ensureHour(hKey, pricing);
+		const bucket = ensureHour(hKey, pricing, contextMultiplier);
 		if (event.data.turn !== void 0) bucket.turns.add(event.data.turn);
 		if (event.data.turn !== void 0 && event.data.step !== void 0) bucket.steps.add(`${event.data.turn}/${event.data.step}`);
 		bucket.inputTokens += tokens.input;
@@ -1137,7 +1193,7 @@ function foldSession(events, config = DEFAULT_PRICING) {
 		bucket.cacheWriteCost += costs.cacheWrite;
 		bucket.outputCost += costs.output;
 		bucket.cost = bucket.inputCost + bucket.cacheReadCost + bucket.cacheWriteCost + bucket.outputCost;
-		const detail = ensureDetail(pricing);
+		const detail = ensureDetail(pricing, contextMultiplier);
 		detail.inputTokens += tokens.input;
 		detail.cacheReadTokens += tokens.cacheRead;
 		detail.cacheWriteTokens += tokens.cacheWrite;
@@ -1149,10 +1205,11 @@ function foldSession(events, config = DEFAULT_PRICING) {
 		detail.cost = detail.inputCost + detail.cacheReadCost + detail.cacheWriteCost + detail.outputCost;
 	}
 	out.cost = out.inputCost + out.cacheReadCost + out.cacheWriteCost + out.outputCost;
-	out.details = [...detailMap.values()];
-	out.hourly = [...hourMap.values()].map((bucket) => {
+	out.details = [...detailMap.values()].filter((detail) => detail.inputTokens !== 0 || detail.cacheReadTokens !== 0 || detail.cacheWriteTokens !== 0 || detail.outputTokens !== 0 || detail.cost !== 0);
+	out.hourly = [...hourMap.values()].flatMap((bucket) => {
 		const totalTokens = bucket.inputTokens + bucket.cacheReadTokens + bucket.cacheWriteTokens + bucket.outputTokens;
-		return {
+		if (totalTokens === 0 && bucket.cost === 0 && bucket.toolCalls === 0) return [];
+		return [{
 			hour: bucket.hour,
 			hourLabel: bucket.hourLabel,
 			turns: bucket.turns.size,
@@ -1171,9 +1228,10 @@ function foldSession(events, config = DEFAULT_PRICING) {
 			model: bucket.model,
 			provider: bucket.provider,
 			pricingSource: bucket.pricingSource,
-			periodName: bucket.periodName
-		};
-	}).sort((a, b) => a.hour.localeCompare(b.hour) || (a.provider ?? "").localeCompare(b.provider ?? "") || (a.model ?? "").localeCompare(b.model ?? ""));
+			periodName: bucket.periodName,
+			contextMultiplier: bucket.contextMultiplier
+		}];
+	}).sort((a, b) => a.hour.localeCompare(b.hour) || (a.provider ?? "").localeCompare(b.provider ?? "") || (a.model ?? "").localeCompare(b.model ?? "") || a.contextMultiplier - b.contextMultiplier);
 	return out;
 }
 //#endregion
@@ -1321,7 +1379,8 @@ function asHourlySlice(value) {
 		cacheRate: value.cacheRate ?? 0,
 		model: value.model ?? null,
 		provider: value.provider ?? null,
-		periodName: value.periodName ?? null
+		periodName: value.periodName ?? null,
+		contextMultiplier: value.contextMultiplier
 	};
 }
 /** Flatten each session's own hourly buckets; parent rows do not include child sessions. */
@@ -1410,9 +1469,14 @@ const periodSchema = Schema.object({
 	end: Schema.string().required(),
 	rates: ratesSchema
 });
+const contextSurchargeSchema = Schema.object({
+	afterTokens: Schema.number().step(1).min(0),
+	multiplier: Schema.number().min(0)
+});
 const planSchema = Schema.object({
 	rates: ratesSchema,
-	periods: Schema.array(periodSchema)
+	periods: Schema.array(periodSchema),
+	contextSurcharges: Schema.union([Schema.array(contextSurchargeSchema), Schema.const(void 0)])
 });
 const Config = Schema.object({
 	currency: Schema.string().default(DEFAULT_PRICING.currency),
@@ -1425,7 +1489,8 @@ const Config = Schema.object({
 			cacheWrite: Schema.number().min(0).default(DEFAULT_PRICING.default.rates.cacheWrite),
 			output: Schema.number().min(0).default(DEFAULT_PRICING.default.rates.output)
 		}),
-		periods: Schema.array(periodSchema)
+		periods: Schema.array(periodSchema),
+		contextSurcharges: Schema.array(contextSurchargeSchema)
 	}),
 	models: Schema.dict(planSchema).default({})
 });
@@ -1543,4 +1608,4 @@ var CostMeterService = class extends TypertRemoteService {
 	}
 };
 //#endregion
-export { validatePricing as C, routeKey as S, toggleSessionTableSort as _, filterSessionRows as a, normalizeUsage as b, localDateOfHour as c, queryHourlyOverview as d, querySessionRows as f, sumHourlySlices as g, sortSessionRows as h, filterHourlyEntries as i, mapWithConcurrency as l, sessionTotalTokens as m, CostMeterService as n, flattenHourlyEntries as o, sessionRoutes as p, collectSessionCosts as r, groupHourlyEntries as s, Config as t, mergeListedSessionCost as u, DEFAULT_PRICING as v, resolvePricing as x, foldSession as y };
+export { resolveContextSurcharge as C, validatePricing as E, resolveContextMultiplier as S, routeKey as T, toggleSessionTableSort as _, filterSessionRows as a, foldSession as b, localDateOfHour as c, queryHourlyOverview as d, querySessionRows as f, sumHourlySlices as g, sortSessionRows as h, filterHourlyEntries as i, mapWithConcurrency as l, sessionTotalTokens as m, CostMeterService as n, flattenHourlyEntries as o, sessionRoutes as p, collectSessionCosts as r, groupHourlyEntries as s, Config as t, mergeListedSessionCost as u, DEFAULT_PRICING as v, resolvePricing as w, normalizeUsage as x, contextTokensOf as y };
