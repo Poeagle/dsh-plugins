@@ -3,12 +3,17 @@ import test from 'node:test'
 import {
   DEFAULT_PRICING,
   collectSessionCosts,
+  filterHourlyEntries,
   filterSessionRows,
+  flattenHourlyEntries,
+  foldSession,
+  localDateOfHour,
   mapWithConcurrency,
   mergeListedSessionCost,
   queryHourlyOverview,
   querySessionRows,
   sortSessionRows,
+  sumHourlySlices,
 } from '../lib/index.js'
 
 const peak = Date.parse('2026-01-01T02:00:00Z')
@@ -275,4 +280,191 @@ test('filters session rows by text, origin, and route', () => {
   assert.deepEqual(filterSessionRows(tableRows, { sessionId: '', origin: '', parentSession: 'root', route: '' }).map(row => row.sessionId), ['sess-b', 'sess-c'])
   assert.deepEqual(filterSessionRows(tableRows, { sessionId: '', origin: '', parentSession: '', route: 'wz/gpt-5.6-terra' }).map(row => row.sessionId), ['sess-b', 'sess-c'])
   assert.deepEqual(querySessionRows(tableRows, { sessionId: '', origin: 'user', parentSession: '', route: '', minCost: 2 }, { key: 'cost', dir: 'asc' }).map(row => row.sessionId), ['sess-a'])
+})
+
+function mergeCostInto(target, cost) {
+  target.cost += cost.cost
+  target.inputCost += cost.inputCost
+  target.cacheReadCost += cost.cacheReadCost
+  target.cacheWriteCost += cost.cacheWriteCost
+  target.outputCost += cost.outputCost
+  target.inputTokens += cost.inputTokens
+  target.cacheReadTokens += cost.cacheReadTokens
+  target.cacheWriteTokens += cost.cacheWriteTokens
+  target.outputTokens += cost.outputTokens
+}
+
+function sessionCostLike(primary, children) {
+  const out = structuredClone(primary)
+  out.subagents = structuredClone(children)
+  for (const child of children) mergeCostInto(out, child)
+  return out
+}
+
+function totalsOf(slices) {
+  return slices.reduce((acc, row) => {
+    acc.cost += row.cost
+    acc.inputTokens += row.inputTokens
+    acc.cacheReadTokens += row.cacheReadTokens
+    acc.cacheWriteTokens += row.cacheWriteTokens
+    acc.outputTokens += row.outputTokens
+    return acc
+  }, { cost: 0, inputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0 })
+}
+
+test('hourly overview uses each session own fold and does not inherit merged parent totals', async () => {
+  const sameHour = Date.parse('2026-08-23T01:00:00Z')
+  const laterHour = Date.parse('2026-08-23T03:00:00Z')
+  const parentFold = foldSession(usageEvents('wz', 'gpt-5.6-terra', sameHour, {
+    inputTokens: 1_000_000, cacheReadTokens: 2_000_000, outputTokens: 100_000,
+  }), DEFAULT_PRICING)
+  const childFold = foldSession(usageEvents('ds', 'deepseek-v4-flash', sameHour, {
+    inputTokens: 500_000, outputTokens: 50_000,
+  }), DEFAULT_PRICING)
+  const otherFold = foldSession(usageEvents('grok', 'grok-4.6', laterHour, {
+    inputTokens: 250_000, outputTokens: 25_000,
+  }), DEFAULT_PRICING)
+  const mergedParent = sessionCostLike(parentFold, [{ ...childFold, sessionId: 'child', children: [] }])
+
+  assert.equal(mergedParent.cost, parentFold.cost + childFold.cost)
+  assert.equal(mergedParent.inputTokens, parentFold.inputTokens + childFold.inputTokens)
+  assert.deepEqual(mergedParent.hourly.map(row => row.model), parentFold.hourly.map(row => row.model))
+  assert.equal(totalsOf(mergedParent.hourly).cost, parentFold.cost)
+  assert.notEqual(mergedParent.cost, totalsOf(mergedParent.hourly).cost)
+
+  const listed = [
+    mergeListedSessionCost({ sessionId: 'parent', origin: 'user' }, mergedParent),
+    mergeListedSessionCost({ sessionId: 'child', parentSessionId: 'parent', origin: 'subagent' }, childFold),
+    mergeListedSessionCost({ sessionId: 'other' }, otherFold),
+  ]
+  const groups = queryHourlyOverview(listed, { date: '', hour: '', sessionId: '', origin: '', route: '' })
+  const allHourly = groups.flatMap(group => group.sessions.map(item => item.entry))
+  const overview = totalsOf(allHourly)
+  const own = totalsOf([...parentFold.hourly, ...childFold.hourly, ...otherFold.hourly])
+
+  assert.equal(overview.cost, own.cost)
+  assert.equal(overview.inputTokens, own.inputTokens)
+  assert.equal(overview.cacheReadTokens, own.cacheReadTokens)
+  assert.equal(overview.outputTokens, own.outputTokens)
+  assert.notEqual(overview.cost, mergedParent.cost + childFold.cost + otherFold.cost)
+  assert.equal(overview.cost, parentFold.cost + childFold.cost + otherFold.cost)
+
+  const firstHour = groups.find(group => group.sessions.some(item => item.sessionId === 'parent'))
+  assert.equal(firstHour.sessions.map(item => item.sessionId).sort().join(','), 'child,parent')
+  assert.equal(firstHour.totals.cost, parentFold.cost + childFold.cost)
+  assert.equal(firstHour.totals.inputTokens, parentFold.inputTokens + childFold.inputTokens)
+  assert.equal(firstHour.totals.outputTokens, parentFold.outputTokens + childFold.outputTokens)
+  const cacheTokens = firstHour.totals.cacheReadTokens + firstHour.totals.cacheWriteTokens
+  const totalTokens = firstHour.totals.inputTokens + cacheTokens + firstHour.totals.outputTokens
+  assert.equal(firstHour.totals.cacheRate, cacheTokens / totalTokens)
+})
+
+test('hourly overview totals equal the sum of visible group totals after filters', () => {
+  const morning = localHour(2026, 8, 23, 9)
+  const noon = localHour(2026, 8, 23, 12)
+  const yesterday = localHour(2026, 8, 22, 21)
+  const slice = (bucket, session, extra) => ({
+    sessionId: session,
+    origin: extra.origin ?? null,
+    parentSession: extra.parentSession ?? null,
+    entry: {
+      hour: bucket.hour,
+      hourLabel: bucket.hourLabel,
+      turns: extra.turns ?? 1,
+      steps: extra.steps ?? 1,
+      toolCalls: extra.toolCalls ?? 0,
+      inputTokens: extra.inputTokens,
+      cacheReadTokens: extra.cacheReadTokens ?? 0,
+      cacheWriteTokens: extra.cacheWriteTokens ?? 0,
+      outputTokens: extra.outputTokens,
+      inputCost: extra.inputCost,
+      cacheReadCost: extra.cacheReadCost ?? 0,
+      cacheWriteCost: extra.cacheWriteCost ?? 0,
+      outputCost: extra.outputCost,
+      cost: extra.inputCost + (extra.cacheReadCost ?? 0) + (extra.cacheWriteCost ?? 0) + extra.outputCost,
+      cacheRate: 0,
+      provider: extra.provider,
+      model: extra.model,
+      periodName: extra.periodName ?? null,
+    },
+  })
+  const entries = [
+    slice(morning, 'sess-a', { origin: 'user', inputTokens: 10, outputTokens: 2, inputCost: 1, outputCost: 2, provider: 'wz', model: 'gpt-5.6-terra' }),
+    slice(morning, 'sess-b', { origin: 'subagent', parentSession: 'sess-a', inputTokens: 5, outputTokens: 1, inputCost: 0.5, outputCost: 0.5, provider: 'ds', model: 'deepseek-v4-flash' }),
+    slice(noon, 'sess-a', { origin: 'user', inputTokens: 8, cacheReadTokens: 4, outputTokens: 3, inputCost: 0.8, cacheReadCost: 0.04, outputCost: 1.2, provider: 'wz', model: 'gpt-5.6-terra' }),
+    slice(yesterday, 'sess-c', { origin: 'user', inputTokens: 20, outputTokens: 6, inputCost: 2, outputCost: 3, provider: 'grok', model: 'grok-4.6' }),
+  ]
+  const empty = { date: '', hour: '', sessionId: '', origin: '', route: '' }
+  const all = queryHourlyOverview(entries.map(item => ({
+    sessionId: item.sessionId,
+    parentSession: item.parentSession,
+    origin: item.origin,
+    cost: { cost: item.entry.cost, inputTokens: item.entry.inputTokens, cacheReadTokens: item.entry.cacheReadTokens, cacheWriteTokens: item.entry.cacheWriteTokens, outputTokens: item.entry.outputTokens, hourly: [item.entry] },
+  })), empty)
+  const grand = sumHourlySlices(all.flatMap(group => group.sessions.map(item => item.entry)))
+  assert.equal(all.length, 3)
+  assert.equal(grand.cost, 1 + 2 + 0.5 + 0.5 + 0.8 + 0.04 + 1.2 + 2 + 3)
+  assert.equal(grand.inputTokens, 10 + 5 + 8 + 20)
+  assert.equal(grand.cacheReadTokens, 4)
+  assert.equal(grand.outputTokens, 2 + 1 + 3 + 6)
+  assert.equal(grand.cost, all.reduce((sum, group) => sum + group.totals.cost, 0))
+
+  const byDate = filterHourlyEntries(flattenHourlyEntries(all.flatMap(group => group.sessions.map(item => ({
+    sessionId: item.sessionId,
+    parentSession: item.parentSession,
+    origin: item.origin,
+    cost: { cost: item.entry.cost, inputTokens: item.entry.inputTokens, cacheReadTokens: item.entry.cacheReadTokens, cacheWriteTokens: item.entry.cacheWriteTokens, outputTokens: item.entry.outputTokens, hourly: [item.entry] },
+  })))), { ...empty, date: localDateOfHour(morning.hour) })
+  assert.equal(byDate.every(item => localDateOfHour(item.entry.hour) === localDateOfHour(morning.hour)), true)
+  assert.equal(byDate.length, 3)
+
+  const byHour = filterHourlyEntries(entries, { ...empty, hour: morning.hourLabel })
+  assert.deepEqual(byHour.map(item => item.sessionId).sort(), ['sess-a', 'sess-b'])
+
+  const bySession = filterHourlyEntries(entries, { ...empty, sessionId: 'sess-a' })
+  assert.equal(bySession.length, 2)
+  assert.equal(bySession.every(item => item.sessionId === 'sess-a'), true)
+
+  const byOrigin = filterHourlyEntries(entries, { ...empty, origin: 'subagent' })
+  assert.deepEqual(byOrigin.map(item => item.sessionId), ['sess-b'])
+
+  const byRoute = filterHourlyEntries(entries, { ...empty, route: 'grok/grok-4.6' })
+  assert.deepEqual(byRoute.map(item => item.sessionId), ['sess-c'])
+})
+
+test('flattenHourlyEntries skips buckets without an hour and keeps independent session rows', () => {
+  const morning = localHour(2026, 8, 23, 9)
+  const entries = flattenHourlyEntries([
+    {
+      sessionId: 'ok',
+      parentSession: null,
+      origin: 'user',
+      cost: {
+        cost: 1,
+        inputTokens: 1,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        outputTokens: 1,
+        hourly: [
+          { ...morning, provider: 'wz', model: 'gpt-5.6-terra', inputTokens: 1, outputTokens: 1, cost: 1 },
+          { provider: 'wz', model: 'missing-hour', inputTokens: 9, outputTokens: 9, cost: 9 },
+        ],
+      },
+    },
+    {
+      sessionId: 'empty',
+      parentSession: null,
+      origin: 'user',
+      cost: { cost: 0, inputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, hourly: [] },
+    },
+  ])
+  assert.equal(entries.length, 1)
+  assert.equal(entries[0].sessionId, 'ok')
+  assert.equal(entries[0].entry.hour, morning.hour)
+})
+
+test('mapWithConcurrency treats empty lists and invalid limits as no-op or serial work', async () => {
+  assert.deepEqual(await mapWithConcurrency([], 8, async value => value), [])
+  const serial = await mapWithConcurrency(['a', 'b'], 0, async value => value.toUpperCase())
+  assert.deepEqual(serial, ['A', 'B'])
 })
