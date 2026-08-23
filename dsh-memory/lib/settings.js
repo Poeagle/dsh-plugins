@@ -1,4 +1,4 @@
-import { l as MemoryStore, t as Config } from "./src-CmaoCkCf.js";
+import { l as memoryReviewNotices, t as Config, u as MemoryStore } from "./src-CN2TttgI.js";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 //#region src/settings.ts
@@ -108,6 +108,21 @@ function apply(ctx) {
 							})),
 							usage: store.usageString(target)
 						}
+					});
+					return;
+				}
+				if (method === "GET" && url.pathname === "/memory/api/review-notice") {
+					const sessionId = url.searchParams.get("sessionId");
+					if (sessionId === null || sessionId === "") {
+						send(res, 400, {
+							ok: false,
+							error: "sessionId is required."
+						});
+						return;
+					}
+					send(res, 200, {
+						ok: true,
+						value: memoryReviewNotices.consume(sessionId) ?? null
 					});
 					return;
 				}

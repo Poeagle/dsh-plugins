@@ -34,7 +34,7 @@ export const MEMORY_TOOL_DESCRIPTION =
   + 'memory stops the user repeating themselves.\n\n'
   + 'IF FULL: an add is rejected with the current entries shown. Reissue as ONE batch that '
   + 'removes or shortens enough stale entries and adds the new one together.\n\n'
-  + 'TARGETS: choose the target by the fact type. Use target="user" ONLY for stable personal '
+  + "TARGETS: 'user' stores stable personal facts; choose the target by the fact type. Use target=\"user\" ONLY for stable personal "
   + 'facts about the user: name, location, age, identity, education, employer, role, personal '
   + 'preferences, or communication style. Use target="memory" for project and environment facts: '
   + 'repositories, code conventions, product details, workflows, tool behavior, technical rules, '

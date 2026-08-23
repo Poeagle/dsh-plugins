@@ -158,12 +158,12 @@ export class MemoryStore {
 
   /**
    * Live entries of one target (read-only view for diagnostics and tests).
-   * Returns entries with timestamps included (the raw on-disk form).
+   * Store-private timestamps never leave this public view.
    * @param target - which store to read.
-   * @returns the live entry list.
+   * @returns the live entry list without metadata.
    */
   entriesFor(target: MemoryTarget): readonly string[] {
-    return this.entries[target]
+    return this.entries[target].map(stripTimestamp)
   }
 
   /**
@@ -202,9 +202,6 @@ export class MemoryStore {
     const scanError = firstThreatMessage(trimmed, 'strict')
     if (scanError !== undefined) return { success: false, error: scanError }
 
-    // Prepend ISO timestamp to the entry.
-    const timestamped = `[${new Date().toISOString()}] ${trimmed}`
-
     return this.withLock(target, async () => {
       // Re-read under lock to pick up other sessions' writes. add skips the
       // drift guard because appending never clobbers existing content — but
@@ -214,11 +211,10 @@ export class MemoryStore {
       if (reload.kind === 'read-failed') return readFailedError(this.pathFor(target))
 
       const entries = this.entries[target]
-      if (entries.includes(timestamped)) {
+      if (entries.some(entry => stripTimestamp(entry) === trimmed)) {
         return this.successResponse(target, 'Entry already exists (no duplicate added).')
       }
-      // Check budget against the stripped content length.
-      const newTotal = [...entries, timestamped].join(ENTRY_DELIMITER).length
+      const newTotal = [...entries, trimmed].join(ENTRY_DELIMITER).length
       if (newTotal > this.charLimit(target)) {
         const current = this.charCount(target)
         return this.consolidationFailure({
@@ -234,7 +230,7 @@ export class MemoryStore {
           usage: `${grouped(current)}/${grouped(this.charLimit(target))}`,
         })
       }
-      entries.push(timestamped)
+      entries.push(trimmed)
       await this.saveToDisk(target)
       return this.successResponse(target, 'Entry added.')
     })
@@ -257,9 +253,6 @@ export class MemoryStore {
     const scanError = firstThreatMessage(trimmedNew, 'strict')
     if (scanError !== undefined) return { success: false, error: scanError }
 
-    // Prepend ISO timestamp to the replacement entry.
-    const timestampedNew = `[${new Date().toISOString()}] ${trimmedNew}`
-
     return this.withLock(target, async () => {
       const refusal = await this.reloadGuarded(target)
       if (refusal !== undefined) return refusal
@@ -268,7 +261,7 @@ export class MemoryStore {
       const match = this.matchOrError(entries, trimmedOld, 'replace')
       if (typeof match !== 'number') return match
       const testEntries = [...entries]
-      testEntries[match] = timestampedNew
+      testEntries[match] = trimmedNew
       const newTotal = testEntries.join(ENTRY_DELIMITER).length
       if (newTotal > this.charLimit(target)) {
         const current = this.charCount(target)
@@ -284,7 +277,7 @@ export class MemoryStore {
           usage: `${grouped(current)}/${grouped(this.charLimit(target))}`,
         })
       }
-      entries[match] = timestampedNew
+      entries[match] = trimmedNew
       await this.saveToDisk(target)
       return this.successResponse(target, 'Entry replaced.')
     })
@@ -390,9 +383,8 @@ export class MemoryStore {
 
         if (op.action === 'add') {
           if (content.length === 0) return this.batchError(target, `${pos}: content is required.`)
-          const timestamped = `[${new Date().toISOString()}] ${content}`
-          if (working.includes(timestamped)) continue // idempotent duplicate skip
-          working.push(timestamped)
+          if (working.some(entry => stripTimestamp(entry) === content)) continue // idempotent duplicate skip
+          working.push(content)
         } else if (op.action === 'replace') {
           if (oldText.length === 0) return this.batchError(target, `${pos}: old_text is required.`)
           if (content.length === 0) {
@@ -407,15 +399,11 @@ export class MemoryStore {
             if (appliedOperations.has(signature)) continue
             return this.batchError(target, `${pos}: no entry matched '${oldText}'.`)
           }
-          const timestamped = `[${new Date().toISOString()}] ${content}`
           if (match === 'ambiguous') {
-            const matches = findAllMatches(working, oldText)
-            for (const index of matches) working[index] = timestamped
-          } else {
-            working[match] = timestamped
+            return this.batchError(target, `${pos}: '${oldText}' matched multiple distinct entries -- be more specific.`)
           }
+          working[match] = content
           appliedOperations.add(`replace\u0000${oldText}\u0000${content}`)
-          working.splice(0, working.length, ...dedupeByContent(working))
         } else if (op.action === 'remove') {
           if (oldText.length === 0) return this.batchError(target, `${pos}: old_text is required.`)
           const match = findUniqueMatch(working, oldText)
@@ -688,19 +676,6 @@ async function mkdirp(dir: string): Promise<void> {
 /** Order-preserving dedupe keeping the first occurrence. */
 function dedupe(entries: readonly string[]): string[] {
   return [...new Set(entries)]
-}
-
-/** Remove duplicate logical entries while retaining the newest timestamp. */
-function dedupeByContent(entries: readonly string[]): string[] {
-  const seen = new Set<string>()
-  const result: string[] = []
-  for (let index = entries.length - 1; index >= 0; index -= 1) {
-    const content = stripTimestamp(entries[index] ?? '')
-    if (seen.has(content)) continue
-    seen.add(content)
-    result.unshift(entries[index] ?? '')
-  }
-  return result
 }
 
 /** Truncated one-line previews of entries for ambiguity feedback. */

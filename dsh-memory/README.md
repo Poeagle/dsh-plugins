@@ -132,14 +132,14 @@ Focus on:
 1. Has the user revealed things about themselves — their persona, desires, preferences, or personal details worth remembering?
 2. Has the user expressed expectations about how you should behave, their work style, or ways they want you to operate?
 
-If something stands out, save it using the memory tool. If nothing is worth saving, just say 'Nothing to save.' and stop.
+Before every write, inspect the current entries and consolidate them. Do not add duplicate or semantically overlapping facts when an existing entry should be merged, replaced, shortened, or removed. Keep only stable reusable facts and conventions; remove obsolete, redundant, and timeline-style details when one compact entry preserves the useful fact. If nothing is worth saving, just say 'Nothing to save.' and stop.
 
 You can only call the memory tool. Other tools will be denied at runtime — do not attempt them.
 ```
 
 #### Token effect
 
-Does not grow the originating session; cost lands entirely in the fork request, capped by `reviewMaxIterations` model steps.
+Does not grow the originating session; cost lands entirely in the fork request, capped by `reviewMaxIterations` model steps. When the review atomically saves entries, the browser can consume one transient, collapsed notice for the source session with the committed entry additions and removals. The process-local notice is deleted when read and is not logged, replayed, restored after reconnect, or injected into any model request; the frozen snapshot remains unchanged until a new session or context rebuild loads it.
 
 #### KV Cache effect
 

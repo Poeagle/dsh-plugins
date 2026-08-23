@@ -132,14 +132,14 @@ Focus on:
 1. Has the user revealed things about themselves — their persona, desires, preferences, or personal details worth remembering?
 2. Has the user expressed expectations about how you should behave, their work style, or ways they want you to operate?
 
-If something stands out, save it using the memory tool. If nothing is worth saving, just say 'Nothing to save.' and stop.
+每次写入前先检查现有条目并做整合。若现有条目应合并、替换、压缩或删除，不得新增重复或语义重叠的事实。仅保留稳定、可复用的事实和约定；当一条紧凑事实足以保留有效信息时，删除陈旧、冗余和时间线式细节。若没有值得保存的内容，只说 'Nothing to save.' 并停止。
 
 You can only call the memory tool. Other tools will be denied at runtime — do not attempt them.
 ```
 
 #### Token effect
 
-不会让发起会话变长；开销完全落在分支请求里，由 `reviewMaxIterations` 模型步数封顶。
+不会让发起会话变长；开销完全落在分支请求里，由 `reviewMaxIterations` 模型步数封顶。审查原子保存条目后，浏览器仅可从来源会话读取一次折叠通知，其中只列出已提交的新增和移除条目。通知只存在于当前进程，读取即删除；它不写日志、不参与重放或重连恢复、不进入模型请求，也不会刷新冻结快照。
 
 #### KV Cache effect
 

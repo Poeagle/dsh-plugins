@@ -21,6 +21,7 @@ import type { Session } from '@deepseek-ai/dsh-session'
 import { parameterSchemaSpecToJsonSchema } from '@deepseek-ai/dsh-tools'
 import { MEMORY_TOOL_DESCRIPTION, MEMORY_TOOL_PARAMETERS, dispatchMemoryTool, toMemoryToolArgs } from './schema.ts'
 import type { MemoryStore } from './store.ts'
+import type { MemoryReviewChange } from './types.ts'
 
 /** The review directive appended after the replayed conversation. */
 export const MEMORY_REVIEW_PROMPT =
@@ -33,8 +34,10 @@ export const MEMORY_REVIEW_PROMPT =
   + 'project should be operated.\n'
   + '3. Project/API debugging facts and implementation requirements MUST use target="memory"; '
   + 'they do not belong in USER.md. Personal profile facts MUST use target="user".\n\n'
-  + 'If something stands out, save it using the memory tool. '
-  + "If nothing is worth saving, just say 'Nothing to save.' and stop.\n\n"
+  + 'Before every write, inspect the current entries and consolidate them: do not add a fact that is duplicated, '
+  + 'semantically overlapping, or better represented by replacing, merging, shortening, or removing existing entries. '
+  + 'Keep only stable, reusable facts and conventions; remove obsolete, redundant, and timeline-style details when a '
+  + 'single compact entry preserves the useful fact. If nothing is worth saving after this review, just say \'Nothing to save.\' and stop.\n\n'
   + 'You can only call the memory tool. Other tools will be denied at runtime — '
   + 'do not attempt them.'
 
@@ -42,8 +45,10 @@ export const MEMORY_REVIEW_PROMPT =
 export interface ReviewOutcome {
   /** Model steps taken (requests sent). */
   readonly iterations: number
-  /** Count of memory writes that landed during the review. */
+  /** Count of memory tool calls that committed at least one store change. */
   readonly saved: number
+  /** Entry-level changes observed after each committed write. */
+  readonly changes: readonly MemoryReviewChange[]
   /** Why the loop stopped. */
   readonly reason: 'finished' | 'max-iterations' | 'aborted' | 'failed'
 }
@@ -106,8 +111,9 @@ export async function runMemoryReview(
   const tools = [memoryToolSchema()]
 
   let saved = 0
+  const changes: MemoryReviewChange[] = []
   for (let iteration = 1; iteration <= maxIterations; iteration++) {
-    if (signal.aborted) return { iterations: iteration - 1, saved, reason: 'aborted' }
+    if (signal.aborted) return { iterations: iteration - 1, saved, changes, reason: 'aborted' }
     const assembler = new BlockAssembler()
     try {
       for await (const chunk of ctx.llm.stream({
@@ -123,11 +129,11 @@ export async function runMemoryReview(
       }
     } catch {
       // Stream construction or iteration failure: review degrades silently.
-      return { iterations: iteration, saved, reason: 'failed' }
+      return { iterations: iteration, saved, changes, reason: 'failed' }
     }
     const finish = assembler.finish
     if (finish.kind === 'aborted' || finish.kind === 'error') {
-      return { iterations: iteration, saved, reason: finish.kind === 'aborted' ? 'aborted' : 'failed' }
+      return { iterations: iteration, saved, changes, reason: finish.kind === 'aborted' ? 'aborted' : 'failed' }
     }
     const blocks = assembler.blocks()
     messages.push(createAssistantMessage({
@@ -136,11 +142,14 @@ export async function runMemoryReview(
     }))
     const toolCalls = blocks.filter((block): block is Extract<ContentBlock, { type: 'tool-call' }> => block.type === 'tool-call')
     if (finish.kind !== 'tool-calls' || toolCalls.length === 0) {
-      return { iterations: iteration, saved, reason: 'finished' }
+      return { iterations: iteration, saved, changes, reason: 'finished' }
     }
     for (const call of toolCalls) {
       const result = await executeReviewToolCall(store, call.id, call.name, call.arguments)
-      if (result.saved) saved += 1
+      if (result.saved) {
+        saved += 1
+        changes.push(...result.changes)
+      }
       messages.push(createToolResultMessage({
         callId: call.id,
         content: [{ type: 'text', text: result.text }],
@@ -148,7 +157,7 @@ export async function runMemoryReview(
       }))
     }
   }
-  return { iterations: maxIterations, saved, reason: 'max-iterations' }
+  return { iterations: maxIterations, saved, changes, reason: 'max-iterations' }
 }
 
 /** One executed tool call's model-facing outcome. */
@@ -157,6 +166,8 @@ interface ReviewToolOutcome {
   readonly isError: boolean
   /** Whether this call landed at least one successful write. */
   readonly saved: boolean
+  /** Committed entry-level delta for the write, never model-proposed arguments. */
+  readonly changes: readonly MemoryReviewChange[]
 }
 
 /**
@@ -181,18 +192,44 @@ async function executeReviewToolCall(
       text: `Background review denied non-whitelisted tool: ${name}. Only memory tools are allowed.`,
       isError: true,
       saved: false,
+      changes: [],
     }
   }
   let args: unknown
   try {
     args = JSON.parse(rawArguments) as unknown
   } catch {
-    return { text: 'Invalid tool arguments: not valid JSON.', isError: true, saved: false }
+    return { text: 'Invalid tool arguments: not valid JSON.', isError: true, saved: false, changes: [] }
   }
   if (args === null || typeof args !== 'object' || Array.isArray(args)) {
-    return { text: 'Invalid tool arguments: expected an object.', isError: true, saved: false }
+    return { text: 'Invalid tool arguments: expected an object.', isError: true, saved: false, changes: [] }
   }
-  const result = await dispatchMemoryTool(store, toMemoryToolArgs(args as Record<string, unknown>))
-  const saved = result.success && result.message !== 'Entry already exists (no duplicate added).'
-  return { text: JSON.stringify(result), isError: false, saved }
+  const parsed = toMemoryToolArgs(args as Record<string, unknown>)
+  const before = [...store.entriesFor(parsed.target)]
+  const result = await dispatchMemoryTool(store, parsed)
+  const after = store.entriesFor(parsed.target)
+  const changes = result.success ? committedChanges(parsed.target, before, after) : []
+  return { text: JSON.stringify(result), isError: !result.success, saved: changes.length > 0, changes }
+}
+
+/** Internal timestamps distinguish revisions but never belong in user-visible receipts. */
+const TIMESTAMP_PREFIX = /^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\]\s*/
+
+/** Compare two committed store states without exposing model-proposed arguments. */
+function committedChanges(
+  target: MemoryReviewChange['target'],
+  before: readonly string[],
+  after: readonly string[],
+): MemoryReviewChange[] {
+  const beforeByContent = new Map(before.map(entry => [stripTimestamp(entry), entry]))
+  const afterByContent = new Map(after.map(entry => [stripTimestamp(entry), entry]))
+  return [
+    ...[...beforeByContent.keys()].filter(content => !afterByContent.has(content)).map(content => ({ target, action: 'removed' as const, content })),
+    ...[...afterByContent.keys()].filter(content => !beforeByContent.has(content)).map(content => ({ target, action: 'added' as const, content })),
+  ]
+}
+
+/** Remove store-private timestamp metadata from a committed entry receipt. */
+function stripTimestamp(entry: string): string {
+  return entry.replace(TIMESTAMP_PREFIX, '')
 }

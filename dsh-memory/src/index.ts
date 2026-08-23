@@ -24,6 +24,8 @@ import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { JsonValue } from '@deepseek-ai/dsh-session'
 import { MemoryStore } from './store.ts'
+import { memoryReviewNotices } from './review-notices.ts'
+import type { MemoryReviewNotification } from './types.ts'
 import { MEMORY_TOOL_DESCRIPTION, MEMORY_TOOL_PARAMETERS, dispatchMemoryTool, toMemoryToolArgs } from './schema.ts'
 import { runMemoryReview } from './review.ts'
 
@@ -31,7 +33,7 @@ import { runMemoryReview } from './review.ts'
 export const name = 'memory'
 
 /** Services required before activation. */
-export const inject = ['tools', 'llm', 'agents']
+export const inject = ['tools', 'llm', 'agents', 'systemPrompt']
 
 /** Character budget of the `memory` store, mirroring the upstream default. */
 export const DEFAULT_MEMORY_CHAR_LIMIT = 2200
@@ -124,6 +126,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     userCharLimit: config.userCharLimit,
   })
   await store.loadFromDisk()
+  ctx.systemPrompt.section({
+    name: 'memory:snapshot',
+    order: -50,
+    text: () => store.renderContextBlock(),
+  })
 
   /**
    * Resolve the effective nudge/review settings from the optional settings
@@ -301,6 +308,15 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       route,
       maxIterations: config.reviewMaxIterations,
       signal: aborter.signal,
+    }).then((outcome) => {
+      if (outcome.changes.length === 0) return
+      const update: MemoryReviewNotification = {
+        sessionId: String(session.id),
+        saved: outcome.saved,
+        changes: outcome.changes,
+        reason: outcome.reason,
+      }
+      memoryReviewNotices.publish(update)
     }).catch((error: unknown) => {
       ctx.logger.warn(`memory: background review for ${String(session.id)} failed: ${String(error)}`)
     }).finally(() => {
@@ -317,5 +333,6 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     states.delete(session.id)
     injected.delete(session.id)
     injectionLocks.delete(session.id)
+    memoryReviewNotices.discard(String(session.id))
   })
 }

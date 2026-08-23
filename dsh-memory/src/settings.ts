@@ -4,6 +4,7 @@ import { readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { Config } from './index.ts'
+import { memoryReviewNotices } from './review-notices.ts'
 import { MemoryStore } from './store.ts'
 
 const MEMORY_ROUTE = '/memory/api'
@@ -99,9 +100,9 @@ export function apply(ctx: Context): void {
           let userSize = 0
           try {
             const memStat = await readFile(join(memDir, 'MEMORY.md'))
-              .then(b => b.length).catch(() => 0)
+              .then((b: string) => b.length).catch(() => 0)
             const userStat = await readFile(join(memDir, 'USER.md'))
-              .then(b => b.length).catch(() => 0)
+              .then((b: string) => b.length).catch(() => 0)
             memSize = memStat
             userSize = userStat
           } catch { /* ignore */ }
@@ -128,6 +129,17 @@ export function apply(ctx: Context): void {
               usage: store.usageString(target),
             },
           })
+          return
+        }
+
+        // GET /memory/api/review-notice?sessionId=<id> — consume one source-session review receipt
+        if (method === 'GET' && url.pathname === '/memory/api/review-notice') {
+          const sessionId = url.searchParams.get('sessionId')
+          if (sessionId === null || sessionId === '') {
+            send(res, 400, { ok: false, error: 'sessionId is required.' })
+            return
+          }
+          send(res, 200, { ok: true, value: memoryReviewNotices.consume(sessionId) ?? null })
           return
         }
 

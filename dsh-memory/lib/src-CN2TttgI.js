@@ -423,12 +423,12 @@ var MemoryStore = class {
 	}
 	/**
 	* Live entries of one target (read-only view for diagnostics and tests).
-	* Returns entries with timestamps included (the raw on-disk form).
+	* Store-private timestamps never leave this public view.
 	* @param target - which store to read.
-	* @returns the live entry list.
+	* @returns the live entry list without metadata.
 	*/
 	entriesFor(target) {
-		return this.entries[target];
+		return this.entries[target].map(stripTimestamp$1);
 	}
 	/**
 	* Live entries with metadata (timestamp) for one target. Each entry is
@@ -441,7 +441,7 @@ var MemoryStore = class {
 		return this.entries[target].map((content) => {
 			const timestamp = extractTimestamp(content) ?? "";
 			return {
-				content: stripTimestamp(content),
+				content: stripTimestamp$1(content),
 				timestamp
 			};
 		});
@@ -472,21 +472,20 @@ var MemoryStore = class {
 			success: false,
 			error: scanError
 		};
-		const timestamped = `[${(/* @__PURE__ */ new Date()).toISOString()}] ${trimmed}`;
 		return this.withLock(target, async () => {
 			if ((await this.reloadTarget(target, { skipDrift: true })).kind === "read-failed") return readFailedError(this.pathFor(target));
 			const entries = this.entries[target];
-			if (entries.includes(timestamped)) return this.successResponse(target, "Entry already exists (no duplicate added).");
-			if ([...entries, timestamped].join("\n§\n").length > this.charLimit(target)) {
+			if (entries.some((entry) => stripTimestamp$1(entry) === trimmed)) return this.successResponse(target, "Entry already exists (no duplicate added).");
+			if ([...entries, trimmed].join("\n§\n").length > this.charLimit(target)) {
 				const current = this.charCount(target);
 				return this.consolidationFailure({
 					success: false,
 					error: `Memory at ${grouped(current)}/${grouped(this.charLimit(target))} chars. Adding this entry (${trimmed.length} chars) would exceed the limit. Consolidate now: use 'replace' to merge overlapping entries into shorter ones or 'remove' stale or less important entries (see current_entries below), then retry this add — all in this turn.`,
-					current_entries: this.entries[target].map(stripTimestamp),
+					current_entries: this.entries[target].map(stripTimestamp$1),
 					usage: `${grouped(current)}/${grouped(this.charLimit(target))}`
 				});
 			}
-			entries.push(timestamped);
+			entries.push(trimmed);
 			await this.saveToDisk(target);
 			return this.successResponse(target, "Entry added.");
 		});
@@ -514,7 +513,6 @@ var MemoryStore = class {
 			success: false,
 			error: scanError
 		};
-		const timestampedNew = `[${(/* @__PURE__ */ new Date()).toISOString()}] ${trimmedNew}`;
 		return this.withLock(target, async () => {
 			const refusal = await this.reloadGuarded(target);
 			if (refusal !== void 0) return refusal;
@@ -522,18 +520,18 @@ var MemoryStore = class {
 			const match = this.matchOrError(entries, trimmedOld, "replace");
 			if (typeof match !== "number") return match;
 			const testEntries = [...entries];
-			testEntries[match] = timestampedNew;
+			testEntries[match] = trimmedNew;
 			const newTotal = testEntries.join(ENTRY_DELIMITER).length;
 			if (newTotal > this.charLimit(target)) {
 				const current = this.charCount(target);
 				return this.consolidationFailure({
 					success: false,
 					error: `Replacement would put memory at ${grouped(newTotal)}/${grouped(this.charLimit(target))} chars. Shorten the new content, or 'remove' other stale or less important entries to make room (see current_entries below), then retry — all in this turn.`,
-					current_entries: entries.map(stripTimestamp),
+					current_entries: entries.map(stripTimestamp$1),
 					usage: `${grouped(current)}/${grouped(this.charLimit(target))}`
 				});
 			}
-			entries[match] = timestampedNew;
+			entries[match] = trimmedNew;
 			await this.saveToDisk(target);
 			return this.successResponse(target, "Entry replaced.");
 		});
@@ -636,9 +634,8 @@ var MemoryStore = class {
 				const pos = `Operation ${i + 1} (${op.action ?? "unknown"})`;
 				if (op.action === "add") {
 					if (content.length === 0) return this.batchError(target, `${pos}: content is required.`);
-					const timestamped = `[${(/* @__PURE__ */ new Date()).toISOString()}] ${content}`;
-					if (working.includes(timestamped)) continue;
-					working.push(timestamped);
+					if (working.some((entry) => stripTimestamp$1(entry) === content)) continue;
+					working.push(content);
 				} else if (op.action === "replace") {
 					if (oldText.length === 0) return this.batchError(target, `${pos}: old_text is required.`);
 					if (content.length === 0) return this.batchError(target, `${pos}: content is required (use action='remove' to delete).`);
@@ -648,13 +645,9 @@ var MemoryStore = class {
 						if (appliedOperations.has(signature)) continue;
 						return this.batchError(target, `${pos}: no entry matched '${oldText}'.`);
 					}
-					const timestamped = `[${(/* @__PURE__ */ new Date()).toISOString()}] ${content}`;
-					if (match === "ambiguous") {
-						const matches = findAllMatches(working, oldText);
-						for (const index of matches) working[index] = timestamped;
-					} else working[match] = timestamped;
+					if (match === "ambiguous") return this.batchError(target, `${pos}: '${oldText}' matched multiple distinct entries -- be more specific.`);
+					working[match] = content;
 					appliedOperations.add(`replace\u0000${oldText}\u0000${content}`);
-					working.splice(0, working.length, ...dedupeByContent(working));
 				} else if (op.action === "remove") {
 					if (oldText.length === 0) return this.batchError(target, `${pos}: old_text is required.`);
 					const match = findUniqueMatch(working, oldText);
@@ -709,7 +702,7 @@ var MemoryStore = class {
 		return this.consolidationFailure({
 			success: false,
 			error: `${message} No operations were applied (batch is all-or-nothing).`,
-			current_entries: this.entries[target].map(stripTimestamp),
+			current_entries: this.entries[target].map(stripTimestamp$1),
 			usage: `${grouped(this.charCount(target))}/${grouped(this.charLimit(target))}`
 		});
 	}
@@ -739,7 +732,7 @@ var MemoryStore = class {
 		if (match === void 0) return this.consolidationFailure({
 			success: false,
 			error: `No entry matched '${trimmedOld}'. Check current_entries below and retry with the exact text of the entry you want to ${verb}.`,
-			current_entries: entries.map(stripTimestamp)
+			current_entries: entries.map(stripTimestamp$1)
 		});
 		if (match === "ambiguous") return {
 			success: false,
@@ -773,7 +766,7 @@ var MemoryStore = class {
 	renderBlock(target, entries) {
 		if (entries.length === 0) return "";
 		const limit = this.charLimit(target);
-		const content = entries.map(stripTimestamp).join(ENTRY_DELIMITER);
+		const content = entries.map(stripTimestamp$1).join(ENTRY_DELIMITER);
 		const current = content.length;
 		const pct = limit > 0 ? Math.min(100, Math.trunc(current / limit * 100)) : 0;
 		const header = `${MEMORY_BLOCK_HEADERS[target]} [${pct}% — ${grouped(current)}/${grouped(limit)} chars]`;
@@ -878,18 +871,6 @@ async function mkdirp(dir) {
 function dedupe(entries) {
 	return [...new Set(entries)];
 }
-/** Remove duplicate logical entries while retaining the newest timestamp. */
-function dedupeByContent(entries) {
-	const seen = /* @__PURE__ */ new Set();
-	const result = [];
-	for (let index = entries.length - 1; index >= 0; index -= 1) {
-		const content = stripTimestamp(entries[index] ?? "");
-		if (seen.has(content)) continue;
-		seen.add(content);
-		result.unshift(entries[index] ?? "");
-	}
-	return result;
-}
 /** Truncated one-line previews of entries for ambiguity feedback. */
 function previews(entries, width = 80) {
 	return entries.map((entry) => entry.length > width ? `${entry.slice(0, width)}...` : entry);
@@ -906,12 +887,12 @@ function previews(entries, width = 80) {
 function findUniqueMatch(entries, oldText) {
 	const matches = findAllMatches(entries, oldText);
 	if (matches.length === 0) return void 0;
-	if (new Set(matches.map((index) => stripTimestamp(entries[index] ?? ""))).size > 1) return "ambiguous";
+	if (new Set(matches.map((index) => stripTimestamp$1(entries[index] ?? ""))).size > 1) return "ambiguous";
 	return matches[0];
 }
 /** Return every entry index whose visible content contains `oldText`. */
 function findAllMatches(entries, oldText) {
-	return entries.flatMap((entry, index) => stripTimestamp(entry).includes(oldText) ? [index] : []);
+	return entries.flatMap((entry, index) => stripTimestamp$1(entry).includes(oldText) ? [index] : []);
 }
 /** Drift-refusal result pointing the operator at the backup snapshot. */
 function driftError(path, backup) {
@@ -953,14 +934,53 @@ function extractTimestamp(content) {
 * @param content - the raw entry content.
 * @returns the entry content without the timestamp prefix.
 */
-function stripTimestamp(content) {
+function stripTimestamp$1(content) {
 	return content.replace(TIMESTAMP_RE, "");
 }
+//#endregion
+//#region src/review-notices.ts
+/**
+* Stores completed review receipts until the source session's browser reads one.
+* Entries live only in this process and are removed by {@link consume}.
+*/
+var MemoryReviewNotices = class {
+	bySession = /* @__PURE__ */ new Map();
+	/**
+	* Publish a committed review receipt for its source session.
+	* @param notice - The already-persisted review result.
+	*/
+	publish(notice) {
+		this.bySession.set(notice.sessionId, notice);
+	}
+	/**
+	* Return and delete the pending receipt for one session.
+	* @param sessionId - Source session that owns the receipt.
+	* @returns The pending receipt, if one exists.
+	*/
+	consume(sessionId) {
+		const notice = this.bySession.get(sessionId);
+		if (notice !== void 0) this.bySession.delete(sessionId);
+		return notice;
+	}
+	/**
+	* Delete a disposed session's unread receipt.
+	* @param sessionId - Session whose transient receipt should be discarded.
+	*/
+	discard(sessionId) {
+		this.bySession.delete(sessionId);
+	}
+};
+/**
+* The settings plugin and the memory agent preset run in different Cordis
+* realms. Module scope provides their process-local handoff without making a
+* preset publish a process-global Cordis service.
+*/
+const memoryReviewNotices = new MemoryReviewNotices();
 //#endregion
 //#region src/schema.ts
 /** Model-facing description of the memory tool (single source for both the
 * registry registration and the review fork's tool schema). */
-const MEMORY_TOOL_DESCRIPTION = "Save durable facts to persistent memory that survive across sessions. Memory is injected into every future turn, so keep entries compact and high-signal.\n\nHOW: make ALL your changes in ONE call via an 'operations' array (each item: {action, content?, old_text?}). The batch applies atomically and the char limit is checked only on the FINAL result — so a single call can remove/replace stale entries to free room AND add new ones, even when an add alone would overflow. The response reports current/limit chars and confirms completion; one batch call finishes the update, so don't repeat it. Use the bare action/content/old_text fields only for a single lone change.\n\nIMPORTANT: To UPDATE an existing entry, use action=\"replace\" with old_text and content in the SAME call. old_text must be a unique substring of exactly one current entry; use the distinctive full entry text shown in current_entries, never text spanning the § separator. Do NOT use remove+add as two separate calls — replace does both atomically. Do not use filesystem, shell, or edit tools to modify MEMORY.md or USER.md; all memory writes MUST go through this memory tool.\n\nWHEN: save proactively when the user states a preference, correction, or personal detail, or you learn a stable fact about their environment, conventions, or workflow. Priority: user preferences & corrections > environment facts > procedures. The best memory stops the user repeating themselves.\n\nIF FULL: an add is rejected with the current entries shown. Reissue as ONE batch that removes or shortens enough stale entries and adds the new one together.\n\nTARGETS: choose the target by the fact type. Use target=\"user\" ONLY for stable personal facts about the user: name, location, age, identity, education, employer, role, personal preferences, or communication style. Use target=\"memory\" for project and environment facts: repositories, code conventions, product details, workflows, tool behavior, technical rules, and instructions about how this project should be operated. Never put project rules or API debugging facts in USER.md. Never put a personal profile fact in MEMORY.md.\n\nSKIP: trivial/obvious info, easily re-discovered facts, raw data dumps, task progress, completed-work logs, temporary TODO state. Reusable procedures belong in a skill, not memory.";
+const MEMORY_TOOL_DESCRIPTION = "Save durable facts to persistent memory that survive across sessions. Memory is injected into every future turn, so keep entries compact and high-signal.\n\nHOW: make ALL your changes in ONE call via an 'operations' array (each item: {action, content?, old_text?}). The batch applies atomically and the char limit is checked only on the FINAL result — so a single call can remove/replace stale entries to free room AND add new ones, even when an add alone would overflow. The response reports current/limit chars and confirms completion; one batch call finishes the update, so don't repeat it. Use the bare action/content/old_text fields only for a single lone change.\n\nIMPORTANT: To UPDATE an existing entry, use action=\"replace\" with old_text and content in the SAME call. old_text must be a unique substring of exactly one current entry; use the distinctive full entry text shown in current_entries, never text spanning the § separator. Do NOT use remove+add as two separate calls — replace does both atomically. Do not use filesystem, shell, or edit tools to modify MEMORY.md or USER.md; all memory writes MUST go through this memory tool.\n\nWHEN: save proactively when the user states a preference, correction, or personal detail, or you learn a stable fact about their environment, conventions, or workflow. Priority: user preferences & corrections > environment facts > procedures. The best memory stops the user repeating themselves.\n\nIF FULL: an add is rejected with the current entries shown. Reissue as ONE batch that removes or shortens enough stale entries and adds the new one together.\n\nTARGETS: 'user' stores stable personal facts; choose the target by the fact type. Use target=\"user\" ONLY for stable personal facts about the user: name, location, age, identity, education, employer, role, personal preferences, or communication style. Use target=\"memory\" for project and environment facts: repositories, code conventions, product details, workflows, tool behavior, technical rules, and instructions about how this project should be operated. Never put project rules or API debugging facts in USER.md. Never put a personal profile fact in MEMORY.md.\n\nSKIP: trivial/obvious info, easily re-discovered facts, raw data dumps, task progress, completed-work logs, temporary TODO state. Reusable procedures belong in a skill, not memory.";
 /** The tool's parameter declaration (implicit open-object root). */
 const MEMORY_TOOL_PARAMETERS = {
 	action: {
@@ -1089,7 +1109,7 @@ async function dispatchMemoryTool(store, args) {
 //#endregion
 //#region src/review.ts
 /** The review directive appended after the replayed conversation. */
-const MEMORY_REVIEW_PROMPT = "Review the conversation above and consider saving a durable fact if appropriate.\n\nClassify every candidate before writing it:\n1. Use target=\"user\" ONLY for stable facts about the person: name, location, age, identity, education, employer, role, personal preferences, or communication style.\n2. Use target=\"memory\" for project and environment facts: repositories, code conventions, product details, workflows, tool behavior, technical rules, and instructions about how the project should be operated.\n3. Project/API debugging facts and implementation requirements MUST use target=\"memory\"; they do not belong in USER.md. Personal profile facts MUST use target=\"user\".\n\nIf something stands out, save it using the memory tool. If nothing is worth saving, just say 'Nothing to save.' and stop.\n\nYou can only call the memory tool. Other tools will be denied at runtime — do not attempt them.";
+const MEMORY_REVIEW_PROMPT = "Review the conversation above and consider saving a durable fact if appropriate.\n\nClassify every candidate before writing it:\n1. Use target=\"user\" ONLY for stable facts about the person: name, location, age, identity, education, employer, role, personal preferences, or communication style.\n2. Use target=\"memory\" for project and environment facts: repositories, code conventions, product details, workflows, tool behavior, technical rules, and instructions about how the project should be operated.\n3. Project/API debugging facts and implementation requirements MUST use target=\"memory\"; they do not belong in USER.md. Personal profile facts MUST use target=\"user\".\n\nBefore every write, inspect the current entries and consolidate them: do not add a fact that is duplicated, semantically overlapping, or better represented by replacing, merging, shortening, or removing existing entries. Keep only stable, reusable facts and conventions; remove obsolete, redundant, and timeline-style details when a single compact entry preserves the useful fact. If nothing is worth saving after this review, just say 'Nothing to save.' and stop.\n\nYou can only call the memory tool. Other tools will be denied at runtime — do not attempt them.";
 /**
 * Build the memory-only tool schema the review request offers. Sharing the
 * parameter spec with the registry registration keeps the fork and the live
@@ -1130,10 +1150,12 @@ async function runMemoryReview(ctx, options) {
 	})];
 	const tools = [memoryToolSchema()];
 	let saved = 0;
+	const changes = [];
 	for (let iteration = 1; iteration <= maxIterations; iteration++) {
 		if (signal.aborted) return {
 			iterations: iteration - 1,
 			saved,
+			changes,
 			reason: "aborted"
 		};
 		const assembler = new BlockAssembler();
@@ -1151,6 +1173,7 @@ async function runMemoryReview(ctx, options) {
 			return {
 				iterations: iteration,
 				saved,
+				changes,
 				reason: "failed"
 			};
 		}
@@ -1158,6 +1181,7 @@ async function runMemoryReview(ctx, options) {
 		if (finish.kind === "aborted" || finish.kind === "error") return {
 			iterations: iteration,
 			saved,
+			changes,
 			reason: finish.kind === "aborted" ? "aborted" : "failed"
 		};
 		const blocks = assembler.blocks();
@@ -1173,11 +1197,15 @@ async function runMemoryReview(ctx, options) {
 		if (finish.kind !== "tool-calls" || toolCalls.length === 0) return {
 			iterations: iteration,
 			saved,
+			changes,
 			reason: "finished"
 		};
 		for (const call of toolCalls) {
 			const result = await executeReviewToolCall(store, call.id, call.name, call.arguments);
-			if (result.saved) saved += 1;
+			if (result.saved) {
+				saved += 1;
+				changes.push(...result.changes);
+			}
 			messages.push(createToolResultMessage({
 				callId: call.id,
 				content: [{
@@ -1191,6 +1219,7 @@ async function runMemoryReview(ctx, options) {
 	return {
 		iterations: maxIterations,
 		saved,
+		changes,
 		reason: "max-iterations"
 	};
 }
@@ -1208,7 +1237,8 @@ async function executeReviewToolCall(store, callId, name, rawArguments) {
 	if (name !== "memory") return {
 		text: `Background review denied non-whitelisted tool: ${name}. Only memory tools are allowed.`,
 		isError: true,
-		saved: false
+		saved: false,
+		changes: []
 	};
 	let args;
 	try {
@@ -1217,21 +1247,47 @@ async function executeReviewToolCall(store, callId, name, rawArguments) {
 		return {
 			text: "Invalid tool arguments: not valid JSON.",
 			isError: true,
-			saved: false
+			saved: false,
+			changes: []
 		};
 	}
 	if (args === null || typeof args !== "object" || Array.isArray(args)) return {
 		text: "Invalid tool arguments: expected an object.",
 		isError: true,
-		saved: false
+		saved: false,
+		changes: []
 	};
-	const result = await dispatchMemoryTool(store, toMemoryToolArgs(args));
-	const saved = result.success && result.message !== "Entry already exists (no duplicate added).";
+	const parsed = toMemoryToolArgs(args);
+	const before = [...store.entriesFor(parsed.target)];
+	const result = await dispatchMemoryTool(store, parsed);
+	const after = store.entriesFor(parsed.target);
+	const changes = result.success ? committedChanges(parsed.target, before, after) : [];
 	return {
 		text: JSON.stringify(result),
-		isError: false,
-		saved
+		isError: !result.success,
+		saved: changes.length > 0,
+		changes
 	};
+}
+/** Internal timestamps distinguish revisions but never belong in user-visible receipts. */
+const TIMESTAMP_PREFIX = /^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\]\s*/;
+/** Compare two committed store states without exposing model-proposed arguments. */
+function committedChanges(target, before, after) {
+	const beforeByContent = new Map(before.map((entry) => [stripTimestamp(entry), entry]));
+	const afterByContent = new Map(after.map((entry) => [stripTimestamp(entry), entry]));
+	return [...[...beforeByContent.keys()].filter((content) => !afterByContent.has(content)).map((content) => ({
+		target,
+		action: "removed",
+		content
+	})), ...[...afterByContent.keys()].filter((content) => !beforeByContent.has(content)).map((content) => ({
+		target,
+		action: "added",
+		content
+	}))];
+}
+/** Remove store-private timestamp metadata from a committed entry receipt. */
+function stripTimestamp(entry) {
+	return entry.replace(TIMESTAMP_PREFIX, "");
 }
 //#endregion
 //#region src/index.ts
@@ -1241,7 +1297,8 @@ const name = "memory";
 const inject = [
 	"tools",
 	"llm",
-	"agents"
+	"agents",
+	"systemPrompt"
 ];
 /** Character budget of the `memory` store, mirroring the upstream default. */
 const DEFAULT_MEMORY_CHAR_LIMIT = 2200;
@@ -1305,6 +1362,11 @@ async function apply(ctx, config) {
 		userCharLimit: config.userCharLimit
 	});
 	await store.loadFromDisk();
+	ctx.systemPrompt.section({
+		name: "memory:snapshot",
+		order: -50,
+		text: () => store.renderContextBlock()
+	});
 	/**
 	* Resolve the effective nudge/review settings from the optional settings
 	* service, falling back to the composition config when the service is
@@ -1462,6 +1524,15 @@ async function apply(ctx, config) {
 			route,
 			maxIterations: config.reviewMaxIterations,
 			signal: aborter.signal
+		}).then((outcome) => {
+			if (outcome.changes.length === 0) return;
+			const update = {
+				sessionId: String(session.id),
+				saved: outcome.saved,
+				changes: outcome.changes,
+				reason: outcome.reason
+			};
+			memoryReviewNotices.publish(update);
 		}).catch((error) => {
 			ctx.logger.warn(`memory: background review for ${String(session.id)} failed: ${String(error)}`);
 		}).finally(() => {
@@ -1477,9 +1548,10 @@ async function apply(ctx, config) {
 		states.delete(session.id);
 		injected.delete(session.id);
 		injectionLocks.delete(session.id);
+		memoryReviewNotices.discard(String(session.id));
 	});
 }
 //#endregion
-export { DEFAULT_USER_CHAR_LIMIT as a, name as c, DEFAULT_REVIEW_MAX_ITERATIONS as i, MemoryStore as l, DEFAULT_MEMORY_CHAR_LIMIT as n, apply as o, DEFAULT_NUDGE_INTERVAL as r, inject as s, Config as t };
+export { DEFAULT_USER_CHAR_LIMIT as a, name as c, DEFAULT_REVIEW_MAX_ITERATIONS as i, memoryReviewNotices as l, DEFAULT_MEMORY_CHAR_LIMIT as n, apply as o, DEFAULT_NUDGE_INTERVAL as r, inject as s, Config as t, MemoryStore as u };
 
-//# sourceMappingURL=src-CmaoCkCf.js.map
+//# sourceMappingURL=src-CN2TttgI.js.map

@@ -130,8 +130,35 @@ describe('runMemoryReview', () => {
       maxIterations: 16,
       signal: new AbortController().signal,
     })
-    expect(outcome).toMatchObject({ iterations: 2, saved: 1, reason: 'finished' })
-    expect(store.entriesFor('user')).toEqual(['Works night shift'])
+    expect(outcome).toMatchObject({
+      iterations: 2,
+      saved: 1,
+      changes: [{ target: 'user', action: 'added', content: 'Works night shift' }],
+      reason: 'finished',
+    })
+    expect(store.entriesWithMeta('user').map(entry => entry.content)).toEqual(['Works night shift'])
+  })
+
+  it('reports committed final deltas instead of duplicate model proposals', async () => {
+    const store = await freshStore()
+    const c = await setup(new ScriptedAdapter([
+      toolCallResponse('c1', 'memory', { action: 'add', target: 'memory', content: 'Old convention' }),
+      toolCallResponse('c2', 'memory', { action: 'operations', target: 'memory', operations: [
+        { action: 'replace', old_text: 'Old convention', content: 'Compact convention' },
+        { action: 'add', content: 'Compact convention' },
+      ] }),
+      textResponse('Nothing to save.'),
+    ]))
+    const outcome = await runMemoryReview(c, {
+      session: session(), store, route: { provider: 'mock', model: 'mock-model' },
+      maxIterations: 16, signal: new AbortController().signal,
+    })
+    expect(outcome.changes).toEqual([
+      { target: 'memory', action: 'added', content: 'Old convention' },
+      { target: 'memory', action: 'removed', content: 'Old convention' },
+      { target: 'memory', action: 'added', content: 'Compact convention' },
+    ])
+    expect(store.entriesWithMeta('memory').map(entry => entry.content)).toEqual(['Compact convention'])
   })
 
   it('replays the parent system prompt and history before the directive', async () => {

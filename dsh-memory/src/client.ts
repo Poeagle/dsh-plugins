@@ -30,9 +30,21 @@ interface MemoryConfigResponse {
   value?: { nudgeInterval: number; reviewEnabled: boolean }
 }
 
+interface MemoryReviewNotice {
+  sessionId: string
+  saved: number
+  changes: readonly { target: 'memory' | 'user'; action: 'added' | 'removed'; content: string }[]
+  reason: 'finished' | 'max-iterations' | 'aborted' | 'failed'
+}
+
 interface MemoryResetResponse {
   ok: boolean
   deleted?: string[]
+}
+
+interface MemoryReviewNoticeResponse {
+  ok: boolean
+  value?: MemoryReviewNotice | null
 }
 
 const MEMORY_ROUTE = '/memory/api'
@@ -49,6 +61,14 @@ const formatTime = (iso: string): string => {
     const d = new Date(iso)
     return d.toLocaleString('zh-CN', { hour12: false })
   } catch { return iso }
+}
+
+const consumeReviewNotice = async (sessionId: string): Promise<MemoryReviewNotice | null> => {
+  try {
+    const response = await fetch(`${MEMORY_ROUTE}/review-notice?sessionId=${encodeURIComponent(sessionId)}`)
+    const body = await response.json() as MemoryReviewNoticeResponse
+    return body.ok ? body.value ?? null : null
+  } catch { return null }
 }
 
 const fetchStatus = async (): Promise<MemoryStatus | null> => {
@@ -497,6 +517,90 @@ function MemorySettingsCard(_props: Record<string, unknown>) {
   )
 }
 
+// ── Background-review notice ────────────────────────────────────────────
+
+function MemoryReviewNotice({ sessionId }: { sessionId: string }) {
+  const [notice, setNotice] = React.useState<MemoryReviewNotice | undefined>(undefined)
+  const [expanded, setExpanded] = React.useState(false)
+  React.useEffect(() => {
+    let disposed = false
+    setNotice(undefined)
+    const read = (): void => {
+      void consumeReviewNotice(sessionId).then((next) => {
+        if (!disposed && next !== null) setNotice(next)
+      })
+    }
+    read()
+    const interval = setInterval(read, 2000)
+    return () => { disposed = true; clearInterval(interval) }
+  }, [sessionId])
+  React.useEffect(() => { setExpanded(false) }, [notice])
+  if (notice === undefined) return null
+  const summary = `后台复核 · 已保存 ${notice.changes.length} 项变更`
+  const toggle = (): void => { setExpanded(value => !value) }
+  return React.createElement('div', {
+    style: { borderBottom: '1px solid var(--dsw-alias-border-l2)', marginBottom: 4 },
+  },
+  React.createElement('div', {
+    style: {
+      display: 'flex', alignItems: 'center', gap: 8, padding: '6px 0',
+      fontSize: 13, lineHeight: '20px', color: 'var(--dsw-alias-label-primary)',
+      cursor: 'pointer', userSelect: 'none',
+    },
+    role: 'button', tabIndex: 0, 'aria-expanded': expanded,
+    onClick: toggle,
+    onKeyDown: (event: any) => {
+      if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); toggle() }
+    },
+  },
+  React.createElement('span', {
+    style: {
+      width: 8, height: 8, borderRadius: '50%', flexShrink: 0,
+      background: 'var(--dsw-alias-color-success, #22c55e)',
+    },
+  }),
+  React.createElement('span', {
+    style: {
+      fontSize: 10, color: 'var(--dsw-alias-label-tertiary)', flexShrink: 0,
+      transform: expanded ? 'rotate(180deg)' : 'rotate(0deg)', transition: 'transform 0.15s',
+    },
+  }, expanded ? '▾' : '▸'),
+  React.createElement('span', { style: { fontSize: 12, flexShrink: 0, marginRight: 2 } }, '📝'),
+  React.createElement('span', { style: { fontWeight: 500, flexShrink: 0 } }, '记忆'),
+  React.createElement('span', {
+    style: {
+      flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis',
+      whiteSpace: 'nowrap', color: 'var(--dsw-alias-label-secondary)', fontSize: 12,
+    },
+  }, summary),
+  ),
+  expanded ? React.createElement('div', {
+    style: {
+      margin: '0 0 8px 16px', padding: 8, border: '1px solid var(--dsw-alias-border-l2)',
+      borderRadius: 6, background: 'var(--dsw-alias-bg-layer-2)', fontSize: 12, lineHeight: '1.5',
+      display: 'grid', gap: 6,
+    },
+  },
+  React.createElement('div', {
+    style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)', fontWeight: 600 },
+  }, 'OUT · 已持久化变更'),
+  notice.changes.map((change, index) => React.createElement('div', {
+    key: `${index}-${change.target}-${change.action}-${change.content}`,
+    style: {
+      display: 'grid', gridTemplateColumns: 'auto auto 1fr', gap: 6, alignItems: 'start',
+      padding: '6px 8px', background: 'var(--dsw-alias-bg-layer-3)', borderRadius: 4,
+      whiteSpace: 'pre-wrap', wordBreak: 'break-word', color: 'var(--dsw-alias-label-primary)',
+    },
+  },
+  React.createElement('span', { style: { color: 'var(--dsw-alias-label-tertiary)', fontSize: 11 } }, change.target === 'user' ? 'USER' : 'MEMORY'),
+  React.createElement('span', {
+    style: { color: change.action === 'added' ? 'var(--dsw-alias-color-success, #22c55e)' : 'var(--dsw-alias-label-error)', fontWeight: 600 },
+  }, change.action === 'added' ? '＋' : '−'),
+  React.createElement('span', null, change.content),
+  )),
+  ) : null)
+}
+
 // ── Dock indicator (memory usage under composer) ────────────────────────
 
 function MemoryDock(_props: { sessionId: string }) {
@@ -593,7 +697,7 @@ function MemoryDock(_props: { sessionId: string }) {
   }
 
   if (!status) return null
-  return React.createElement(React.Fragment, null,
+  return React.createElement('div', { style: { display: 'contents' } },
     // Dock text (clickable)
     React.createElement('div', {
       style: {
@@ -743,7 +847,6 @@ function MemoryDock(_props: { sessionId: string }) {
 export async function apply(ctx: Context) {
   const slots = ctx.get('slots') as SlotsFace | undefined
   if (!slots) return
-
   // 1. Register the memory toolview (custom row for memory tool calls)
   slots.inject('tool.call.toolview', () => slots.register(
     { name: 'tool.call.toolview', key: 'memory' },
@@ -755,7 +858,13 @@ export async function apply(ctx: Context) {
     name: 'settings.plugin.item', key: 'memory', id: 'memory', order: 40,
   }, MemorySettingsCard))
 
-  // 3. Register the dock indicator
+  // 3. Show one transient, source-session-only review receipt above the composer.
+  slots.inject('conversation.input.dock', () => slots.register(
+    { name: 'conversation.input.dock', id: 'memory-review', order: 30 },
+    (props: { sessionId: string }) => React.createElement(MemoryReviewNotice, props),
+  ))
+
+  // 4. Register the dock indicator
   slots.inject('conversation.composer.dock', () => slots.register(
     { name: 'conversation.composer.dock', id: 'memory-indicator', order: 200 },
     (props: { sessionId: string }) => React.createElement(MemoryDock, { ...props }),

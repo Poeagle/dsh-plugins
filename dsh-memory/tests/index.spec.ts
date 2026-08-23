@@ -16,6 +16,7 @@ import { Session, SessionId, SessionStore, type SessionEvent } from '@deepseek-a
 import SystemPrompt, { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 import * as memory from '../src/index.ts'
+import { memoryReviewNotices } from '../src/review-notices.ts'
 
 const SIGNAL = new AbortController().signal
 
@@ -343,6 +344,29 @@ describe('nudge gating', () => {
 })
 
 describe('background review spawning', () => {
+  it('emits one transient receipt for committed background-review changes', async () => {
+    const c = await mount({ nudgeInterval: 1 })
+    const adapter = new ScriptedAdapter([
+      toolCallResponse('c1', 'memory', { action: 'add', target: 'memory', content: 'Background fact' }),
+      textResponse('Nothing to save.'),
+    ])
+    c.llm.registerAdapter(['mock'], adapter)
+    const session = sessionWithRoute(c, 'review-notice')
+    session.append('turn/start', { turn: 1 })
+    appendUserMessage(session, 'Remember this')
+    session.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+    await vi.waitFor(() => {
+      expect(memoryReviewNotices.consume(String(session.id))).toEqual({
+        sessionId: String(session.id),
+        saved: 1,
+        changes: [{ target: 'memory', action: 'added', content: 'Background fact' }],
+        reason: 'finished',
+      })
+    })
+    expect(memoryReviewNotices.consume(String(session.id))).toBeUndefined()
+    expect(session.events).not.toContainEqual(expect.objectContaining({ type: 'memory/review-updated' }))
+  })
+
   it('saves entries the forked review writes', async () => {
     const c = await mount({ nudgeInterval: 1 })
     const adapter = new ScriptedAdapter([

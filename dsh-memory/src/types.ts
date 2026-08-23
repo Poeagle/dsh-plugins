@@ -67,6 +67,28 @@ export interface MemoryEntryMeta {
   readonly timestamp: string
 }
 
+/** One persisted entry change produced by a completed background review. */
+export interface MemoryReviewChange {
+  /** Store whose committed entry changed. */
+  readonly target: MemoryTarget
+  /** The persisted operation observed after the write committed. */
+  readonly action: 'added' | 'removed'
+  /** Entry content after an addition, or before a removal. */
+  readonly content: string
+}
+
+/** Transient, source-session-only summary of one completed background review. */
+export interface MemoryReviewNotification {
+  /** Session whose completed turn triggered the review. */
+  readonly sessionId: string
+  /** Number of review tool calls that committed at least one store change. */
+  readonly saved: number
+  /** All committed entry-level additions and removals, in execution order. */
+  readonly changes: readonly MemoryReviewChange[]
+  /** Terminal state of the review after the committed changes. */
+  readonly reason: 'finished' | 'max-iterations' | 'aborted' | 'failed'
+}
+
 /** Configurable memory settings exposed to the settings UI. */
 export interface MemorySettings {
   /** Completed user turns between background memory reviews; 0 disables reviews. */

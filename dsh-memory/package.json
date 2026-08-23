@@ -12,12 +12,7 @@
     "./package.json": "./package.json"
   },
   "files": [
-    "lib/index.js",
-    "lib/index.js.map",
-    "lib/client.js",
-    "lib/client.js.map",
-    "lib/settings.js",
-    "lib/settings.js.map",
+    "lib",
     "cordis.patch.yml",
     "README.md",
     "README.zh.md",
