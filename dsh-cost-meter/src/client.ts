@@ -288,14 +288,7 @@ function PricingSettingsCard(props: {
   let invalid: string | null = null
   try { validatePricing(draft) } catch (error) { invalid = error instanceof Error ? error.message : String(error) }
   const setDefaultRates = (rates: Partial<TokenRates>) => setDraft({ ...draft, default: { ...draft.default, rates: rates as TokenRates } })
-  const catalogRoutes = new Set(catalog.groups.flatMap(group => group.models.map(model => `${group.id}/${model.id}`)))
-  const unavailableGroups: ModelGroup[] = Object.keys(draft.models)
-    .filter(key => !catalogRoutes.has(key))
-    .map((key) => {
-      const slash = key.indexOf('/')
-      return { id: key.slice(0, slash), name: '当前不可用', models: [{ id: key.slice(slash + 1), name: key.slice(slash + 1) }] }
-    })
-  const displayGroups = [...catalog.groups, ...unavailableGroups]
+  const displayGroups = catalog.groups
   const save = async () => {
     if (invalid || !dirty) return
     setSaving(true)

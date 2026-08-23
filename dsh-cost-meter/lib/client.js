@@ -500,6 +500,9 @@ window.__ModuleLoader__.load({
 				settings.value,
 				seedRevision
 			]);
+			react.default.useEffect(() => {
+				if (open) props.refreshCatalog();
+			}, [open, props.refreshCatalog]);
 			if (settings.status === "unavailable") return null;
 			const baseline = cloneConfig(settings.value);
 			const dirty = JSON.stringify(draft) !== JSON.stringify(baseline);
@@ -516,19 +519,7 @@ window.__ModuleLoader__.load({
 					rates
 				}
 			});
-			const catalogRoutes = new Set(catalog.groups.flatMap((group) => group.models.map((model) => `${group.id}/${model.id}`)));
-			const unavailableGroups = Object.keys(draft.models).filter((key) => !catalogRoutes.has(key)).map((key) => {
-				const slash = key.indexOf("/");
-				return {
-					id: key.slice(0, slash),
-					name: "当前不可用",
-					models: [{
-						id: key.slice(slash + 1),
-						name: key.slice(slash + 1)
-					}]
-				};
-			});
-			const displayGroups = [...catalog.groups, ...unavailableGroups];
+			const displayGroups = catalog.groups;
 			const save = async () => {
 				if (invalid || !dirty) return;
 				setSaving(true);
@@ -1220,6 +1211,7 @@ window.__ModuleLoader__.load({
 						pricing,
 						catalog
 					},
+					refreshCatalog: catalog.load,
 					save: (config) => pricing.save(config)
 				})
 			}, PricingSettingsCard));
