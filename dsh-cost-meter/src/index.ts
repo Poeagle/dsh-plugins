@@ -34,6 +34,7 @@ export {
   queryHourlyOverview,
   querySessionRows,
   sessionRoutes,
+  sharedContextSurcharge,
   sessionTotalTokens,
   sortSessionRows,
   sumHourlySlices,

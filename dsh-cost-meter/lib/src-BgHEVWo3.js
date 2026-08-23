@@ -1587,6 +1587,25 @@ function groupHourlyEntries(entries) {
 function queryHourlyOverview(rows, filter) {
 	return groupHourlyEntries(filterHourlyEntries(flattenHourlyEntries(rows), filter));
 }
+/**
+* Collapse one or more hourly slices to a single surcharge label.
+* Mixed multipliers, including a mix of charged and uncharged requests,
+* return null so the UI does not claim the whole group was doubled.
+*/
+function sharedContextSurcharge(rows) {
+	const first = rows[0];
+	if (first === void 0) return null;
+	const multiplier = first.contextMultiplier ?? 1;
+	const afterTokens = first.contextAfterTokens ?? null;
+	for (const row of rows) {
+		if ((row.contextMultiplier ?? 1) !== multiplier) return null;
+		if ((row.contextAfterTokens ?? null) !== afterTokens) return null;
+	}
+	return {
+		afterTokens,
+		multiplier
+	};
+}
 //#endregion
 //#region src/index.ts
 const ratesSchema = Schema.object({
@@ -1764,4 +1783,4 @@ var CostMeterService = class extends TypertRemoteService {
 	}
 };
 //#endregion
-export { routeKey as A, foldSession as C, resolveContextMultiplier as D, normalizeUsage as E, resolveContextSurcharge as O, contextTokensOf as S, formatTokenThreshold as T, toggleSessionTableSort as _, filterSessionRows as a, pricingFingerprint as b, localDateOfHour as c, queryHourlyOverview as d, querySessionRows as f, sumHourlySlices as g, sortSessionRows as h, filterHourlyEntries as i, validatePricing as j, resolvePricing as k, mapWithConcurrency as l, sessionTotalTokens as m, CostMeterService as n, flattenHourlyEntries as o, sessionRoutes as p, collectSessionCosts as r, groupHourlyEntries as s, Config as t, mergeListedSessionCost as u, SessionFoldCache as v, formatContextSurcharge as w, DEFAULT_PRICING as x, logFingerprint as y };
+export { resolvePricing as A, contextTokensOf as C, normalizeUsage as D, formatTokenThreshold as E, validatePricing as M, resolveContextMultiplier as O, DEFAULT_PRICING as S, formatContextSurcharge as T, sumHourlySlices as _, filterSessionRows as a, logFingerprint as b, localDateOfHour as c, queryHourlyOverview as d, querySessionRows as f, sortSessionRows as g, sharedContextSurcharge as h, filterHourlyEntries as i, routeKey as j, resolveContextSurcharge as k, mapWithConcurrency as l, sessionTotalTokens as m, CostMeterService as n, flattenHourlyEntries as o, sessionRoutes as p, collectSessionCosts as r, groupHourlyEntries as s, Config as t, mergeListedSessionCost as u, toggleSessionTableSort as v, foldSession as w, pricingFingerprint as x, SessionFoldCache as y };

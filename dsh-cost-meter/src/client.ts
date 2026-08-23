@@ -10,6 +10,7 @@ import {
   mergeListedSessionCost,
   queryHourlyOverview,
   sessionRoutes,
+  sharedContextSurcharge,
   sumHourlySlices,
   type HourlyOverviewFilter,
   type HourlySlice,
@@ -236,6 +237,10 @@ const inputStyle: React.CSSProperties = { height: 32, minWidth: 0, border: '1px 
 const buttonStyle: React.CSSProperties = { border: '1px solid var(--dsw-alias-border-l2)', borderRadius: 6, padding: '5px 10px', background: 'transparent', color: 'var(--dsw-alias-label-secondary)', font: 'inherit', fontSize: 12, cursor: 'pointer' }
 const primaryButtonStyle: React.CSSProperties = { ...buttonStyle, background: 'var(--dsw-alias-label-primary)', color: 'var(--dsw-alias-bg-layer-3)' }
 const surchargeLabel = (afterTokens: number | null | undefined, multiplier: number | null | undefined): string => formatContextSurcharge(afterTokens, multiplier) ?? '-'
+const surchargeOf = (rows: ReadonlyArray<{ contextAfterTokens?: number | null; contextMultiplier?: number | null }>): string => {
+  const shared = sharedContextSurcharge(rows)
+  return shared === null ? '-' : surchargeLabel(shared.afterTokens, shared.multiplier)
+}
 const RATE_FIELDS: Array<{ key: keyof TokenRates; label: string }> = [
   { key: 'input', label: '未缓存输入' },
   { key: 'cacheRead', label: '缓存读取' },
@@ -448,6 +453,7 @@ function HourlyTable(props: {
   headerLeft: React.CSSProperties
 }) {
   const routeOf = (row: HourlyDetail): string => `${row.provider ?? ''}/${row.model ?? ''}`
+  const surchargeKeyOf = (row: HourlyDetail): string => `${row.contextMultiplier ?? 1}|${row.contextAfterTokens ?? ''}`
   const flatten = (rows: readonly CostSubagent[]): Array<{ sessionId: string; entry: HourlyDetail }> => rows.flatMap(row => [
     ...(row.hourly ?? []).map(entry => ({ sessionId: row.sessionId, entry })),
     ...flatten(row.children),
@@ -530,33 +536,39 @@ function HourlyTable(props: {
         const timeRow = React.createElement('tr', { key: timeKey, style: { borderBottom: '1px solid var(--dsw-alias-border-l2, #eee)', fontWeight: 600 } },
           React.createElement('td', { style: props.cellLeft }, React.createElement('button', { type: 'button', 'aria-expanded': timeExpanded, onClick: () => props.toggleHour(timeKey), style: { border: 0, background: 'transparent', cursor: 'pointer', padding: '0 6px 0 0', fontSize: 13, color: 'inherit' } }, timeExpanded ? '−' : '+'), total.hourLabel),
           ...dataCells(total),
-          React.createElement('td', { style: props.cellBase }, surchargeLabel(hourRows.length === 1 ? hourRows[0]?.contextAfterTokens : null, hourRows.length === 1 ? hourRows[0]?.contextMultiplier : undefined)),
+          React.createElement('td', { style: props.cellBase }, surchargeOf(hourRows)),
           React.createElement('td', { style: props.cellBase }, '-'),
           React.createElement('td', { style: props.cellBase }, `${routes.length} 个模型`),
         )
         if (!timeExpanded) return [timeRow]
         return [timeRow, ...routes.flatMap(route => {
           const entries = hourRows.filter(row => routeOf(row) === route)
-          const modelTotal = sumRows(entries)
-          if (modelTotal === null) return []
-          const modelKey = `${props.sessionId}:model:${hour}:${route}`
-          const modelExpanded = props.expandedHours.has(modelKey)
           const children = hourChildren.filter(row => routeOf(row.entry) === route)
-          const modelRow = React.createElement('tr', { key: modelKey, style: { borderBottom: '1px solid var(--dsw-alias-border-l2, #eee)', background: 'var(--dsw-alias-bg-layer-2, #fafafa)' } },
-            React.createElement('td', { style: { ...props.cellLeft, paddingLeft: 28 } }, children.length > 0 ? React.createElement('button', { type: 'button', 'aria-expanded': modelExpanded, onClick: () => props.toggleHour(modelKey), style: { border: 0, background: 'transparent', cursor: 'pointer', padding: '0 6px 0 0', fontSize: 13, color: 'inherit' } }, modelExpanded ? '−' : '+') : React.createElement('span', { style: { display: 'inline-block', width: 19 } }), `↳ ${route}`),
-            ...dataCells(modelTotal),
-            React.createElement('td', { style: props.cellBase }, surchargeLabel(entries.length === 1 ? entries[0]?.contextAfterTokens : null, entries.length === 1 ? entries[0]?.contextMultiplier : undefined)),
-            React.createElement('td', { style: props.cellBase }, '-'),
-            React.createElement('td', { style: props.cellBase }, route),
-          )
-          if (!modelExpanded) return [modelRow]
-          return [modelRow, ...children.map(({ sessionId, entry }) => React.createElement('tr', { key: `${props.sessionId}:child:${hour}:${route}:${sessionId}`, style: { borderBottom: '1px solid var(--dsw-alias-border-l2, #eee)', color: 'var(--dsw-alias-label-secondary)' } },
-            React.createElement('td', { style: { ...props.cellLeft, paddingLeft: 52 } }, `↳ 子代理 ${sessionId.slice(0, 8)}`),
-            ...dataCells(entry),
-            React.createElement('td', { style: props.cellBase }, surchargeLabel(entry.contextAfterTokens, entry.contextMultiplier)),
-            React.createElement('td', { style: props.cellBase }, entry.periodName ?? '-'),
-            React.createElement('td', { style: props.cellBase }, `${entry.provider ?? '?'}/${entry.model ?? '?'}`),
-          ))]
+          const surchargeKeys = [...new Set(entries.map(surchargeKeyOf))].sort()
+          return surchargeKeys.flatMap(surchargeKey => {
+            const charged = entries.filter(row => surchargeKeyOf(row) === surchargeKey)
+            const modelTotal = sumRows(charged)
+            if (modelTotal === null) return []
+            const sample = charged[0]
+            const modelKey = `${props.sessionId}:model:${hour}:${route}:${surchargeKey}`
+            const modelExpanded = props.expandedHours.has(modelKey)
+            const chargedChildren = children.filter(row => surchargeKeyOf(row.entry) === surchargeKey)
+            const modelRow = React.createElement('tr', { key: modelKey, style: { borderBottom: '1px solid var(--dsw-alias-border-l2, #eee)', background: 'var(--dsw-alias-bg-layer-2, #fafafa)' } },
+              React.createElement('td', { style: { ...props.cellLeft, paddingLeft: 28 } }, chargedChildren.length > 0 ? React.createElement('button', { type: 'button', 'aria-expanded': modelExpanded, onClick: () => props.toggleHour(modelKey), style: { border: 0, background: 'transparent', cursor: 'pointer', padding: '0 6px 0 0', fontSize: 13, color: 'inherit' } }, modelExpanded ? '−' : '+') : React.createElement('span', { style: { display: 'inline-block', width: 19 } }), `↳ ${route}`),
+              ...dataCells(modelTotal),
+              React.createElement('td', { style: props.cellBase }, surchargeOf(charged)),
+              React.createElement('td', { style: props.cellBase }, sample?.periodName ?? '-'),
+              React.createElement('td', { style: props.cellBase }, route),
+            )
+            if (!modelExpanded) return [modelRow]
+            return [modelRow, ...chargedChildren.map(({ sessionId, entry }) => React.createElement('tr', { key: `${props.sessionId}:child:${hour}:${route}:${surchargeKey}:${sessionId}`, style: { borderBottom: '1px solid var(--dsw-alias-border-l2, #eee)', color: 'var(--dsw-alias-label-secondary)' } },
+              React.createElement('td', { style: { ...props.cellLeft, paddingLeft: 52 } }, `↳ 子代理 ${sessionId.slice(0, 8)}`),
+              ...dataCells(entry),
+              React.createElement('td', { style: props.cellBase }, surchargeLabel(entry.contextAfterTokens, entry.contextMultiplier)),
+              React.createElement('td', { style: props.cellBase }, entry.periodName ?? '-'),
+              React.createElement('td', { style: props.cellBase }, `${entry.provider ?? '?'}/${entry.model ?? '?'}`),
+            ))]
+          })
         })]
       }),
       totals ? React.createElement('tr', { style: { fontWeight: 600, borderTop: '2px solid var(--dsw-alias-border-l1, #bbb)' } },
@@ -806,7 +818,7 @@ function CostDock(props: { sessionId: string; costMeter: CostMeterFace; sessions
                   const timeRow = React.createElement('tr', { key: timeKey, style: { borderBottom: '1px solid var(--dsw-alias-border-l2, #eee)', fontWeight: 600 } },
                     React.createElement('td', { style: cellLeft }, React.createElement('button', { type: 'button', 'aria-expanded': expanded, onClick: () => toggleHour(timeKey), style: { border: 0, background: 'transparent', cursor: 'pointer', padding: '0 6px 0 0', fontSize: 13, color: 'inherit' } }, expanded ? '−' : '+'), `${localDateOfHour(group.hour)} ${group.hourLabel}`),
                     ...hourlyDataCells(group.totals),
-                    React.createElement('td', { style: cellBase }, surchargeLabel(group.sessions.length === 1 ? group.sessions[0]?.entry.contextAfterTokens : null, group.sessions.length === 1 ? group.sessions[0]?.entry.contextMultiplier : undefined)),
+                    React.createElement('td', { style: cellBase }, surchargeOf(group.sessions.map(item => item.entry))),
                     React.createElement('td', { style: cellBase }, `${group.sessions.length} 个会话`),
                     React.createElement('td', { style: cellBase }, routes.length === 0 ? '-' : `${routes.length} 个模型`),
                   )

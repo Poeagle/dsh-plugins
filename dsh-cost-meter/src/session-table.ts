@@ -356,3 +356,25 @@ export function queryHourlyOverview(
 ): HourlyOverviewGroup[] {
   return groupHourlyEntries(filterHourlyEntries(flattenHourlyEntries(rows), filter))
 }
+
+export interface ContextSurchargeLabel {
+  afterTokens: number | null
+  multiplier: number
+}
+
+/**
+ * Collapse one or more hourly slices to a single surcharge label.
+ * Mixed multipliers, including a mix of charged and uncharged requests,
+ * return null so the UI does not claim the whole group was doubled.
+ */
+export function sharedContextSurcharge(rows: ReadonlyArray<{ contextAfterTokens?: number | null; contextMultiplier?: number | null }>): ContextSurchargeLabel | null {
+  const first = rows[0]
+  if (first === undefined) return null
+  const multiplier = first.contextMultiplier ?? 1
+  const afterTokens = first.contextAfterTokens ?? null
+  for (const row of rows) {
+    if ((row.contextMultiplier ?? 1) !== multiplier) return null
+    if ((row.contextAfterTokens ?? null) !== afterTokens) return null
+  }
+  return { afterTokens, multiplier }
+}

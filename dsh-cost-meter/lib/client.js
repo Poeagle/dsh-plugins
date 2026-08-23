@@ -305,6 +305,25 @@ window.__ModuleLoader__.load({
 		function queryHourlyOverview(rows, filter) {
 			return groupHourlyEntries(filterHourlyEntries(flattenHourlyEntries(rows), filter));
 		}
+		/**
+		* Collapse one or more hourly slices to a single surcharge label.
+		* Mixed multipliers, including a mix of charged and uncharged requests,
+		* return null so the UI does not claim the whole group was doubled.
+		*/
+		function sharedContextSurcharge(rows) {
+			const first = rows[0];
+			if (first === void 0) return null;
+			const multiplier = first.contextMultiplier ?? 1;
+			const afterTokens = first.contextAfterTokens ?? null;
+			for (const row of rows) {
+				if ((row.contextMultiplier ?? 1) !== multiplier) return null;
+				if ((row.contextAfterTokens ?? null) !== afterTokens) return null;
+			}
+			return {
+				afterTokens,
+				multiplier
+			};
+		}
 		//#endregion
 		//#region src/client.ts
 		const inject = [
@@ -481,6 +500,10 @@ window.__ModuleLoader__.load({
 			color: "var(--dsw-alias-bg-layer-3)"
 		};
 		const surchargeLabel = (afterTokens, multiplier) => formatContextSurcharge(afterTokens, multiplier) ?? "-";
+		const surchargeOf = (rows) => {
+			const shared = sharedContextSurcharge(rows);
+			return shared === null ? "-" : surchargeLabel(shared.afterTokens, shared.multiplier);
+		};
 		const RATE_FIELDS = [
 			{
 				key: "input",
@@ -1010,6 +1033,7 @@ window.__ModuleLoader__.load({
 		};
 		function HourlyTable(props) {
 			const routeOf = (row) => `${row.provider ?? ""}/${row.model ?? ""}`;
+			const surchargeKeyOf = (row) => `${row.contextMultiplier ?? 1}|${row.contextAfterTokens ?? ""}`;
 			const flatten = (rows) => rows.flatMap((row) => [...(row.hourly ?? []).map((entry) => ({
 				sessionId: row.sessionId,
 				entry
@@ -1094,51 +1118,56 @@ window.__ModuleLoader__.load({
 						fontSize: 13,
 						color: "inherit"
 					}
-				}, timeExpanded ? "−" : "+"), total.hourLabel), ...dataCells(total), react.default.createElement("td", { style: props.cellBase }, surchargeLabel(hourRows.length === 1 ? hourRows[0]?.contextAfterTokens : null, hourRows.length === 1 ? hourRows[0]?.contextMultiplier : void 0)), react.default.createElement("td", { style: props.cellBase }, "-"), react.default.createElement("td", { style: props.cellBase }, `${routes.length} 个模型`));
+				}, timeExpanded ? "−" : "+"), total.hourLabel), ...dataCells(total), react.default.createElement("td", { style: props.cellBase }, surchargeOf(hourRows)), react.default.createElement("td", { style: props.cellBase }, "-"), react.default.createElement("td", { style: props.cellBase }, `${routes.length} 个模型`));
 				if (!timeExpanded) return [timeRow];
 				return [timeRow, ...routes.flatMap((route) => {
 					const entries = hourRows.filter((row) => routeOf(row) === route);
-					const modelTotal = sumRows(entries);
-					if (modelTotal === null) return [];
-					const modelKey = `${props.sessionId}:model:${hour}:${route}`;
-					const modelExpanded = props.expandedHours.has(modelKey);
 					const children = hourChildren.filter((row) => routeOf(row.entry) === route);
-					const modelRow = react.default.createElement("tr", {
-						key: modelKey,
-						style: {
-							borderBottom: "1px solid var(--dsw-alias-border-l2, #eee)",
-							background: "var(--dsw-alias-bg-layer-2, #fafafa)"
-						}
-					}, react.default.createElement("td", { style: {
-						...props.cellLeft,
-						paddingLeft: 28
-					} }, children.length > 0 ? react.default.createElement("button", {
-						type: "button",
-						"aria-expanded": modelExpanded,
-						onClick: () => props.toggleHour(modelKey),
-						style: {
-							border: 0,
-							background: "transparent",
-							cursor: "pointer",
-							padding: "0 6px 0 0",
-							fontSize: 13,
-							color: "inherit"
-						}
-					}, modelExpanded ? "−" : "+") : react.default.createElement("span", { style: {
-						display: "inline-block",
-						width: 19
-					} }), `↳ ${route}`), ...dataCells(modelTotal), react.default.createElement("td", { style: props.cellBase }, surchargeLabel(entries.length === 1 ? entries[0]?.contextAfterTokens : null, entries.length === 1 ? entries[0]?.contextMultiplier : void 0)), react.default.createElement("td", { style: props.cellBase }, "-"), react.default.createElement("td", { style: props.cellBase }, route));
-					if (!modelExpanded) return [modelRow];
-					return [modelRow, ...children.map(({ sessionId, entry }) => react.default.createElement("tr", {
-						key: `${props.sessionId}:child:${hour}:${route}:${sessionId}`,
-						style: {
-							borderBottom: "1px solid var(--dsw-alias-border-l2, #eee)",
-							color: "var(--dsw-alias-label-secondary)"
-						}
-					}, react.default.createElement("td", { style: {
-						...props.cellLeft,
-						paddingLeft: 52
-					} }, `↳ 子代理 ${sessionId.slice(0, 8)}`), ...dataCells(entry), react.default.createElement("td", { style: props.cellBase }, surchargeLabel(entry.contextAfterTokens, entry.contextMultiplier)), react.default.createElement("td", { style: props.cellBase }, entry.periodName ?? "-"), react.default.createElement("td", { style: props.cellBase }, `${entry.provider ?? "?"}/${entry.model ?? "?"}`)))];
+					return [...new Set(entries.map(surchargeKeyOf))].sort().flatMap((surchargeKey) => {
+						const charged = entries.filter((row) => surchargeKeyOf(row) === surchargeKey);
+						const modelTotal = sumRows(charged);
+						if (modelTotal === null) return [];
+						const sample = charged[0];
+						const modelKey = `${props.sessionId}:model:${hour}:${route}:${surchargeKey}`;
+						const modelExpanded = props.expandedHours.has(modelKey);
+						const chargedChildren = children.filter((row) => surchargeKeyOf(row.entry) === surchargeKey);
+						const modelRow = react.default.createElement("tr", {
+							key: modelKey,
+							style: {
+								borderBottom: "1px solid var(--dsw-alias-border-l2, #eee)",
+								background: "var(--dsw-alias-bg-layer-2, #fafafa)"
+							}
+						}, react.default.createElement("td", { style: {
+							...props.cellLeft,
+							paddingLeft: 28
+						} }, chargedChildren.length > 0 ? react.default.createElement("button", {
+							type: "button",
+							"aria-expanded": modelExpanded,
+							onClick: () => props.toggleHour(modelKey),
+							style: {
+								border: 0,
+								background: "transparent",
+								cursor: "pointer",
+								padding: "0 6px 0 0",
+								fontSize: 13,
+								color: "inherit"
+							}
+						}, modelExpanded ? "−" : "+") : react.default.createElement("span", { style: {
+							display: "inline-block",
+							width: 19
+						} }), `↳ ${route}`), ...dataCells(modelTotal), react.default.createElement("td", { style: props.cellBase }, surchargeOf(charged)), react.default.createElement("td", { style: props.cellBase }, sample?.periodName ?? "-"), react.default.createElement("td", { style: props.cellBase }, route));
+						if (!modelExpanded) return [modelRow];
+						return [modelRow, ...chargedChildren.map(({ sessionId, entry }) => react.default.createElement("tr", {
+							key: `${props.sessionId}:child:${hour}:${route}:${surchargeKey}:${sessionId}`,
+							style: {
+								borderBottom: "1px solid var(--dsw-alias-border-l2, #eee)",
+								color: "var(--dsw-alias-label-secondary)"
+							}
+						}, react.default.createElement("td", { style: {
+							...props.cellLeft,
+							paddingLeft: 52
+						} }, `↳ 子代理 ${sessionId.slice(0, 8)}`), ...dataCells(entry), react.default.createElement("td", { style: props.cellBase }, surchargeLabel(entry.contextAfterTokens, entry.contextMultiplier)), react.default.createElement("td", { style: props.cellBase }, entry.periodName ?? "-"), react.default.createElement("td", { style: props.cellBase }, `${entry.provider ?? "?"}/${entry.model ?? "?"}`)))];
+					});
 				})];
 			}), totals ? react.default.createElement("tr", { style: {
 				fontWeight: 600,
@@ -1615,7 +1644,7 @@ window.__ModuleLoader__.load({
 						fontSize: 13,
 						color: "inherit"
 					}
-				}, expanded ? "−" : "+"), `${localDateOfHour(group.hour)} ${group.hourLabel}`), ...hourlyDataCells(group.totals), react.default.createElement("td", { style: cellBase }, surchargeLabel(group.sessions.length === 1 ? group.sessions[0]?.entry.contextAfterTokens : null, group.sessions.length === 1 ? group.sessions[0]?.entry.contextMultiplier : void 0)), react.default.createElement("td", { style: cellBase }, `${group.sessions.length} 个会话`), react.default.createElement("td", { style: cellBase }, routes.length === 0 ? "-" : `${routes.length} 个模型`));
+				}, expanded ? "−" : "+"), `${localDateOfHour(group.hour)} ${group.hourLabel}`), ...hourlyDataCells(group.totals), react.default.createElement("td", { style: cellBase }, surchargeOf(group.sessions.map((item) => item.entry))), react.default.createElement("td", { style: cellBase }, `${group.sessions.length} 个会话`), react.default.createElement("td", { style: cellBase }, routes.length === 0 ? "-" : `${routes.length} 个模型`));
 				if (!expanded) return [timeRow];
 				return [timeRow, ...group.sessions.map((item) => react.default.createElement("tr", {
 					key: `${timeKey}:${item.sessionId}:${item.entry.provider ?? ""}/${item.entry.model ?? ""}`,

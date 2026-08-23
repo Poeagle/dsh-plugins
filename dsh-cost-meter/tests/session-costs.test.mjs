@@ -15,6 +15,7 @@ import {
   pricingFingerprint,
   queryHourlyOverview,
   querySessionRows,
+  sharedContextSurcharge,
   sortSessionRows,
   sumHourlySlices,
 } from '../lib/index.js'
@@ -544,6 +545,18 @@ test('flattenHourlyEntries skips buckets without an hour and keeps independent s
   assert.equal(entries.length, 1)
   assert.equal(entries[0].sessionId, 'ok')
   assert.equal(entries[0].entry.hour, morning.hour)
+})
+
+test('sharedContextSurcharge stays silent when an hour mixes charged and uncharged requests', () => {
+  assert.deepEqual(sharedContextSurcharge([
+    { contextAfterTokens: 200_000, contextMultiplier: 2 },
+    { contextAfterTokens: 200_000, contextMultiplier: 2 },
+  ]), { afterTokens: 200_000, multiplier: 2 })
+  assert.equal(sharedContextSurcharge([
+    { contextAfterTokens: null, contextMultiplier: 1 },
+    { contextAfterTokens: 200_000, contextMultiplier: 2 },
+  ]), null)
+  assert.equal(sharedContextSurcharge([]), null)
 })
 
 test('mapWithConcurrency treats empty lists and invalid limits as no-op or serial work', async () => {
