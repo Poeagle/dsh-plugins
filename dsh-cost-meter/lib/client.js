@@ -134,55 +134,145 @@ window.__ModuleLoader__.load({
 			}
 			return [...routes];
 		}
-		function sessionTotalTokens(row) {
-			return row.cost.inputTokens + row.cost.cacheReadTokens + row.cost.cacheWriteTokens + row.cost.outputTokens;
+		/** Map items with a bounded number of in-flight promises, preserving input order. */
+		async function mapWithConcurrency(items, concurrency, mapper) {
+			const limit = Math.max(1, Math.min(items.length, Math.floor(concurrency) || 1));
+			const results = new Array(items.length);
+			let next = 0;
+			const worker = async () => {
+				while (next < items.length) {
+					const index = next;
+					next += 1;
+					results[index] = await mapper(items[index], index);
+				}
+			};
+			await Promise.all(Array.from({ length: limit }, () => worker()));
+			return results;
 		}
-		/** Keep rows that match every populated filter field. */
-		function filterSessionRows(rows, filter) {
+		function emptyHourlySlice(hour = "", hourLabel = "") {
+			return {
+				hour,
+				hourLabel,
+				turns: 0,
+				steps: 0,
+				toolCalls: 0,
+				inputTokens: 0,
+				cacheReadTokens: 0,
+				cacheWriteTokens: 0,
+				outputTokens: 0,
+				inputCost: 0,
+				cacheReadCost: 0,
+				cacheWriteCost: 0,
+				outputCost: 0,
+				cost: 0,
+				cacheRate: 0,
+				model: null,
+				provider: null,
+				periodName: null
+			};
+		}
+		/** Local calendar date of an hourly ISO bucket. */
+		function localDateOfHour(hour) {
+			const date = new Date(hour);
+			if (Number.isNaN(date.getTime())) return "";
+			return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+		}
+		function hourlyRoute(entry) {
+			return routeLabel(entry.provider, entry.model);
+		}
+		function asHourlySlice(value) {
+			if (typeof value.hour !== "string" || value.hour === "") return null;
+			return {
+				hour: value.hour,
+				hourLabel: value.hourLabel ?? value.hour,
+				turns: value.turns ?? 0,
+				steps: value.steps ?? 0,
+				toolCalls: value.toolCalls ?? 0,
+				inputTokens: value.inputTokens ?? 0,
+				cacheReadTokens: value.cacheReadTokens ?? 0,
+				cacheWriteTokens: value.cacheWriteTokens ?? 0,
+				outputTokens: value.outputTokens ?? 0,
+				inputCost: value.inputCost ?? 0,
+				cacheReadCost: value.cacheReadCost ?? 0,
+				cacheWriteCost: value.cacheWriteCost ?? 0,
+				outputCost: value.outputCost ?? 0,
+				cost: value.cost ?? 0,
+				cacheRate: value.cacheRate ?? 0,
+				model: value.model ?? null,
+				provider: value.provider ?? null,
+				periodName: value.periodName ?? null
+			};
+		}
+		/** Flatten each session's own hourly buckets; parent rows do not include child sessions. */
+		function flattenHourlyEntries(rows) {
+			const entries = [];
+			for (const row of rows) for (const hourly of row.cost.hourly ?? []) {
+				const entry = asHourlySlice(hourly);
+				if (entry === null) continue;
+				entries.push({
+					sessionId: row.sessionId,
+					origin: row.origin,
+					parentSession: row.parentSession,
+					entry
+				});
+			}
+			return entries;
+		}
+		function filterHourlyEntries(entries, filter) {
 			const sessionId = filter.sessionId.trim().toLowerCase();
-			const parent = filter.parentSession.trim().toLowerCase();
-			return rows.filter((row) => {
-				if (sessionId && !row.sessionId.toLowerCase().includes(sessionId)) return false;
-				if (filter.origin && (row.origin ?? "") !== filter.origin) return false;
-				if (parent && !(row.parentSession ?? "").toLowerCase().includes(parent)) return false;
-				if (filter.route && !sessionRoutes(row).includes(filter.route)) return false;
-				if (filter.minCost !== void 0 && row.cost.cost < filter.minCost) return false;
-				if (filter.maxCost !== void 0 && row.cost.cost > filter.maxCost) return false;
+			return entries.filter((item) => {
+				if (filter.date && localDateOfHour(item.entry.hour) !== filter.date) return false;
+				if (filter.hour && item.entry.hour !== filter.hour && item.entry.hourLabel !== filter.hour) return false;
+				if (sessionId && !item.sessionId.toLowerCase().includes(sessionId)) return false;
+				if (filter.origin && (item.origin ?? "") !== filter.origin) return false;
+				const route = hourlyRoute(item.entry);
+				if (filter.route && route !== filter.route) return false;
 				return true;
 			});
 		}
-		function compareSessionRows(left, right, key) {
-			switch (key) {
-				case "sessionId": return left.sessionId.localeCompare(right.sessionId);
-				case "origin": return (left.origin ?? "").localeCompare(right.origin ?? "");
-				case "parentSession": return (left.parentSession ?? "").localeCompare(right.parentSession ?? "");
-				case "cost": return left.cost.cost - right.cost.cost;
-				case "inputTokens": return left.cost.inputTokens - right.cost.inputTokens;
-				case "cacheReadTokens": return left.cost.cacheReadTokens - right.cost.cacheReadTokens;
-				case "outputTokens": return left.cost.outputTokens - right.cost.outputTokens;
-				case "totalTokens": return sessionTotalTokens(left) - sessionTotalTokens(right);
+		function sumHourlySlices(rows, hour = "", hourLabel = "") {
+			const out = emptyHourlySlice(hour, hourLabel);
+			for (const row of rows) {
+				out.turns += row.turns;
+				out.steps += row.steps;
+				out.toolCalls += row.toolCalls;
+				out.inputTokens += row.inputTokens;
+				out.cacheReadTokens += row.cacheReadTokens;
+				out.cacheWriteTokens += row.cacheWriteTokens;
+				out.outputTokens += row.outputTokens;
+				out.inputCost += row.inputCost;
+				out.cacheReadCost += row.cacheReadCost;
+				out.cacheWriteCost += row.cacheWriteCost;
+				out.outputCost += row.outputCost;
+				out.cost += row.cost;
 			}
+			const totalTokens = out.inputTokens + out.cacheReadTokens + out.cacheWriteTokens + out.outputTokens;
+			out.cacheRate = totalTokens > 0 ? (out.cacheReadTokens + out.cacheWriteTokens) / totalTokens : 0;
+			return out;
 		}
-		/** Stable sort: equal values keep sessionId order. */
-		function sortSessionRows(rows, sort) {
-			const direction = sort.dir === "asc" ? 1 : -1;
-			return [...rows].sort((left, right) => {
-				const compared = compareSessionRows(left, right, sort.key);
-				return compared === 0 ? left.sessionId.localeCompare(right.sessionId) : compared * direction;
-			});
+		/** Group flattened hourly entries by time bucket, newest hour last. */
+		function groupHourlyEntries(entries) {
+			const groups = /* @__PURE__ */ new Map();
+			for (const item of entries) {
+				const existing = groups.get(item.entry.hour);
+				if (existing === void 0) {
+					groups.set(item.entry.hour, {
+						hour: item.entry.hour,
+						hourLabel: item.entry.hourLabel,
+						sessions: [item],
+						totals: emptyHourlySlice(item.entry.hour, item.entry.hourLabel)
+					});
+					continue;
+				}
+				existing.sessions.push(item);
+			}
+			return [...groups.values()].sort((left, right) => left.hour.localeCompare(right.hour)).map((group) => ({
+				...group,
+				totals: sumHourlySlices(group.sessions.map((item) => item.entry), group.hour, group.hourLabel)
+			}));
 		}
-		function querySessionRows(rows, filter, sort) {
-			return sortSessionRows(filterSessionRows(rows, filter), sort);
-		}
-		function toggleSessionTableSort(current, key) {
-			if (current.key === key) return {
-				key,
-				dir: current.dir === "asc" ? "desc" : "asc"
-			};
-			return {
-				key,
-				dir: key === "sessionId" || key === "origin" || key === "parentSession" ? "asc" : "desc"
-			};
+		function queryHourlyOverview(rows, filter) {
+			return groupHourlyEntries(filterHourlyEntries(flattenHourlyEntries(rows), filter));
 		}
 		//#endregion
 		//#region src/client.ts
@@ -196,21 +286,24 @@ window.__ModuleLoader__.load({
 			if (error && typeof error === "object" && "message" in error && typeof error.message === "string") return error.message;
 			return error === void 0 ? "未知错误" : String(error);
 		}
+		const SESSION_COST_CONCURRENCY = 8;
 		async function loadAllSessionCosts(costMeter, sessions) {
 			const remote = await costMeter.sessionCosts();
 			if (remote.ok && Array.isArray(remote.value)) return remote.value;
 			const listed = await sessions.list({});
 			if (!listed.result.ok || listed.result.value === void 0) throw new Error(remoteErrorText(remote.error ?? listed.result.error) || "会话费用加载失败");
-			const rows = [];
+			const unique = [];
 			const seen = /* @__PURE__ */ new Set();
 			for (const item of listed.result.value.items) {
 				if (item.sessionId === "" || seen.has(item.sessionId)) continue;
 				seen.add(item.sessionId);
-				const response = await costMeter.sessionCost(item.sessionId);
-				if (!response.ok || response.value === null || response.value === void 0) continue;
-				rows.push(mergeListedSessionCost(item, response.value));
+				unique.push(item);
 			}
-			return rows;
+			return (await mapWithConcurrency(unique, SESSION_COST_CONCURRENCY, async (item) => {
+				const response = await costMeter.sessionCost(item.sessionId);
+				if (!response.ok || response.value === null || response.value === void 0) return null;
+				return mergeListedSessionCost(item, response.value);
+			})).filter((row) => row !== null);
 		}
 		const PRICING_ROUTE = "/cost-meter/pricing";
 		/**
@@ -797,15 +890,12 @@ window.__ModuleLoader__.load({
 				onClick: save
 			}, saving ? "保存中…" : saved ? "✓ 保存成功" : "保存"))) : null);
 		}
-		const EMPTY_SESSION_FILTER = {
+		const EMPTY_HOURLY_FILTER = {
+			date: "",
+			hour: "",
 			sessionId: "",
 			origin: "",
-			parentSession: "",
 			route: ""
-		};
-		const DEFAULT_SESSION_SORT = {
-			key: "cost",
-			dir: "desc"
 		};
 		function HourlyTable(props) {
 			const routeOf = (row) => `${row.provider ?? ""}/${row.model ?? ""}`;
@@ -960,11 +1050,9 @@ window.__ModuleLoader__.load({
 			const [sessionRows, setSessionRows] = react.default.useState([]);
 			const [sessionLoadError, setSessionLoadError] = react.default.useState(null);
 			const [sessionLoading, setSessionLoading] = react.default.useState(false);
-			const [expandedSessions, setExpandedSessions] = react.default.useState(() => /* @__PURE__ */ new Set());
 			const [expandedHours, setExpandedHours] = react.default.useState(() => /* @__PURE__ */ new Set());
 			const [showAllSessions, setShowAllSessions] = react.default.useState(false);
-			const [sessionFilter, setSessionFilter] = react.default.useState(EMPTY_SESSION_FILTER);
-			const [sessionSort, setSessionSort] = react.default.useState(DEFAULT_SESSION_SORT);
+			const [hourlyFilter, setHourlyFilter] = react.default.useState(EMPTY_HOURLY_FILTER);
 			const tooltipTimerRef = react.default.useRef(null);
 			react.default.useEffect(() => {
 				const load = () => {
@@ -1050,22 +1138,29 @@ window.__ModuleLoader__.load({
 				return next;
 			});
 			const toggleHour = (id) => toggleExpanded(setExpandedHours, id);
-			const toggleSession = (id) => toggleExpanded(setExpandedSessions, id);
+			const compactId = (value) => value ? value.length > 12 ? `${value.slice(0, 8)}…` : value : "-";
+			const hourGroups = queryHourlyOverview(sessionRows, hourlyFilter);
+			const dateOptions = [...new Set(sessionRows.flatMap((row) => (row.cost.hourly ?? []).map((entry) => entry.hour ? localDateOfHour(entry.hour) : "")).filter(Boolean))].sort();
+			const hourOptions = [...new Set((hourlyFilter.date === "" ? sessionRows.flatMap((row) => row.cost.hourly ?? []) : sessionRows.flatMap((row) => row.cost.hourly ?? []).filter((entry) => entry.hour !== void 0 && localDateOfHour(entry.hour) === hourlyFilter.date)).map((entry) => entry.hourLabel ?? entry.hour).filter((value) => Boolean(value)))].sort();
 			const originOptions = [...new Set(sessionRows.map((row) => row.origin).filter((value) => Boolean(value)))].sort();
 			const routeOptions = [...new Set(sessionRows.flatMap((row) => sessionRoutes(row)))].sort();
-			const visibleRows = querySessionRows(sessionRows, sessionFilter, sessionSort);
-			const parseBound = (value) => value === "" ? void 0 : Number(value);
-			const sortMark = (key) => sessionSort.key === key ? sessionSort.dir === "asc" ? " ↑" : " ↓" : "";
-			const sortHeader = (key, label, align = "right") => react.default.createElement("th", {
-				style: {
-					...align === "left" ? headerLeft : headerStyle,
-					cursor: "pointer",
-					userSelect: "none"
-				},
-				"aria-sort": sessionSort.key === key ? sessionSort.dir === "asc" ? "ascending" : "descending" : "none",
-				onClick: () => setSessionSort((current) => toggleSessionTableSort(current, key))
-			}, `${label}${sortMark(key)}`);
-			const compactId = (value) => value ? value.length > 12 ? `${value.slice(0, 8)}…` : value : "-";
+			const overviewTotals = sumHourlySlices(hourGroups.flatMap((group) => group.sessions.map((item) => item.entry)));
+			const hourlyDataCells = (row) => [
+				react.default.createElement("td", { style: cellBase }, String(row.turns)),
+				react.default.createElement("td", { style: cellBase }, String(row.steps)),
+				react.default.createElement("td", { style: cellBase }, String(row.toolCalls)),
+				react.default.createElement("td", { style: cellBase }, row.inputTokens.toLocaleString("zh-CN")),
+				react.default.createElement("td", { style: cellBase }, `${symbol}${money(row.inputCost)}`),
+				react.default.createElement("td", { style: cellBase }, (row.cacheReadTokens + row.cacheWriteTokens).toLocaleString("zh-CN")),
+				react.default.createElement("td", { style: cellBase }, `${symbol}${money(row.cacheReadCost + row.cacheWriteCost)}`),
+				react.default.createElement("td", { style: cellBase }, row.outputTokens.toLocaleString("zh-CN")),
+				react.default.createElement("td", { style: cellBase }, `${symbol}${money(row.outputCost)}`),
+				react.default.createElement("td", { style: cellBase }, `${(row.cacheRate * 100).toFixed(1)}%`),
+				react.default.createElement("td", { style: {
+					...cellBase,
+					fontWeight: 600
+				} }, `${symbol}${money(row.cost)}`)
+			];
 			const filterInput = (value, placeholder, onChange) => react.default.createElement("input", {
 				style: {
 					...inputStyle,
@@ -1313,9 +1408,9 @@ window.__ModuleLoader__.load({
 				margin: 0,
 				fontSize: 13,
 				fontWeight: 600
-			} }, "会话费用总览"), react.default.createElement("div", { style: {
+			} }, "全部会话按时段"), react.default.createElement("div", { style: {
 				display: "grid",
-				gridTemplateColumns: "repeat(6, minmax(110px, 1fr))",
+				gridTemplateColumns: "repeat(5, minmax(110px, 1fr))",
 				gap: 8
 			} }, react.default.createElement("label", { style: {
 				display: "flex",
@@ -1323,7 +1418,26 @@ window.__ModuleLoader__.load({
 				gap: 4,
 				fontSize: 11,
 				color: "var(--dsw-alias-label-tertiary)"
-			} }, "会话 ID", filterInput(sessionFilter.sessionId, "包含…", (value) => setSessionFilter((current) => ({
+			} }, "日期", filterSelect(hourlyFilter.date, dateOptions, (value) => setHourlyFilter((current) => ({
+				...current,
+				date: value,
+				hour: ""
+			})))), react.default.createElement("label", { style: {
+				display: "flex",
+				flexDirection: "column",
+				gap: 4,
+				fontSize: 11,
+				color: "var(--dsw-alias-label-tertiary)"
+			} }, "时段", filterSelect(hourlyFilter.hour, hourOptions, (value) => setHourlyFilter((current) => ({
+				...current,
+				hour: value
+			})))), react.default.createElement("label", { style: {
+				display: "flex",
+				flexDirection: "column",
+				gap: 4,
+				fontSize: 11,
+				color: "var(--dsw-alias-label-tertiary)"
+			} }, "会话 ID", filterInput(hourlyFilter.sessionId, "包含…", (value) => setHourlyFilter((current) => ({
 				...current,
 				sessionId: value
 			})))), react.default.createElement("label", { style: {
@@ -1332,7 +1446,7 @@ window.__ModuleLoader__.load({
 				gap: 4,
 				fontSize: 11,
 				color: "var(--dsw-alias-label-tertiary)"
-			} }, "来源", filterSelect(sessionFilter.origin, originOptions, (value) => setSessionFilter((current) => ({
+			} }, "来源", filterSelect(hourlyFilter.origin, originOptions, (value) => setHourlyFilter((current) => ({
 				...current,
 				origin: value
 			})))), react.default.createElement("label", { style: {
@@ -1341,36 +1455,9 @@ window.__ModuleLoader__.load({
 				gap: 4,
 				fontSize: 11,
 				color: "var(--dsw-alias-label-tertiary)"
-			} }, "父会话", filterInput(sessionFilter.parentSession, "包含…", (value) => setSessionFilter((current) => ({
-				...current,
-				parentSession: value
-			})))), react.default.createElement("label", { style: {
-				display: "flex",
-				flexDirection: "column",
-				gap: 4,
-				fontSize: 11,
-				color: "var(--dsw-alias-label-tertiary)"
-			} }, "模型/路由", filterSelect(sessionFilter.route, routeOptions, (value) => setSessionFilter((current) => ({
+			} }, "模型/路由", filterSelect(hourlyFilter.route, routeOptions, (value) => setHourlyFilter((current) => ({
 				...current,
 				route: value
-			})))), react.default.createElement("label", { style: {
-				display: "flex",
-				flexDirection: "column",
-				gap: 4,
-				fontSize: 11,
-				color: "var(--dsw-alias-label-tertiary)"
-			} }, "最低费用", filterInput(sessionFilter.minCost === void 0 ? "" : String(sessionFilter.minCost), "≥", (value) => setSessionFilter((current) => ({
-				...current,
-				minCost: parseBound(value)
-			})))), react.default.createElement("label", { style: {
-				display: "flex",
-				flexDirection: "column",
-				gap: 4,
-				fontSize: 11,
-				color: "var(--dsw-alias-label-tertiary)"
-			} }, "最高费用", filterInput(sessionFilter.maxCost === void 0 ? "" : String(sessionFilter.maxCost), "≤", (value) => setSessionFilter((current) => ({
-				...current,
-				maxCost: parseBound(value)
 			}))))), sessionLoading ? react.default.createElement("p", { style: {
 				margin: 0,
 				fontSize: 12,
@@ -1382,34 +1469,31 @@ window.__ModuleLoader__.load({
 					fontSize: 12,
 					color: "var(--dsw-alias-label-error)"
 				}
-			}, sessionLoadError) : null, !sessionLoading && !sessionLoadError && visibleRows.length === 0 ? react.default.createElement("p", { style: {
+			}, sessionLoadError) : null, !sessionLoading && !sessionLoadError && hourGroups.length === 0 ? react.default.createElement("p", { style: {
 				margin: 0,
 				fontSize: 12,
 				color: "var(--dsw-alias-label-tertiary)"
-			} }, "暂无匹配的会话费用") : null, react.default.createElement("div", { style: {
+			} }, "暂无匹配的时段费用") : null, react.default.createElement("div", { style: {
 				overflowX: "auto",
 				fontSize: 12
 			} }, react.default.createElement("table", { style: {
 				width: "100%",
 				borderCollapse: "collapse",
 				whiteSpace: "nowrap"
-			} }, react.default.createElement("thead", null, react.default.createElement("tr", null, react.default.createElement("th", { style: headerLeft }), sortHeader("sessionId", "会话 ID", "left"), sortHeader("origin", "来源", "left"), sortHeader("parentSession", "父会话", "left"), sortHeader("cost", "总费用"), sortHeader("inputTokens", "输入 Token"), sortHeader("cacheReadTokens", "缓存读取 Token"), react.default.createElement("th", { style: headerStyle }, "缓存写入 Token"), sortHeader("outputTokens", "输出 Token"), sortHeader("totalTokens", "总 Token"), react.default.createElement("th", { style: headerStyle }, "模型/路由"))), react.default.createElement("tbody", null, ...visibleRows.flatMap((row) => {
-				const expanded = expandedSessions.has(row.sessionId);
-				const routes = sessionRoutes(row);
-				const summary = react.default.createElement("tr", {
-					key: row.sessionId,
+			} }, react.default.createElement("thead", null, react.default.createElement("tr", null, react.default.createElement("th", { style: headerLeft }, "时间段"), react.default.createElement("th", { style: headerStyle }, "轮次"), react.default.createElement("th", { style: headerStyle }, "步骤"), react.default.createElement("th", { style: headerStyle }, "工具调用"), react.default.createElement("th", { style: headerStyle }, "输入 tokens"), react.default.createElement("th", { style: headerStyle }, "输入价格"), react.default.createElement("th", { style: headerStyle }, "缓存 tokens"), react.default.createElement("th", { style: headerStyle }, "缓存价格"), react.default.createElement("th", { style: headerStyle }, "输出 tokens"), react.default.createElement("th", { style: headerStyle }, "输出价格"), react.default.createElement("th", { style: headerStyle }, "缓存率"), react.default.createElement("th", { style: headerStyle }, "总价"), react.default.createElement("th", { style: headerStyle }, "时段名称"), react.default.createElement("th", { style: headerStyle }, "模型"))), react.default.createElement("tbody", null, ...hourGroups.flatMap((group) => {
+				const timeKey = `all:time:${group.hour}`;
+				const expanded = expandedHours.has(timeKey);
+				const routes = [...new Set(group.sessions.map((item) => `${item.entry.provider ?? ""}/${item.entry.model ?? ""}`).filter((value) => value !== "/"))];
+				const timeRow = react.default.createElement("tr", {
+					key: timeKey,
 					style: {
 						borderBottom: "1px solid var(--dsw-alias-border-l2, #eee)",
-						cursor: "pointer"
-					},
-					onClick: () => toggleSession(row.sessionId)
+						fontWeight: 600
+					}
 				}, react.default.createElement("td", { style: cellLeft }, react.default.createElement("button", {
 					type: "button",
 					"aria-expanded": expanded,
-					onClick: (event) => {
-						event.stopPropagation();
-						toggleSession(row.sessionId);
-					},
+					onClick: () => toggleHour(timeKey),
 					style: {
 						border: 0,
 						background: "transparent",
@@ -1418,32 +1502,28 @@ window.__ModuleLoader__.load({
 						fontSize: 13,
 						color: "inherit"
 					}
-				}, expanded ? "−" : "+")), react.default.createElement("td", {
-					style: cellLeft,
-					title: row.sessionId
-				}, compactId(row.sessionId)), react.default.createElement("td", { style: cellLeft }, row.origin ?? "-"), react.default.createElement("td", {
-					style: cellLeft,
-					title: row.parentSession ?? void 0
-				}, compactId(row.parentSession)), react.default.createElement("td", { style: {
-					...cellBase,
-					fontWeight: 600
-				} }, `${symbol}${money(row.cost.cost)}`), react.default.createElement("td", { style: cellBase }, row.cost.inputTokens.toLocaleString("zh-CN")), react.default.createElement("td", { style: cellBase }, row.cost.cacheReadTokens.toLocaleString("zh-CN")), react.default.createElement("td", { style: cellBase }, row.cost.cacheWriteTokens.toLocaleString("zh-CN")), react.default.createElement("td", { style: cellBase }, row.cost.outputTokens.toLocaleString("zh-CN")), react.default.createElement("td", { style: cellBase }, sessionTotalTokens(row).toLocaleString("zh-CN")), react.default.createElement("td", { style: cellBase }, routes.length === 0 ? "-" : routes.length === 1 ? routes[0] : `${routes.length} 个模型`));
-				if (!expanded) return [summary];
-				return [summary, react.default.createElement("tr", { key: `${row.sessionId}:detail` }, react.default.createElement("td", {
-					colSpan: 11,
-					style: { padding: "0 8px 12px" }
-				}, react.default.createElement(HourlyTable, {
-					sessionId: row.sessionId,
-					hourly: row.cost.hourly ?? [],
-					expandedHours,
-					toggleHour,
-					symbol,
-					cellBase,
-					cellLeft,
-					headerStyle,
-					headerLeft
-				})))];
-			}))))) : react.default.createElement("section", { style: {
+				}, expanded ? "−" : "+"), `${localDateOfHour(group.hour)} ${group.hourLabel}`), ...hourlyDataCells(group.totals), react.default.createElement("td", { style: cellBase }, `${group.sessions.length} 个会话`), react.default.createElement("td", { style: cellBase }, routes.length === 0 ? "-" : `${routes.length} 个模型`));
+				if (!expanded) return [timeRow];
+				return [timeRow, ...group.sessions.map((item) => react.default.createElement("tr", {
+					key: `${timeKey}:${item.sessionId}:${item.entry.provider ?? ""}/${item.entry.model ?? ""}`,
+					style: {
+						borderBottom: "1px solid var(--dsw-alias-border-l2, #eee)",
+						background: "var(--dsw-alias-bg-layer-2, #fafafa)"
+					}
+				}, react.default.createElement("td", {
+					style: {
+						...cellLeft,
+						paddingLeft: 28
+					},
+					title: item.sessionId
+				}, `↳ ${compactId(item.sessionId)}${item.origin ? ` · ${item.origin}` : ""}`), ...hourlyDataCells(item.entry), react.default.createElement("td", { style: cellBase }, item.entry.periodName ?? "-"), react.default.createElement("td", { style: cellBase }, item.entry.provider && item.entry.model ? `${item.entry.provider}/${item.entry.model}` : "-")))];
+			}), hourGroups.length > 0 ? react.default.createElement("tr", { style: {
+				fontWeight: 600,
+				borderTop: "2px solid var(--dsw-alias-border-l1, #bbb)"
+			} }, react.default.createElement("td", { style: {
+				...cellLeft,
+				fontWeight: 600
+			} }, "合计"), ...hourlyDataCells(overviewTotals), react.default.createElement("td", { style: cellBase }, `${hourGroups.reduce((total, group) => total + group.sessions.length, 0)} 条明细`), react.default.createElement("td", { style: cellBase }, `${(overviewTotals.inputTokens + overviewTotals.cacheReadTokens + overviewTotals.cacheWriteTokens + overviewTotals.outputTokens).toLocaleString("zh-CN")} tokens`)) : null)))) : react.default.createElement("section", { style: {
 				display: "flex",
 				flexDirection: "column",
 				gap: 10

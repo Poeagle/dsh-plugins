@@ -1255,6 +1255,146 @@ function toggleSessionTableSort(current, key) {
 		dir: key === "sessionId" || key === "origin" || key === "parentSession" ? "asc" : "desc"
 	};
 }
+/** Map items with a bounded number of in-flight promises, preserving input order. */
+async function mapWithConcurrency(items, concurrency, mapper) {
+	const limit = Math.max(1, Math.min(items.length, Math.floor(concurrency) || 1));
+	const results = new Array(items.length);
+	let next = 0;
+	const worker = async () => {
+		while (next < items.length) {
+			const index = next;
+			next += 1;
+			results[index] = await mapper(items[index], index);
+		}
+	};
+	await Promise.all(Array.from({ length: limit }, () => worker()));
+	return results;
+}
+function emptyHourlySlice(hour = "", hourLabel = "") {
+	return {
+		hour,
+		hourLabel,
+		turns: 0,
+		steps: 0,
+		toolCalls: 0,
+		inputTokens: 0,
+		cacheReadTokens: 0,
+		cacheWriteTokens: 0,
+		outputTokens: 0,
+		inputCost: 0,
+		cacheReadCost: 0,
+		cacheWriteCost: 0,
+		outputCost: 0,
+		cost: 0,
+		cacheRate: 0,
+		model: null,
+		provider: null,
+		periodName: null
+	};
+}
+/** Local calendar date of an hourly ISO bucket. */
+function localDateOfHour(hour) {
+	const date = new Date(hour);
+	if (Number.isNaN(date.getTime())) return "";
+	return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+function hourlyRoute(entry) {
+	return routeLabel(entry.provider, entry.model);
+}
+function asHourlySlice(value) {
+	if (typeof value.hour !== "string" || value.hour === "") return null;
+	return {
+		hour: value.hour,
+		hourLabel: value.hourLabel ?? value.hour,
+		turns: value.turns ?? 0,
+		steps: value.steps ?? 0,
+		toolCalls: value.toolCalls ?? 0,
+		inputTokens: value.inputTokens ?? 0,
+		cacheReadTokens: value.cacheReadTokens ?? 0,
+		cacheWriteTokens: value.cacheWriteTokens ?? 0,
+		outputTokens: value.outputTokens ?? 0,
+		inputCost: value.inputCost ?? 0,
+		cacheReadCost: value.cacheReadCost ?? 0,
+		cacheWriteCost: value.cacheWriteCost ?? 0,
+		outputCost: value.outputCost ?? 0,
+		cost: value.cost ?? 0,
+		cacheRate: value.cacheRate ?? 0,
+		model: value.model ?? null,
+		provider: value.provider ?? null,
+		periodName: value.periodName ?? null
+	};
+}
+/** Flatten each session's own hourly buckets; parent rows do not include child sessions. */
+function flattenHourlyEntries(rows) {
+	const entries = [];
+	for (const row of rows) for (const hourly of row.cost.hourly ?? []) {
+		const entry = asHourlySlice(hourly);
+		if (entry === null) continue;
+		entries.push({
+			sessionId: row.sessionId,
+			origin: row.origin,
+			parentSession: row.parentSession,
+			entry
+		});
+	}
+	return entries;
+}
+function filterHourlyEntries(entries, filter) {
+	const sessionId = filter.sessionId.trim().toLowerCase();
+	return entries.filter((item) => {
+		if (filter.date && localDateOfHour(item.entry.hour) !== filter.date) return false;
+		if (filter.hour && item.entry.hour !== filter.hour && item.entry.hourLabel !== filter.hour) return false;
+		if (sessionId && !item.sessionId.toLowerCase().includes(sessionId)) return false;
+		if (filter.origin && (item.origin ?? "") !== filter.origin) return false;
+		const route = hourlyRoute(item.entry);
+		if (filter.route && route !== filter.route) return false;
+		return true;
+	});
+}
+function sumHourlySlices(rows, hour = "", hourLabel = "") {
+	const out = emptyHourlySlice(hour, hourLabel);
+	for (const row of rows) {
+		out.turns += row.turns;
+		out.steps += row.steps;
+		out.toolCalls += row.toolCalls;
+		out.inputTokens += row.inputTokens;
+		out.cacheReadTokens += row.cacheReadTokens;
+		out.cacheWriteTokens += row.cacheWriteTokens;
+		out.outputTokens += row.outputTokens;
+		out.inputCost += row.inputCost;
+		out.cacheReadCost += row.cacheReadCost;
+		out.cacheWriteCost += row.cacheWriteCost;
+		out.outputCost += row.outputCost;
+		out.cost += row.cost;
+	}
+	const totalTokens = out.inputTokens + out.cacheReadTokens + out.cacheWriteTokens + out.outputTokens;
+	out.cacheRate = totalTokens > 0 ? (out.cacheReadTokens + out.cacheWriteTokens) / totalTokens : 0;
+	return out;
+}
+/** Group flattened hourly entries by time bucket, newest hour last. */
+function groupHourlyEntries(entries) {
+	const groups = /* @__PURE__ */ new Map();
+	for (const item of entries) {
+		const existing = groups.get(item.entry.hour);
+		if (existing === void 0) {
+			groups.set(item.entry.hour, {
+				hour: item.entry.hour,
+				hourLabel: item.entry.hourLabel,
+				sessions: [item],
+				totals: emptyHourlySlice(item.entry.hour, item.entry.hourLabel)
+			});
+			continue;
+		}
+		existing.sessions.push(item);
+	}
+	return [...groups.values()].sort((left, right) => left.hour.localeCompare(right.hour)).map((group) => ({
+		...group,
+		totals: sumHourlySlices(group.sessions.map((item) => item.entry), group.hour, group.hourLabel)
+	}));
+}
+function queryHourlyOverview(rows, filter) {
+	return groupHourlyEntries(filterHourlyEntries(flattenHourlyEntries(rows), filter));
+}
 //#endregion
 //#region src/index.ts
 const ratesSchema = Schema.object({
@@ -1403,4 +1543,4 @@ var CostMeterService = class extends TypertRemoteService {
 	}
 };
 //#endregion
-export { mergeListedSessionCost as a, sessionTotalTokens as c, DEFAULT_PRICING as d, foldSession as f, validatePricing as g, routeKey as h, filterSessionRows as i, sortSessionRows as l, resolvePricing as m, CostMeterService as n, querySessionRows as o, normalizeUsage as p, collectSessionCosts as r, sessionRoutes as s, Config as t, toggleSessionTableSort as u };
+export { validatePricing as C, routeKey as S, toggleSessionTableSort as _, filterSessionRows as a, normalizeUsage as b, localDateOfHour as c, queryHourlyOverview as d, querySessionRows as f, sumHourlySlices as g, sortSessionRows as h, filterHourlyEntries as i, mapWithConcurrency as l, sessionTotalTokens as m, CostMeterService as n, flattenHourlyEntries as o, sessionRoutes as p, collectSessionCosts as r, groupHourlyEntries as s, Config as t, mergeListedSessionCost as u, DEFAULT_PRICING as v, resolvePricing as x, foldSession as y };

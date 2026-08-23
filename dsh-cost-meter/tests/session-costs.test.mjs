@@ -4,7 +4,9 @@ import {
   DEFAULT_PRICING,
   collectSessionCosts,
   filterSessionRows,
+  mapWithConcurrency,
   mergeListedSessionCost,
+  queryHourlyOverview,
   querySessionRows,
   sortSessionRows,
 } from '../lib/index.js'
@@ -148,6 +150,123 @@ test('mergeListedSessionCost keeps listing metadata with an independent fold', (
     origin: 'subagent',
     cost: { cost: 3, inputTokens: 10, cacheReadTokens: 2, cacheWriteTokens: 0, outputTokens: 4, route: 'wz/gpt-5.6-terra' },
   })
+})
+
+test('mapWithConcurrency preserves order and bounds in-flight work', async () => {
+  let inflight = 0
+  let peak = 0
+  const values = await mapWithConcurrency([3, 1, 2, 4], 2, async (value) => {
+    inflight += 1
+    peak = Math.max(peak, inflight)
+    await new Promise(resolve => setTimeout(resolve, 5))
+    inflight -= 1
+    return value * 10
+  })
+  assert.deepEqual(values, [30, 10, 20, 40])
+  assert.equal(peak <= 2, true)
+})
+
+function localHour(year, month, day, hour) {
+  const date = new Date(year, month - 1, day, hour, 0, 0, 0)
+  const label = `${String(hour).padStart(2, '0')}:00–${String(hour).padStart(2, '0')}:59`
+  return { hour: date.toISOString(), hourLabel: label }
+}
+
+test('groups filtered hourly entries by date and hour', () => {
+  const morning = localHour(2026, 8, 23, 9)
+  const midnight = localHour(2026, 8, 22, 0)
+  const rows = [
+    {
+      sessionId: 'sess-a',
+      parentSession: null,
+      origin: 'user',
+      cost: {
+        cost: 3,
+        inputTokens: 10,
+        cacheReadTokens: 2,
+        cacheWriteTokens: 0,
+        outputTokens: 4,
+        hourly: [{
+          ...morning,
+          turns: 1,
+          steps: 2,
+          toolCalls: 0,
+          inputTokens: 10,
+          cacheReadTokens: 2,
+          cacheWriteTokens: 0,
+          outputTokens: 4,
+          inputCost: 1,
+          cacheReadCost: 0.1,
+          cacheWriteCost: 0,
+          outputCost: 2,
+          cost: 3.1,
+          cacheRate: 0.125,
+          provider: 'wz',
+          model: 'gpt-5.6-terra',
+          periodName: null,
+        }],
+      },
+    },
+    {
+      sessionId: 'sess-b',
+      parentSession: 'sess-a',
+      origin: 'subagent',
+      cost: {
+        cost: 1,
+        inputTokens: 5,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        outputTokens: 1,
+        hourly: [{
+          ...morning,
+          turns: 1,
+          steps: 1,
+          toolCalls: 1,
+          inputTokens: 5,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          outputTokens: 1,
+          inputCost: 0.5,
+          cacheReadCost: 0,
+          cacheWriteCost: 0,
+          outputCost: 0.5,
+          cost: 1,
+          cacheRate: 0,
+          provider: 'ds',
+          model: 'deepseek-v4-flash',
+          periodName: null,
+        }, {
+          ...midnight,
+          turns: 1,
+          steps: 1,
+          toolCalls: 0,
+          inputTokens: 8,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          outputTokens: 2,
+          inputCost: 0.8,
+          cacheReadCost: 0,
+          cacheWriteCost: 0,
+          outputCost: 0.4,
+          cost: 1.2,
+          cacheRate: 0,
+          provider: 'ds',
+          model: 'deepseek-v4-flash',
+          periodName: null,
+        }],
+      },
+    },
+  ]
+  const morningGroups = queryHourlyOverview(rows, { date: '', hour: morning.hourLabel, sessionId: '', origin: '', route: '' })
+  assert.equal(morningGroups.length, 1)
+  assert.equal(morningGroups[0].sessions.length, 2)
+  assert.equal(morningGroups[0].totals.cost, 4.1)
+  assert.equal(morningGroups[0].totals.inputTokens, 15)
+  const oneDay = queryHourlyOverview(rows, { date: '2026-08-23', hour: '', sessionId: '', origin: '', route: '' })
+  assert.deepEqual(oneDay.map(group => group.hourLabel), [morning.hourLabel])
+  const oneRoute = queryHourlyOverview(rows, { date: '', hour: '', sessionId: '', origin: '', route: 'ds/deepseek-v4-flash' })
+  assert.equal(oneRoute.length, 2)
+  assert.equal(oneRoute.every(group => group.sessions.every(item => item.entry.model === 'deepseek-v4-flash')), true)
 })
 
 test('filters session rows by text, origin, and route', () => {

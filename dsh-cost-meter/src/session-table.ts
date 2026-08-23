@@ -1,5 +1,26 @@
 /** Pure session-overview query helpers shared by the host tests and the dock UI. */
 
+export interface HourlySlice {
+  hour: string
+  hourLabel: string
+  turns: number
+  steps: number
+  toolCalls: number
+  inputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  outputTokens: number
+  inputCost: number
+  cacheReadCost: number
+  cacheWriteCost: number
+  outputCost: number
+  cost: number
+  cacheRate: number
+  model: string | null
+  provider: string | null
+  periodName: string | null
+}
+
 export interface SessionTableCost {
   cost: number
   inputTokens: number
@@ -7,7 +28,7 @@ export interface SessionTableCost {
   cacheWriteTokens: number
   outputTokens: number
   route?: string | null
-  hourly?: ReadonlyArray<{ provider: string | null; model: string | null }>
+  hourly?: ReadonlyArray<Partial<HourlySlice> & { provider: string | null; model: string | null }>
   details?: ReadonlyArray<{ provider: string | null; model: string | null }>
 }
 
@@ -141,4 +162,193 @@ export function querySessionRows<T extends SessionTableRow>(
 export function toggleSessionTableSort(current: SessionTableSort, key: SessionTableSortKey): SessionTableSort {
   if (current.key === key) return { key, dir: current.dir === 'asc' ? 'desc' : 'asc' }
   return { key, dir: key === 'sessionId' || key === 'origin' || key === 'parentSession' ? 'asc' : 'desc' }
+}
+
+/** Map items with a bounded number of in-flight promises, preserving input order. */
+export async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  concurrency: number,
+  mapper: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const limit = Math.max(1, Math.min(items.length, Math.floor(concurrency) || 1))
+  const results = new Array<R>(items.length)
+  let next = 0
+  const worker = async (): Promise<void> => {
+    while (next < items.length) {
+      const index = next
+      next += 1
+      results[index] = await mapper(items[index] as T, index)
+    }
+  }
+  await Promise.all(Array.from({ length: limit }, () => worker()))
+  return results
+}
+
+export interface HourlySessionEntry {
+  sessionId: string
+  origin: string | null
+  parentSession: string | null
+  entry: HourlySlice
+}
+
+export interface HourlyOverviewFilter {
+  date: string
+  hour: string
+  sessionId: string
+  origin: string
+  route: string
+}
+
+export interface HourlyOverviewGroup {
+  hour: string
+  hourLabel: string
+  sessions: HourlySessionEntry[]
+  totals: HourlySlice
+}
+
+function emptyHourlySlice(hour = '', hourLabel = ''): HourlySlice {
+  return {
+    hour,
+    hourLabel,
+    turns: 0,
+    steps: 0,
+    toolCalls: 0,
+    inputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    outputTokens: 0,
+    inputCost: 0,
+    cacheReadCost: 0,
+    cacheWriteCost: 0,
+    outputCost: 0,
+    cost: 0,
+    cacheRate: 0,
+    model: null,
+    provider: null,
+    periodName: null,
+  }
+}
+
+/** Local calendar date of an hourly ISO bucket. */
+export function localDateOfHour(hour: string): string {
+  const date = new Date(hour)
+  if (Number.isNaN(date.getTime())) return ''
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
+}
+
+function hourlyRoute(entry: Pick<HourlySlice, 'provider' | 'model'>): string | null {
+  return routeLabel(entry.provider, entry.model)
+}
+
+function asHourlySlice(value: Partial<HourlySlice> & { provider: string | null; model: string | null }): HourlySlice | null {
+  if (typeof value.hour !== 'string' || value.hour === '') return null
+  return {
+    hour: value.hour,
+    hourLabel: value.hourLabel ?? value.hour,
+    turns: value.turns ?? 0,
+    steps: value.steps ?? 0,
+    toolCalls: value.toolCalls ?? 0,
+    inputTokens: value.inputTokens ?? 0,
+    cacheReadTokens: value.cacheReadTokens ?? 0,
+    cacheWriteTokens: value.cacheWriteTokens ?? 0,
+    outputTokens: value.outputTokens ?? 0,
+    inputCost: value.inputCost ?? 0,
+    cacheReadCost: value.cacheReadCost ?? 0,
+    cacheWriteCost: value.cacheWriteCost ?? 0,
+    outputCost: value.outputCost ?? 0,
+    cost: value.cost ?? 0,
+    cacheRate: value.cacheRate ?? 0,
+    model: value.model ?? null,
+    provider: value.provider ?? null,
+    periodName: value.periodName ?? null,
+  }
+}
+
+/** Flatten each session's own hourly buckets; parent rows do not include child sessions. */
+export function flattenHourlyEntries(rows: readonly SessionTableRow[]): HourlySessionEntry[] {
+  const entries: HourlySessionEntry[] = []
+  for (const row of rows) {
+    for (const hourly of row.cost.hourly ?? []) {
+      const entry = asHourlySlice(hourly)
+      if (entry === null) continue
+      entries.push({
+        sessionId: row.sessionId,
+        origin: row.origin,
+        parentSession: row.parentSession,
+        entry,
+      })
+    }
+  }
+  return entries
+}
+
+export function filterHourlyEntries(
+  entries: readonly HourlySessionEntry[],
+  filter: HourlyOverviewFilter,
+): HourlySessionEntry[] {
+  const sessionId = filter.sessionId.trim().toLowerCase()
+  return entries.filter(item => {
+    if (filter.date && localDateOfHour(item.entry.hour) !== filter.date) return false
+    if (filter.hour && item.entry.hour !== filter.hour && item.entry.hourLabel !== filter.hour) return false
+    if (sessionId && !item.sessionId.toLowerCase().includes(sessionId)) return false
+    if (filter.origin && (item.origin ?? '') !== filter.origin) return false
+    const route = hourlyRoute(item.entry)
+    if (filter.route && route !== filter.route) return false
+    return true
+  })
+}
+
+export function sumHourlySlices(rows: readonly HourlySlice[], hour = '', hourLabel = ''): HourlySlice {
+  const out = emptyHourlySlice(hour, hourLabel)
+  for (const row of rows) {
+    out.turns += row.turns
+    out.steps += row.steps
+    out.toolCalls += row.toolCalls
+    out.inputTokens += row.inputTokens
+    out.cacheReadTokens += row.cacheReadTokens
+    out.cacheWriteTokens += row.cacheWriteTokens
+    out.outputTokens += row.outputTokens
+    out.inputCost += row.inputCost
+    out.cacheReadCost += row.cacheReadCost
+    out.cacheWriteCost += row.cacheWriteCost
+    out.outputCost += row.outputCost
+    out.cost += row.cost
+  }
+  const totalTokens = out.inputTokens + out.cacheReadTokens + out.cacheWriteTokens + out.outputTokens
+  out.cacheRate = totalTokens > 0 ? (out.cacheReadTokens + out.cacheWriteTokens) / totalTokens : 0
+  return out
+}
+
+/** Group flattened hourly entries by time bucket, newest hour last. */
+export function groupHourlyEntries(entries: readonly HourlySessionEntry[]): HourlyOverviewGroup[] {
+  const groups = new Map<string, HourlyOverviewGroup>()
+  for (const item of entries) {
+    const existing = groups.get(item.entry.hour)
+    if (existing === undefined) {
+      groups.set(item.entry.hour, {
+        hour: item.entry.hour,
+        hourLabel: item.entry.hourLabel,
+        sessions: [item],
+        totals: emptyHourlySlice(item.entry.hour, item.entry.hourLabel),
+      })
+      continue
+    }
+    existing.sessions.push(item)
+  }
+  return [...groups.values()]
+    .sort((left, right) => left.hour.localeCompare(right.hour))
+    .map(group => ({
+      ...group,
+      totals: sumHourlySlices(group.sessions.map(item => item.entry), group.hour, group.hourLabel),
+    }))
+}
+
+export function queryHourlyOverview(
+  rows: readonly SessionTableRow[],
+  filter: HourlyOverviewFilter,
+): HourlyOverviewGroup[] {
+  return groupHourlyEntries(filterHourlyEntries(flattenHourlyEntries(rows), filter))
 }

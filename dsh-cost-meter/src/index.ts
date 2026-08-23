@@ -16,16 +16,27 @@ import {
 
 export { DEFAULT_PRICING, foldSession, normalizeUsage, resolvePricing, routeKey, validatePricing }
 export {
+  filterHourlyEntries,
   filterSessionRows,
+  flattenHourlyEntries,
+  groupHourlyEntries,
+  localDateOfHour,
+  mapWithConcurrency,
   mergeListedSessionCost,
+  queryHourlyOverview,
   querySessionRows,
   sessionRoutes,
   sessionTotalTokens,
   sortSessionRows,
+  sumHourlySlices,
   toggleSessionTableSort,
 } from './session-table.js'
 export type { CostDetail, CostFold, CostSubagent, HourlyDetail, PartialTokenRates, PricingConfig, PricingPeriod, PricingPlan, TokenRates } from './pricing.js'
 export type {
+  HourlyOverviewFilter,
+  HourlyOverviewGroup,
+  HourlySessionEntry,
+  HourlySlice,
   SessionTableFilter,
   SessionTableRow,
   SessionTableSort,
