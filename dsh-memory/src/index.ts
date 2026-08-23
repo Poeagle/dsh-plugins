@@ -271,7 +271,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
 
   /** Publish the current countdown for the browser-only memory indicator. */
   function publishReviewProgress(sessionId: SessionId, state: SessionNudgeState, nudgeInterval: number, reviewEnabled: boolean): void {
-    memoryReviewProgress.publish(String(sessionId), {
+    void memoryReviewProgress.publish(String(sessionId), {
       reviewEnabled,
       remainingTurns: reviewEnabled && nudgeInterval > 0 ? nudgeInterval - state.turnsSinceMemory : 0,
     })
@@ -328,7 +328,6 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       maxIterations: config.reviewMaxIterations,
       signal: aborter.signal,
     }).then((outcome) => {
-      if (outcome.changes.length === 0) return
       const update: MemoryReviewNotification = {
         sessionId: String(session.id),
         saved: outcome.saved,
@@ -353,6 +352,6 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     injected.delete(session.id)
     injectionLocks.delete(session.id)
     void memoryReviewNotices.discard(String(session.id))
-    memoryReviewProgress.discard(String(session.id))
+    void memoryReviewProgress.discard(String(session.id))
   })
 }

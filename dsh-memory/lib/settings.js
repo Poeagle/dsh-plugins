@@ -1,4 +1,4 @@
-import { d as MemoryStore, l as memoryReviewProgress, t as Config, u as memoryReviewNotices } from "./src-Dh_pIN17.js";
+import { d as MemoryStore, l as memoryReviewProgress, t as Config, u as memoryReviewNotices } from "./src-DhFY--Uk.js";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 //#region src/settings.ts
@@ -111,7 +111,7 @@ function apply(ctx) {
 					});
 					return;
 				}
-				if (method === "GET" && url.pathname === "/memory/api/review-notice") {
+				if (method === "GET" && url.pathname === "/memory/api/review-history") {
 					const sessionId = url.searchParams.get("sessionId");
 					if (sessionId === null || sessionId === "") {
 						send(res, 400, {
@@ -122,7 +122,7 @@ function apply(ctx) {
 					}
 					send(res, 200, {
 						ok: true,
-						value: await memoryReviewNotices.get(sessionId) ?? null
+						value: await memoryReviewNotices.list(sessionId)
 					});
 					return;
 				}
@@ -137,7 +137,7 @@ function apply(ctx) {
 					}
 					send(res, 200, {
 						ok: true,
-						value: memoryReviewProgress.get(sessionId) ?? null
+						value: await memoryReviewProgress.get(sessionId) ?? null
 					});
 					return;
 				}

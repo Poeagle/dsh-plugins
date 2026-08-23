@@ -316,8 +316,8 @@ const MEMORY_BLOCK_HEADERS = {
 /** Sentinel: the target file exists on disk but could not be read. */
 const READ_FAILED = Symbol("read-failed");
 /** Permission bits for memory files and their directory (owner-private). */
-const FILE_MODE$1 = 384;
-const DIR_MODE$1 = 448;
+const FILE_MODE$2 = 384;
+const DIR_MODE$2 = 448;
 /**
 * After this many failed consolidation attempts (overflow / zero-match) in
 * one turn, stop instructing the model to retry and return a terminal result
@@ -894,7 +894,7 @@ var MemoryStore = class {
 		if (!(raw.trim() !== roundtrip || maxEntryLength > this.charLimit(target))) return void 0;
 		const backupPath = `${this.pathFor(target)}.bak.${Math.trunc(Date.now() / 1e3)}`;
 		try {
-			await writeFile(backupPath, raw, { mode: FILE_MODE$1 });
+			await writeFile(backupPath, raw, { mode: FILE_MODE$2 });
 		} catch {
 			return `${backupPath} (BACKUP FAILED — file unchanged on disk)`;
 		}
@@ -905,8 +905,8 @@ var MemoryStore = class {
 		const entries = this.entries[target].map(stripTimestamp$1);
 		const content = entries.length > 0 ? entries.join(ENTRY_DELIMITER) : "";
 		await writeFileAtomic(this.pathFor(target), content, {
-			mode: FILE_MODE$1,
-			dirMode: DIR_MODE$1
+			mode: FILE_MODE$2,
+			dirMode: DIR_MODE$2
 		});
 		const metadata = {
 			version: 1,
@@ -916,8 +916,8 @@ var MemoryStore = class {
 			}))
 		};
 		await writeFileAtomic(this.metadataPathFor(target), `${JSON.stringify(metadata)}\n`, {
-			mode: FILE_MODE$1,
-			dirMode: DIR_MODE$1
+			mode: FILE_MODE$2,
+			dirMode: DIR_MODE$2
 		});
 	}
 	/** Serialize a read-modify-write cycle through the per-file lock. */
@@ -931,7 +931,7 @@ var MemoryStore = class {
 async function mkdirp(dir) {
 	await mkdir(dir, {
 		recursive: true,
-		mode: DIR_MODE$1
+		mode: DIR_MODE$2
 	});
 }
 /** Order-preserving dedupe keeping the first occurrence. */
@@ -1033,80 +1033,118 @@ function stripTimestamp$1(content) {
 }
 //#endregion
 //#region src/review-notices.ts
-/** Durable background-review notification storage. */
-/** Owner-only directory mode for persisted review receipts. */
-const DIR_MODE = 448;
-/** Owner-only file mode for persisted review receipts. */
-const FILE_MODE = 384;
+/** Durable background-review history outside the official session log. */
+const DIR_MODE$1 = 448;
+const FILE_MODE$1 = 384;
 /**
-* Stores the latest completed review receipt per source session on disk.
-* Reading a receipt never deletes it, so a browser refresh or reconnect retains
-* the visible background-update result until a newer review supersedes it.
+* Persists bounded review history per session. It is deliberately a plugin
+* sidecar rather than an official Session event, because external plugins lack
+* the public API required to safely append an ignorable unknown event.
 */
 var MemoryReviewNotices = class {
 	path;
-	/** @param dir - directory holding the receipt file. */
+	/** @param dir - directory holding the review-history file. */
 	constructor(dir = dshHomePath("memories")) {
 		this.path = join(dir, ".review-notices.json");
 	}
-	/** Persist a committed review receipt for its source session. */
+	/** Append a completed review record for one source session. */
 	async publish(notice) {
-		const notices = await this.read();
-		notices[notice.sessionId] = notice;
-		await this.write(notices);
+		const history = await this.read();
+		const records = history[notice.sessionId] ?? [];
+		history[notice.sessionId] = [...records, {
+			...notice,
+			completedAt: (/* @__PURE__ */ new Date()).toISOString()
+		}].slice(-50);
+		await this.write(history);
 	}
-	/** Return the latest persisted receipt for one source session without consuming it. */
-	async get(sessionId) {
-		return (await this.read())[sessionId];
+	/** Return the full persisted review history for one source session. */
+	async list(sessionId) {
+		return (await this.read())[sessionId] ?? [];
 	}
-	/** Delete a disposed session's persisted receipt. */
+	/** Delete a disposed session's review history. */
 	async discard(sessionId) {
-		const notices = await this.read();
-		if (notices[sessionId] === void 0) return;
-		delete notices[sessionId];
-		await this.write(notices);
+		const history = await this.read();
+		if (history[sessionId] === void 0) return;
+		delete history[sessionId];
+		await this.write(history);
 	}
 	async read() {
 		try {
-			const raw = await readFile(this.path, "utf8");
-			const parsed = JSON.parse(raw);
+			const parsed = JSON.parse(await readFile(this.path, "utf8"));
+			if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+			const records = {};
+			for (const [sessionId, value] of Object.entries(parsed)) if (Array.isArray(value)) records[sessionId] = value;
+			else if (value !== null && typeof value === "object") records[sessionId] = [{
+				...value,
+				completedAt: ""
+			}];
+			return records;
+		} catch {
+			return {};
+		}
+	}
+	async write(history) {
+		await mkdir(dirname(this.path), {
+			recursive: true,
+			mode: DIR_MODE$1
+		});
+		await writeFileAtomic(this.path, JSON.stringify(history), {
+			mode: FILE_MODE$1,
+			dirMode: DIR_MODE$1
+		});
+	}
+};
+/** Shared review-history store for the memory preset and host HTTP route. */
+const memoryReviewNotices = new MemoryReviewNotices();
+//#endregion
+//#region src/review-progress.ts
+/** Durable review-cycle progress for the browser memory indicator. */
+const DIR_MODE = 448;
+const FILE_MODE = 384;
+/** Persist the latest countdown for each session outside the official session log. */
+var MemoryReviewProgressStore = class {
+	bySession = /* @__PURE__ */ new Map();
+	path;
+	/** @param dir - directory holding the progress receipt. */
+	constructor(dir = dshHomePath("memories")) {
+		this.path = join(dir, ".review-progress.json");
+	}
+	/** Store a countdown in memory and on disk. */
+	async publish(sessionId, progress) {
+		this.bySession.set(sessionId, progress);
+		const values = await this.read();
+		values[sessionId] = progress;
+		await this.write(values);
+	}
+	/** Read the current or prior-process countdown. */
+	async get(sessionId) {
+		return this.bySession.get(sessionId) ?? (await this.read())[sessionId];
+	}
+	/** Remove a disposed session's receipt. */
+	async discard(sessionId) {
+		this.bySession.delete(sessionId);
+		const values = await this.read();
+		if (values[sessionId] === void 0) return;
+		delete values[sessionId];
+		await this.write(values);
+	}
+	async read() {
+		try {
+			const parsed = JSON.parse(await readFile(this.path, "utf8"));
 			return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
 		} catch {
 			return {};
 		}
 	}
-	async write(notices) {
+	async write(values) {
 		await mkdir(dirname(this.path), {
 			recursive: true,
 			mode: DIR_MODE
 		});
-		await writeFileAtomic(this.path, JSON.stringify(notices), {
+		await writeFileAtomic(this.path, JSON.stringify(values), {
 			mode: FILE_MODE,
 			dirMode: DIR_MODE
 		});
-	}
-};
-/** Shared receipt store for the memory preset and host HTTP route. */
-const memoryReviewNotices = new MemoryReviewNotices();
-//#endregion
-//#region src/review-progress.ts
-/**
-* Holds the current source-session review countdown without writing session data.
-* Values disappear when the owning session disposes or the process restarts.
-*/
-var MemoryReviewProgressStore = class {
-	bySession = /* @__PURE__ */ new Map();
-	/** Publish one session's current countdown. */
-	publish(sessionId, progress) {
-		this.bySession.set(sessionId, progress);
-	}
-	/** Read one session's current countdown without consuming it. */
-	get(sessionId) {
-		return this.bySession.get(sessionId);
-	}
-	/** Forget a disposed session's countdown. */
-	discard(sessionId) {
-		this.bySession.delete(sessionId);
 	}
 };
 /** Shared across the preset and host settings plugin in this DSH process. */
@@ -1683,7 +1721,6 @@ async function apply(ctx, config) {
 			maxIterations: config.reviewMaxIterations,
 			signal: aborter.signal
 		}).then((outcome) => {
-			if (outcome.changes.length === 0) return;
 			const update = {
 				sessionId: String(session.id),
 				saved: outcome.saved,
@@ -1713,4 +1750,4 @@ async function apply(ctx, config) {
 //#endregion
 export { DEFAULT_USER_CHAR_LIMIT as a, name as c, MemoryStore as d, DEFAULT_REVIEW_MAX_ITERATIONS as i, memoryReviewProgress as l, DEFAULT_MEMORY_CHAR_LIMIT as n, apply as o, DEFAULT_NUDGE_INTERVAL as r, inject as s, Config as t, memoryReviewNotices as u };
 
-//# sourceMappingURL=src-Dh_pIN17.js.map
+//# sourceMappingURL=src-DhFY--Uk.js.map

@@ -30,11 +30,12 @@ interface MemoryConfigResponse {
   value?: { nudgeInterval: number; reviewEnabled: boolean }
 }
 
-interface MemoryReviewNotice {
+interface MemoryReviewRecord {
   sessionId: string
   saved: number
   changes: readonly { target: 'memory' | 'user'; action: 'added' | 'removed'; content: string }[]
   reason: 'finished' | 'max-iterations' | 'aborted' | 'failed'
+  completedAt: string
 }
 
 interface MemoryResetResponse {
@@ -42,9 +43,9 @@ interface MemoryResetResponse {
   deleted?: string[]
 }
 
-interface MemoryReviewNoticeResponse {
+interface MemoryReviewHistoryResponse {
   ok: boolean
-  value?: MemoryReviewNotice | null
+  value?: readonly MemoryReviewRecord[]
 }
 
 interface MemoryReviewProgressResponse {
@@ -68,12 +69,21 @@ const formatTime = (iso: string): string => {
   } catch { return iso }
 }
 
-const fetchReviewNotice = async (sessionId: string): Promise<MemoryReviewNotice | null> => {
+const reviewReasonLabel = (reason: MemoryReviewRecord['reason']): string => {
+  switch (reason) {
+    case 'finished': return '正常完成'
+    case 'max-iterations': return '达到最大复核步数'
+    case 'aborted': return '已中止'
+    case 'failed': return '失败'
+  }
+}
+
+const fetchReviewHistory = async (sessionId: string): Promise<readonly MemoryReviewRecord[]> => {
   try {
-    const response = await fetch(`${MEMORY_ROUTE}/review-notice?sessionId=${encodeURIComponent(sessionId)}`)
-    const body = await response.json() as MemoryReviewNoticeResponse
-    return body.ok ? body.value ?? null : null
-  } catch { return null }
+    const response = await fetch(`${MEMORY_ROUTE}/review-history?sessionId=${encodeURIComponent(sessionId)}`)
+    const body = await response.json() as MemoryReviewHistoryResponse
+    return body.ok ? body.value ?? [] : []
+  } catch { return [] }
 }
 
 const fetchReviewProgress = async (sessionId: string): Promise<{ remainingTurns: number; reviewEnabled: boolean } | null> => {
@@ -530,17 +540,17 @@ function MemorySettingsCard(_props: Record<string, unknown>) {
   )
 }
 
-// ── Background-review notice ────────────────────────────────────────────
+// ── Background-review history ───────────────────────────────────────────
 
 function MemoryReviewNotice({ sessionId }: { sessionId: string }) {
-  const [notice, setNotice] = React.useState<MemoryReviewNotice | undefined>(undefined)
+  const [notice, setNotice] = React.useState<MemoryReviewRecord | undefined>(undefined)
   const [expanded, setExpanded] = React.useState(false)
   React.useEffect(() => {
     let disposed = false
     setNotice(undefined)
     const read = (): void => {
-      void fetchReviewNotice(sessionId).then((next) => {
-        if (!disposed && next !== null) setNotice(next)
+      void fetchReviewHistory(sessionId).then((history) => {
+        if (!disposed) setNotice(history.at(-1))
       })
     }
     read()
@@ -627,7 +637,8 @@ function MemoryDock({ sessionId }: { sessionId: string }) {
   const [reviewProgress, setReviewProgress] = React.useState<{ remainingTurns: number; reviewEnabled: boolean } | null>(null)
   const [modalOpen, setModalOpen] = React.useState(false)
   const [entries, setEntries] = React.useState<{ memory: MemoryEntry[]; user: MemoryEntry[] }>({ memory: [], user: [] })
-  const [tab, setTab] = React.useState<'memory' | 'user'>('memory')
+  const [reviewHistory, setReviewHistory] = React.useState<readonly MemoryReviewRecord[]>([])
+  const [tab, setTab] = React.useState<'memory' | 'user' | 'reviews'>('memory')
   const [selected, setSelected] = React.useState<Set<number>>(new Set())
   const [loading, setLoading] = React.useState(false)
   const [toast, setToast] = React.useState<string | null>(null)
@@ -654,13 +665,15 @@ function MemoryDock({ sessionId }: { sessionId: string }) {
   const openModal = async () => {
     setModalOpen(true)
     setLoading(true)
-    const [memEntries, userEntries] = await Promise.all([
+    const [memEntries, userEntries, reviews] = await Promise.all([
       fetchEntries('memory'),
       fetchEntries('user'),
+      fetchReviewHistory(sessionId),
     ])
     const memVal: MemoryEntry[] = memEntries?.ok === true && memEntries.value?.entries ? memEntries.value.entries : []
     const userVal: MemoryEntry[] = userEntries?.ok === true && userEntries.value?.entries ? userEntries.value.entries : []
     setEntries({ memory: memVal, user: userVal })
+    setReviewHistory(reviews)
     setLoading(false)
   }
 
@@ -710,7 +723,7 @@ function MemoryDock({ sessionId }: { sessionId: string }) {
     })
   }
 
-  const currentEntries: MemoryEntry[] = entries[tab]
+  const currentEntries: MemoryEntry[] = tab === 'reviews' ? [] : entries[tab]
 
   const cellStyle: React.CSSProperties = {
     padding: '6px 8px', fontSize: 12,
@@ -805,6 +818,15 @@ function MemoryDock({ sessionId }: { sessionId: string }) {
               fontWeight: tab === 'user' ? 600 : 400,
             },
           }, `USER.md (${entries.user.length} 条)`),
+          React.createElement('button', {
+            type: 'button', onClick: () => setTab('reviews'),
+            style: {
+              flex: 1, border: 0, background: 'transparent', color: 'inherit', cursor: 'pointer',
+              padding: '8px 0', fontSize: 13,
+              borderBottom: tab === 'reviews' ? '2px solid var(--dsw-alias-label-primary)' : '2px solid transparent',
+              fontWeight: tab === 'reviews' ? 600 : 400,
+            },
+          }, `后台更新记录 (${reviewHistory.length} 条)`),
         ),
 
         // Batch action bar
@@ -821,10 +843,34 @@ function MemoryDock({ sessionId }: { sessionId: string }) {
             )
           : null,
 
-        // Entry table
+        // Entry table / review history
         React.createElement('div', { style: { flex: 1, overflow: 'auto', padding: '0 16px 16px' } },
           loading
             ? React.createElement('div', { style: { fontSize: 12, color: 'var(--dsw-alias-label-tertiary)', padding: 8 } }, '加载中…')
+            : tab === 'reviews'
+            ? reviewHistory.length === 0
+              ? React.createElement('div', { style: { fontSize: 12, color: 'var(--dsw-alias-label-tertiary)', padding: 8 } }, '（尚无后台更新记录）')
+              : React.createElement('table', { style: { width: '100%', borderCollapse: 'collapse', tableLayout: 'fixed', marginTop: 8, fontSize: 12 } },
+                React.createElement('thead', null,
+                  React.createElement('tr', null,
+                    React.createElement('th', { style: { ...cellStyle, width: 172, fontWeight: 600 } }, '更新时间'),
+                    React.createElement('th', { style: { ...cellStyle, width: 112, fontWeight: 600 } }, '结果'),
+                    React.createElement('th', { style: { ...cellStyle, width: 120, fontWeight: 600 } }, '结束状态'),
+                    React.createElement('th', { style: { ...cellStyle, fontWeight: 600 } }, '变更详情'),
+                  ),
+                ),
+                React.createElement('tbody', null,
+                  [...reviewHistory].reverse().map((record, index) => React.createElement('tr', { key: `${record.completedAt}-${index}` },
+                    React.createElement('td', { style: { ...cellStyle, color: 'var(--dsw-alias-label-tertiary)' } }, record.completedAt === '' ? '升级前未记录' : formatTime(record.completedAt)),
+                    React.createElement('td', { style: cellStyle }, record.changes.length > 0 ? `已保存 ${record.changes.length} 项` : '未修改记忆'),
+                    React.createElement('td', { style: { ...cellStyle, color: 'var(--dsw-alias-label-tertiary)' } }, reviewReasonLabel(record.reason)),
+                    React.createElement('td', { style: cellStyle }, record.changes.length === 0
+                      ? '现有记忆已覆盖本轮对话中的长期信息。'
+                      : record.changes.map((change, changeIndex) => React.createElement('div', { key: `${changeIndex}-${change.content}`, style: { whiteSpace: 'pre-wrap', wordBreak: 'break-word' } }, `${change.target === 'user' ? 'USER' : 'MEMORY'} ${change.action === 'added' ? '＋' : '−'} ${change.content}`)),
+                    ),
+                  )),
+                ),
+            )
             : currentEntries.length === 0
             ? React.createElement('div', { style: { fontSize: 12, color: 'var(--dsw-alias-label-tertiary)', padding: 8 } }, '（空）')
             : React.createElement('table', { style: { width: '100%', borderCollapse: 'collapse', tableLayout: 'fixed', marginTop: 8 } },
@@ -882,13 +928,8 @@ export async function apply(ctx: Context) {
     name: 'settings.plugin.item', key: 'memory', id: 'memory', order: 40,
   }, MemorySettingsCard))
 
-  // 3. Show one transient, source-session-only review receipt above the composer.
-  slots.inject('conversation.input.dock', () => slots.register(
-    { name: 'conversation.input.dock', id: 'memory-review', order: 30 },
-    (props: { sessionId: string }) => React.createElement(MemoryReviewNotice, props),
-  ))
+  // 3. Register the dock indicator; full review history opens on click.
 
-  // 4. Register the dock indicator
   slots.inject('conversation.composer.dock', () => slots.register(
     { name: 'conversation.composer.dock', id: 'memory-indicator', order: 200 },
     (props: { sessionId: string }) => React.createElement(MemoryDock, { ...props }),

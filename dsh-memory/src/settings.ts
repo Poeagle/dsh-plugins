@@ -133,14 +133,14 @@ export function apply(ctx: Context): void {
           return
         }
 
-        // GET /memory/api/review-notice?sessionId=<id> — read the persisted source-session review receipt
-        if (method === 'GET' && url.pathname === '/memory/api/review-notice') {
+        // GET /memory/api/review-history?sessionId=<id> — read persisted source-session review records
+        if (method === 'GET' && url.pathname === '/memory/api/review-history') {
           const sessionId = url.searchParams.get('sessionId')
           if (sessionId === null || sessionId === '') {
             send(res, 400, { ok: false, error: 'sessionId is required.' })
             return
           }
-          send(res, 200, { ok: true, value: await memoryReviewNotices.get(sessionId) ?? null })
+          send(res, 200, { ok: true, value: await memoryReviewNotices.list(sessionId) })
           return
         }
 
@@ -151,7 +151,7 @@ export function apply(ctx: Context): void {
             send(res, 400, { ok: false, error: 'sessionId is required.' })
             return
           }
-          send(res, 200, { ok: true, value: memoryReviewProgress.get(sessionId) ?? null })
+          send(res, 200, { ok: true, value: await memoryReviewProgress.get(sessionId) ?? null })
           return
         }
 

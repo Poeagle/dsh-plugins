@@ -412,9 +412,9 @@ describe('background review spawning', () => {
       reason: 'finished',
     }
     await vi.waitFor(async () => {
-      await expect(memoryReviewNotices.get(String(session.id))).resolves.toEqual(expected)
+      await expect(memoryReviewNotices.list(String(session.id))).resolves.toHaveLength(1)
     })
-    await expect(memoryReviewNotices.get(String(session.id))).resolves.toEqual(expected)
+    expect((await memoryReviewNotices.list(String(session.id)))[0]).toMatchObject(expected)
     expect(session.events).not.toContainEqual(expect.objectContaining({ type: 'memory/review-updated' }))
   })
 

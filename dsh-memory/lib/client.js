@@ -44,12 +44,20 @@ window.__ModuleLoader__.load({
 				return iso;
 			}
 		};
-		const fetchReviewNotice = async (sessionId) => {
+		const reviewReasonLabel = (reason) => {
+			switch (reason) {
+				case "finished": return "正常完成";
+				case "max-iterations": return "达到最大复核步数";
+				case "aborted": return "已中止";
+				case "failed": return "失败";
+			}
+		};
+		const fetchReviewHistory = async (sessionId) => {
 			try {
-				const body = await (await fetch(`${MEMORY_ROUTE}/review-notice?sessionId=${encodeURIComponent(sessionId)}`)).json();
-				return body.ok ? body.value ?? null : null;
+				const body = await (await fetch(`${MEMORY_ROUTE}/review-history?sessionId=${encodeURIComponent(sessionId)}`)).json();
+				return body.ok ? body.value ?? [] : [];
 			} catch {
-				return null;
+				return [];
 			}
 		};
 		const fetchReviewProgress = async (sessionId) => {
@@ -542,127 +550,6 @@ window.__ModuleLoader__.load({
 				onClick: () => handleReset("all")
 			}, resetting === "all" ? "重置中…" : "重置全部")))) : null);
 		}
-		function MemoryReviewNotice({ sessionId }) {
-			const [notice, setNotice] = react.default.useState(void 0);
-			const [expanded, setExpanded] = react.default.useState(false);
-			react.default.useEffect(() => {
-				let disposed = false;
-				setNotice(void 0);
-				const read = () => {
-					fetchReviewNotice(sessionId).then((next) => {
-						if (!disposed && next !== null) setNotice(next);
-					});
-				};
-				read();
-				const interval = setInterval(read, 2e3);
-				return () => {
-					disposed = true;
-					clearInterval(interval);
-				};
-			}, [sessionId]);
-			react.default.useEffect(() => {
-				setExpanded(false);
-			}, [notice]);
-			if (notice === void 0) return null;
-			const summary = `后台复核 · 已保存 ${notice.changes.length} 项变更`;
-			const toggle = () => {
-				setExpanded((value) => !value);
-			};
-			return react.default.createElement("div", { style: {
-				display: "flex",
-				justifyContent: "center",
-				width: "100%",
-				maxWidth: "100%",
-				margin: "0 0 6px"
-			} }, react.default.createElement("div", { style: { width: "min(100%, 560px)" } }, react.default.createElement("div", {
-				style: {
-					display: "inline-flex",
-					maxWidth: "100%",
-					alignItems: "center",
-					gap: 8,
-					padding: "5px 9px",
-					border: "1px solid var(--dsw-alias-border-l2)",
-					borderRadius: 6,
-					background: "var(--dsw-alias-bg-layer-2)",
-					fontSize: 13,
-					lineHeight: "20px",
-					color: "var(--dsw-alias-label-primary)",
-					cursor: "pointer",
-					userSelect: "none"
-				},
-				role: "button",
-				tabIndex: 0,
-				"aria-expanded": expanded,
-				onClick: toggle,
-				onKeyDown: (event) => {
-					if (event.key === "Enter" || event.key === " ") {
-						event.preventDefault();
-						toggle();
-					}
-				}
-			}, react.default.createElement("span", { style: {
-				width: 8,
-				height: 8,
-				borderRadius: "50%",
-				flexShrink: 0,
-				background: "var(--dsw-alias-color-success, #22c55e)"
-			} }), react.default.createElement("span", { style: {
-				fontSize: 10,
-				color: "var(--dsw-alias-label-tertiary)",
-				flexShrink: 0,
-				transform: expanded ? "rotate(180deg)" : "rotate(0deg)",
-				transition: "transform 0.15s"
-			} }, expanded ? "▾" : "▸"), react.default.createElement("span", { style: {
-				fontSize: 12,
-				flexShrink: 0,
-				marginRight: 2
-			} }, "📝"), react.default.createElement("span", { style: {
-				fontWeight: 500,
-				flexShrink: 0
-			} }, "记忆"), react.default.createElement("span", { style: {
-				flex: 1,
-				minWidth: 0,
-				overflow: "hidden",
-				textOverflow: "ellipsis",
-				whiteSpace: "nowrap",
-				color: "var(--dsw-alias-label-secondary)",
-				fontSize: 12
-			} }, summary)), expanded ? react.default.createElement("div", { style: {
-				margin: "4px 0 0",
-				padding: 8,
-				border: "1px solid var(--dsw-alias-border-l2)",
-				borderRadius: 6,
-				background: "var(--dsw-alias-bg-layer-2)",
-				fontSize: 12,
-				lineHeight: "1.5",
-				display: "grid",
-				gap: 6
-			} }, react.default.createElement("div", { style: {
-				fontSize: 11,
-				color: "var(--dsw-alias-label-tertiary)",
-				fontWeight: 600
-			} }, "OUT · 已持久化变更"), notice.changes.map((change, index) => react.default.createElement("div", {
-				key: `${index}-${change.target}-${change.action}-${change.content}`,
-				style: {
-					display: "grid",
-					gridTemplateColumns: "auto auto 1fr",
-					gap: 6,
-					alignItems: "start",
-					padding: "6px 8px",
-					background: "var(--dsw-alias-bg-layer-3)",
-					borderRadius: 4,
-					whiteSpace: "pre-wrap",
-					wordBreak: "break-word",
-					color: "var(--dsw-alias-label-primary)"
-				}
-			}, react.default.createElement("span", { style: {
-				color: "var(--dsw-alias-label-tertiary)",
-				fontSize: 11
-			} }, change.target === "user" ? "USER" : "MEMORY"), react.default.createElement("span", { style: {
-				color: change.action === "added" ? "var(--dsw-alias-color-success, #22c55e)" : "var(--dsw-alias-label-error)",
-				fontWeight: 600
-			} }, change.action === "added" ? "＋" : "−"), react.default.createElement("span", null, change.content)))) : null));
-		}
 		function MemoryDock({ sessionId }) {
 			const [status, setStatus] = react.default.useState(null);
 			const [reviewProgress, setReviewProgress] = react.default.useState(null);
@@ -671,6 +558,7 @@ window.__ModuleLoader__.load({
 				memory: [],
 				user: []
 			});
+			const [reviewHistory, setReviewHistory] = react.default.useState([]);
 			const [tab, setTab] = react.default.useState("memory");
 			const [selected, setSelected] = react.default.useState(/* @__PURE__ */ new Set());
 			const [loading, setLoading] = react.default.useState(false);
@@ -696,13 +584,18 @@ window.__ModuleLoader__.load({
 			const openModal = async () => {
 				setModalOpen(true);
 				setLoading(true);
-				const [memEntries, userEntries] = await Promise.all([fetchEntries("memory"), fetchEntries("user")]);
+				const [memEntries, userEntries, reviews] = await Promise.all([
+					fetchEntries("memory"),
+					fetchEntries("user"),
+					fetchReviewHistory(sessionId)
+				]);
 				const memVal = memEntries?.ok === true && memEntries.value?.entries ? memEntries.value.entries : [];
 				const userVal = userEntries?.ok === true && userEntries.value?.entries ? userEntries.value.entries : [];
 				setEntries({
 					memory: memVal,
 					user: userVal
 				});
+				setReviewHistory(reviews);
 				setLoading(false);
 			};
 			const closeModal = () => {
@@ -743,7 +636,7 @@ window.__ModuleLoader__.load({
 					return next;
 				});
 			};
-			const currentEntries = entries[tab];
+			const currentEntries = tab === "reviews" ? [] : entries[tab];
 			const cellStyle = {
 				padding: "6px 8px",
 				fontSize: 12,
@@ -855,7 +748,21 @@ window.__ModuleLoader__.load({
 					borderBottom: tab === "user" ? "2px solid var(--dsw-alias-label-primary)" : "2px solid transparent",
 					fontWeight: tab === "user" ? 600 : 400
 				}
-			}, `USER.md (${entries.user.length} 条)`)), selected.size > 0 ? react.default.createElement("div", { style: {
+			}, `USER.md (${entries.user.length} 条)`), react.default.createElement("button", {
+				type: "button",
+				onClick: () => setTab("reviews"),
+				style: {
+					flex: 1,
+					border: 0,
+					background: "transparent",
+					color: "inherit",
+					cursor: "pointer",
+					padding: "8px 0",
+					fontSize: 13,
+					borderBottom: tab === "reviews" ? "2px solid var(--dsw-alias-label-primary)" : "2px solid transparent",
+					fontWeight: tab === "reviews" ? 600 : 400
+				}
+			}, `后台更新记录 (${reviewHistory.length} 条)`)), selected.size > 0 ? react.default.createElement("div", { style: {
 				display: "flex",
 				alignItems: "center",
 				gap: 8,
@@ -878,7 +785,44 @@ window.__ModuleLoader__.load({
 				fontSize: 12,
 				color: "var(--dsw-alias-label-tertiary)",
 				padding: 8
-			} }, "加载中…") : currentEntries.length === 0 ? react.default.createElement("div", { style: {
+			} }, "加载中…") : tab === "reviews" ? reviewHistory.length === 0 ? react.default.createElement("div", { style: {
+				fontSize: 12,
+				color: "var(--dsw-alias-label-tertiary)",
+				padding: 8
+			} }, "（尚无后台更新记录）") : react.default.createElement("table", { style: {
+				width: "100%",
+				borderCollapse: "collapse",
+				tableLayout: "fixed",
+				marginTop: 8,
+				fontSize: 12
+			} }, react.default.createElement("thead", null, react.default.createElement("tr", null, react.default.createElement("th", { style: {
+				...cellStyle,
+				width: 172,
+				fontWeight: 600
+			} }, "更新时间"), react.default.createElement("th", { style: {
+				...cellStyle,
+				width: 112,
+				fontWeight: 600
+			} }, "结果"), react.default.createElement("th", { style: {
+				...cellStyle,
+				width: 120,
+				fontWeight: 600
+			} }, "结束状态"), react.default.createElement("th", { style: {
+				...cellStyle,
+				fontWeight: 600
+			} }, "变更详情"))), react.default.createElement("tbody", null, [...reviewHistory].reverse().map((record, index) => react.default.createElement("tr", { key: `${record.completedAt}-${index}` }, react.default.createElement("td", { style: {
+				...cellStyle,
+				color: "var(--dsw-alias-label-tertiary)"
+			} }, record.completedAt === "" ? "升级前未记录" : formatTime(record.completedAt)), react.default.createElement("td", { style: cellStyle }, record.changes.length > 0 ? `已保存 ${record.changes.length} 项` : "未修改记忆"), react.default.createElement("td", { style: {
+				...cellStyle,
+				color: "var(--dsw-alias-label-tertiary)"
+			} }, reviewReasonLabel(record.reason)), react.default.createElement("td", { style: cellStyle }, record.changes.length === 0 ? "现有记忆已覆盖本轮对话中的长期信息。" : record.changes.map((change, changeIndex) => react.default.createElement("div", {
+				key: `${changeIndex}-${change.content}`,
+				style: {
+					whiteSpace: "pre-wrap",
+					wordBreak: "break-word"
+				}
+			}, `${change.target === "user" ? "USER" : "MEMORY"} ${change.action === "added" ? "＋" : "−"} ${change.content}`))))))) : currentEntries.length === 0 ? react.default.createElement("div", { style: {
 				fontSize: 12,
 				color: "var(--dsw-alias-label-tertiary)",
 				padding: 8
@@ -950,11 +894,6 @@ window.__ModuleLoader__.load({
 				id: "memory",
 				order: 40
 			}, MemorySettingsCard));
-			slots.inject("conversation.input.dock", () => slots.register({
-				name: "conversation.input.dock",
-				id: "memory-review",
-				order: 30
-			}, (props) => react.default.createElement(MemoryReviewNotice, props)));
 			slots.inject("conversation.composer.dock", () => slots.register({
 				name: "conversation.composer.dock",
 				id: "memory-indicator",

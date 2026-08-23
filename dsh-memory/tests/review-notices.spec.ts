@@ -30,24 +30,26 @@ const second = {
 }
 
 describe('MemoryReviewNotices', () => {
-  it('persists and isolates receipts by session without consuming them on read', async () => {
+  it('persists bounded review histories by session', async () => {
     const notices = new MemoryReviewNotices(dir)
     await notices.publish(first)
     await notices.publish(second)
 
-    expect(await notices.get('session-a')).toEqual(first)
-    expect(await notices.get('session-a')).toEqual(first)
-    expect(await notices.get('session-b')).toEqual(second)
-    expect(await notices.get('unknown')).toBeUndefined()
+    const sessionA = await notices.list('session-a')
+    expect(sessionA).toHaveLength(1)
+    expect(sessionA[0]).toMatchObject(first)
+    expect(sessionA[0]?.completedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/)
+    expect((await notices.list('session-b'))[0]).toMatchObject(second)
+    expect(await notices.list('unknown')).toEqual([])
 
     const afterRefresh = new MemoryReviewNotices(dir)
-    expect(await afterRefresh.get('session-a')).toEqual(first)
+    expect((await afterRefresh.list('session-a'))[0]).toMatchObject(first)
   })
 
   it('drops a disposed session receipt', async () => {
     const notices = new MemoryReviewNotices(dir)
     await notices.publish(first)
     await notices.discard('session-a')
-    expect(await notices.get('session-a')).toBeUndefined()
+    expect(await notices.list('session-a')).toEqual([])
   })
 })
