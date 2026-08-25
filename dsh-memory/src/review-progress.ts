@@ -14,6 +14,23 @@ export interface MemoryReviewProgress {
   readonly reviewEnabled: boolean
 }
 
+/**
+ * Turns still needed before the next armed review, given how many completed
+ * user turns already count toward the current cycle.
+ * @param countedTurns - completed user turns already folded into this cycle.
+ * @param nudgeInterval - configured cycle length; 0 disables reviews.
+ * @param reviewEnabled - master switch for the background review.
+ * @returns remaining turns, or 0 when reviews are off.
+ */
+export function remainingTurnsUntilReview(
+  countedTurns: number,
+  nudgeInterval: number,
+  reviewEnabled: boolean,
+): number {
+  if (!reviewEnabled || nudgeInterval <= 0) return 0
+  return nudgeInterval - (countedTurns % nudgeInterval)
+}
+
 /** Persist the latest countdown for each session outside the official session log. */
 export class MemoryReviewProgressStore {
   private readonly bySession = new Map<string, MemoryReviewProgress>()

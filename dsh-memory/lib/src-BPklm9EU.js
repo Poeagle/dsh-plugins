@@ -1101,6 +1101,18 @@ const memoryReviewNotices = new MemoryReviewNotices();
 /** Durable review-cycle progress for the browser memory indicator. */
 const DIR_MODE = 448;
 const FILE_MODE = 384;
+/**
+* Turns still needed before the next armed review, given how many completed
+* user turns already count toward the current cycle.
+* @param countedTurns - completed user turns already folded into this cycle.
+* @param nudgeInterval - configured cycle length; 0 disables reviews.
+* @param reviewEnabled - master switch for the background review.
+* @returns remaining turns, or 0 when reviews are off.
+*/
+function remainingTurnsUntilReview(countedTurns, nudgeInterval, reviewEnabled) {
+	if (!reviewEnabled || nudgeInterval <= 0) return 0;
+	return nudgeInterval - countedTurns % nudgeInterval;
+}
 /** Persist the latest countdown for each session outside the official session log. */
 var MemoryReviewProgressStore = class {
 	bySession = /* @__PURE__ */ new Map();
@@ -1531,6 +1543,15 @@ function priorCompletedUserTurns(session) {
 	}
 	return count;
 }
+/** True when a counted user message is still waiting for its `turn/end`. */
+function hasPendingCountedUserTurn(session) {
+	let pendingUserTurn = false;
+	for (const event of session.events) {
+		if (isCountedUserMessage(event)) pendingUserTurn = true;
+		if (event.type === "turn/end") pendingUserTurn = false;
+	}
+	return pendingUserTurn;
+}
 /**
 * Activate the memory subsystem: load the stores, register the tool and the
 * system-prompt snapshot section, and attach the per-session nudge counters
@@ -1587,8 +1608,9 @@ async function apply(ctx, config) {
 			return await dispatchMemoryTool(store, toMemoryToolArgs(args));
 		}
 	}));
-	ctx.on("session/created", () => {
+	ctx.on("session/created", (session) => {
 		store.refreshSnapshot();
+		seedReviewProgress(session);
 	});
 	/** Sessions that have already received the memory context injection. */
 	const injected = /* @__PURE__ */ new Set();
@@ -1668,9 +1690,28 @@ async function apply(ctx, config) {
 	function publishReviewProgress(sessionId, state, nudgeInterval, reviewEnabled) {
 		memoryReviewProgress.publish(String(sessionId), {
 			reviewEnabled,
-			remainingTurns: reviewEnabled && nudgeInterval > 0 ? nudgeInterval - state.turnsSinceMemory : 0
+			remainingTurns: remainingTurnsUntilReview(state.turnsSinceMemory, nudgeInterval, reviewEnabled)
 		});
 	}
+	/**
+	* Seed the durable countdown as soon as a session is live so a browser
+	* refresh during the first unfinished turn still has a value to show.
+	* @param session - live session to publish for.
+	*/
+	function seedReviewProgress(session) {
+		if ((session.header.delegationDepth ?? 0) > 0) return;
+		const { nudgeInterval, reviewEnabled } = effectiveSettings();
+		const state = stateFor(session.id);
+		if (!state.hydrated) {
+			const completed = priorCompletedUserTurns(session);
+			state.turnsSinceMemory = nudgeInterval > 0 && completed > 0 ? completed % nudgeInterval : 0;
+			state.pendingUserTurn = hasPendingCountedUserTurn(session);
+			state.hydrated = true;
+		}
+		publishReviewProgress(session.id, state, nudgeInterval, reviewEnabled);
+	}
+	const sessions = ctx.get("sessions");
+	if (sessions !== void 0) for (const session of sessions.list()) seedReviewProgress(session);
 	/** Count only completed main-session user turns and arm review on the configured interval. */
 	ctx.on("session/event", (session, event) => {
 		if ((session.header.delegationDepth ?? 0) > 0) return;
@@ -1748,6 +1789,6 @@ async function apply(ctx, config) {
 	});
 }
 //#endregion
-export { DEFAULT_USER_CHAR_LIMIT as a, name as c, MemoryStore as d, DEFAULT_REVIEW_MAX_ITERATIONS as i, memoryReviewProgress as l, DEFAULT_MEMORY_CHAR_LIMIT as n, apply as o, DEFAULT_NUDGE_INTERVAL as r, inject as s, Config as t, memoryReviewNotices as u };
+export { DEFAULT_USER_CHAR_LIMIT as a, name as c, memoryReviewNotices as d, MemoryStore as f, DEFAULT_REVIEW_MAX_ITERATIONS as i, memoryReviewProgress as l, DEFAULT_MEMORY_CHAR_LIMIT as n, apply as o, DEFAULT_NUDGE_INTERVAL as r, inject as s, Config as t, remainingTurnsUntilReview as u };
 
-//# sourceMappingURL=src-Bym_kend.js.map
+//# sourceMappingURL=src-BPklm9EU.js.map

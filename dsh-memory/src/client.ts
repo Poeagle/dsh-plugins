@@ -649,7 +649,20 @@ function MemoryDock({ sessionId }: { sessionId: string }) {
   React.useEffect(() => {
     const refresh = (): void => {
       void fetchStatus().then(setStatus)
-      void fetchReviewProgress(sessionId).then(setReviewProgress)
+      void Promise.all([fetchReviewProgress(sessionId), fetchConfig()]).then(([progress, cfg]) => {
+        if (progress) {
+          setReviewProgress(progress)
+          return
+        }
+        if (cfg?.ok === true && cfg.value !== undefined) {
+          setReviewProgress({
+            remainingTurns: cfg.value.reviewEnabled ? cfg.value.nudgeInterval : 0,
+            reviewEnabled: cfg.value.reviewEnabled,
+          })
+          return
+        }
+        setReviewProgress(null)
+      })
     }
     refresh()
     const interval = setInterval(refresh, 2000)

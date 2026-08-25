@@ -25,7 +25,7 @@ import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { JsonValue } from '@deepseek-ai/dsh-session'
 import { MemoryStore } from './store.ts'
 import { memoryReviewNotices } from './review-notices.ts'
-import { memoryReviewProgress } from './review-progress.ts'
+import { memoryReviewProgress, remainingTurnsUntilReview } from './review-progress.ts'
 import type { MemoryReviewNotification } from './types.ts'
 import { MEMORY_TOOL_DESCRIPTION, MEMORY_TOOL_PARAMETERS, dispatchMemoryTool, toMemoryToolArgs } from './schema.ts'
 import { runMemoryReview } from './review.ts'
@@ -124,6 +124,16 @@ function priorCompletedUserTurns(session: Session): number {
   return count
 }
 
+/** True when a counted user message is still waiting for its `turn/end`. */
+function hasPendingCountedUserTurn(session: Session): boolean {
+  let pendingUserTurn = false
+  for (const event of session.events) {
+    if (isCountedUserMessage(event)) pendingUserTurn = true
+    if (event.type === 'turn/end') pendingUserTurn = false
+  }
+  return pendingUserTurn
+}
+
 /**
  * Activate the memory subsystem: load the stores, register the tool and the
  * system-prompt snapshot section, and attach the per-session nudge counters
@@ -184,8 +194,9 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   // with source.kind === 'plugin' as expandable "上下文注入" cards.
   // The snapshot is refreshed at session creation so new sessions always
   // see the latest data; mid-session writes do NOT refresh the snapshot.
-  ctx.on('session/created', () => {
+  ctx.on('session/created', (session: Session) => {
     void store.refreshSnapshot()
+    seedReviewProgress(session)
   })
 
   /** Sessions that have already received the memory context injection. */
@@ -273,8 +284,31 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   function publishReviewProgress(sessionId: SessionId, state: SessionNudgeState, nudgeInterval: number, reviewEnabled: boolean): void {
     void memoryReviewProgress.publish(String(sessionId), {
       reviewEnabled,
-      remainingTurns: reviewEnabled && nudgeInterval > 0 ? nudgeInterval - state.turnsSinceMemory : 0,
+      remainingTurns: remainingTurnsUntilReview(state.turnsSinceMemory, nudgeInterval, reviewEnabled),
     })
+  }
+
+  /**
+   * Seed the durable countdown as soon as a session is live so a browser
+   * refresh during the first unfinished turn still has a value to show.
+   * @param session - live session to publish for.
+   */
+  function seedReviewProgress(session: Session): void {
+    if ((session.header.delegationDepth ?? 0) > 0) return
+    const { nudgeInterval, reviewEnabled } = effectiveSettings()
+    const state = stateFor(session.id)
+    if (!state.hydrated) {
+      const completed = priorCompletedUserTurns(session)
+      state.turnsSinceMemory = nudgeInterval > 0 && completed > 0 ? completed % nudgeInterval : 0
+      state.pendingUserTurn = hasPendingCountedUserTurn(session)
+      state.hydrated = true
+    }
+    publishReviewProgress(session.id, state, nudgeInterval, reviewEnabled)
+  }
+
+  const sessions = ctx.get('sessions') as { list(): Session[] } | undefined
+  if (sessions !== undefined) {
+    for (const session of sessions.list()) seedReviewProgress(session)
   }
 
   /** Count only completed main-session user turns and arm review on the configured interval. */

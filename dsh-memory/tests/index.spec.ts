@@ -18,6 +18,7 @@ import SystemPrompt, { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 import * as memory from '../src/index.ts'
 import { memoryReviewNotices } from '../src/review-notices.ts'
+import { memoryReviewProgress } from '../src/review-progress.ts'
 
 const SIGNAL = new AbortController().signal
 
@@ -262,6 +263,44 @@ describe('memory plugin wiring', () => {
 })
 
 describe('nudge gating', () => {
+  it('publishes a full-cycle countdown when a live session is created', async () => {
+    const c = await mount({ nudgeInterval: 5 })
+    const session = c.sessions.create(SessionId('countdown-seed'))
+    await vi.waitFor(async () => {
+      await expect(memoryReviewProgress.get(String(session.id))).resolves.toEqual({
+        reviewEnabled: true,
+        remainingTurns: 5,
+      })
+    })
+  })
+
+  it('seeds the countdown for a session already live when the plugin mounts', async () => {
+    const c = new Context()
+    ctx = c
+    await c.plugin(SessionStore)
+    await c.plugin(SystemPrompt)
+    await c.plugin(ToolRuntime)
+    await c.plugin(AgentRegistry)
+    await c.plugin(LlmRuntime)
+    const session = c.sessions.create(SessionId('already-live'))
+    session.append('turn/start', { turn: 1 })
+    appendUserMessage(session, 'in-flight first turn')
+    memoryFiber = await c.plugin(memory, { nudgeInterval: 5 } as memory.Config)
+    await vi.waitFor(async () => {
+      await expect(memoryReviewProgress.get(String(session.id))).resolves.toEqual({
+        reviewEnabled: true,
+        remainingTurns: 5,
+      })
+    })
+    session.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+    await vi.waitFor(async () => {
+      await expect(memoryReviewProgress.get(String(session.id))).resolves.toEqual({
+        reviewEnabled: true,
+        remainingTurns: 4,
+      })
+    })
+  })
+
   it('arms a review on the interval-th user turn and skips non-counting events', async () => {
     const c = await mount({ nudgeInterval: 2 })
     const adapter = new ScriptedAdapter([textResponse('Nothing to save.')])

@@ -1,4 +1,4 @@
-import { d as MemoryStore, l as memoryReviewProgress, t as Config, u as memoryReviewNotices } from "./src-Bym_kend.js";
+import { d as memoryReviewNotices, f as MemoryStore, l as memoryReviewProgress, t as Config, u as remainingTurnsUntilReview } from "./src-BPklm9EU.js";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 //#region src/settings.ts
@@ -136,9 +136,23 @@ function apply(ctx) {
 						});
 						return;
 					}
+					const stored = await memoryReviewProgress.get(sessionId);
+					if (stored !== void 0) {
+						send(res, 200, {
+							ok: true,
+							value: stored
+						});
+						return;
+					}
+					const raw = ctx.get("settings")?.get?.("memory");
+					const nudgeInterval = typeof raw?.nudgeInterval === "number" ? raw.nudgeInterval : 10;
+					const reviewEnabled = typeof raw?.reviewEnabled === "boolean" ? raw.reviewEnabled : true;
 					send(res, 200, {
 						ok: true,
-						value: await memoryReviewProgress.get(sessionId) ?? null
+						value: {
+							reviewEnabled,
+							remainingTurns: remainingTurnsUntilReview(0, nudgeInterval, reviewEnabled)
+						}
 					});
 					return;
 				}

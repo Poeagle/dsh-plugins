@@ -64,7 +64,7 @@ npm test           # vitest 单元测试
 
 ## 后台审查
 
-每一条用户来源的 `user/message`（委派会话除外）都会让该会话的计数器加一；达到 `nudgeInterval` 时武装一个待处理审查。恢复的会话在第一条实时用户消息时按历史用户轮次数水合计数器（`prior % interval`）。被武装的审查在下一个正常完成的 `turn/end` 时启动：`runMemoryReview` 以该会话最后一次路由到的请求路由完整回放会话，把审查指令作为最后一条用户消息追加进去，并以仅有 memory 工具的循环运行，直到模型不再调用工具或达到 `reviewMaxIterations`。每个会话同一时间只跑一个审查；会话销毁会中止分支并清理状态。
+每一条用户来源的 `user/message`（委派会话除外）都会让该会话的计数器加一；达到 `nudgeInterval` 时武装一个待处理审查。会话一进入 live，或插件挂载扫到已有 live 会话时，就会写入 `$DSH_HOME/memories/.review-progress.json`，因此第一轮尚未结束就刷新浏览器仍能看到剩余轮次。恢复的会话按已完成用户轮次水合计数器（`prior % interval`）。被武装的审查在下一个正常完成的 `turn/end` 时启动：`runMemoryReview` 以该会话最后一次路由到的请求路由完整回放会话，把审查指令作为最后一条用户消息追加进去，并以仅有 memory 工具的循环运行，直到模型不再调用工具或达到 `reviewMaxIterations`。每个会话同一时间只跑一个审查；会话销毁会中止分支并清理状态。
 
 配置字段（均经校验，可在 cordis.yml 中覆盖）：
 

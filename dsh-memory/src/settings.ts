@@ -3,9 +3,9 @@
 import { readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
-import { Config } from './index.ts'
+import { Config, DEFAULT_NUDGE_INTERVAL } from './index.ts'
 import { memoryReviewNotices } from './review-notices.ts'
-import { memoryReviewProgress } from './review-progress.ts'
+import { memoryReviewProgress, remainingTurnsUntilReview } from './review-progress.ts'
 import { MemoryStore } from './store.ts'
 
 const MEMORY_ROUTE = '/memory/api'
@@ -151,7 +151,22 @@ export function apply(ctx: Context): void {
             send(res, 400, { ok: false, error: 'sessionId is required.' })
             return
           }
-          send(res, 200, { ok: true, value: await memoryReviewProgress.get(sessionId) ?? null })
+          const stored = await memoryReviewProgress.get(sessionId)
+          if (stored !== undefined) {
+            send(res, 200, { ok: true, value: stored })
+            return
+          }
+          const settingsFace = ctx.get('settings') as { get?(ns: string): unknown } | undefined
+          const raw = settingsFace?.get?.('memory') as { nudgeInterval?: number; reviewEnabled?: boolean } | undefined
+          const nudgeInterval = typeof raw?.nudgeInterval === 'number' ? raw.nudgeInterval : DEFAULT_NUDGE_INTERVAL
+          const reviewEnabled = typeof raw?.reviewEnabled === 'boolean' ? raw.reviewEnabled : true
+          send(res, 200, {
+            ok: true,
+            value: {
+              reviewEnabled,
+              remainingTurns: remainingTurnsUntilReview(0, nudgeInterval, reviewEnabled),
+            },
+          })
           return
         }
 

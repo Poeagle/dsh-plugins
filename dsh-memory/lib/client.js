@@ -567,7 +567,20 @@ window.__ModuleLoader__.load({
 			react.default.useEffect(() => {
 				const refresh = () => {
 					fetchStatus().then(setStatus);
-					fetchReviewProgress(sessionId).then(setReviewProgress);
+					Promise.all([fetchReviewProgress(sessionId), fetchConfig()]).then(([progress, cfg]) => {
+						if (progress) {
+							setReviewProgress(progress);
+							return;
+						}
+						if (cfg?.ok === true && cfg.value !== void 0) {
+							setReviewProgress({
+								remainingTurns: cfg.value.reviewEnabled ? cfg.value.nudgeInterval : 0,
+								reviewEnabled: cfg.value.reviewEnabled
+							});
+							return;
+						}
+						setReviewProgress(null);
+					});
 				};
 				refresh();
 				const interval = setInterval(refresh, 2e3);

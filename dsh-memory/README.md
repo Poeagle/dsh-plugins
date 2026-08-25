@@ -64,7 +64,7 @@ Overflow and zero-match failures count toward a per-turn consolidation budget. T
 
 ## Background review
 
-On every user-source `user/message` (delegations excluded) a per-session counter increments; reaching `nudgeInterval` arms a pending review. Resumed sessions hydrate the counter from the prior user-turn count (`prior % interval`) at their first live user message. The armed review spawns when the next `turn/end` completes normally: `runMemoryReview` replays the whole session through the session's last routed request route, appends the review directive as one final user message, and loops with the memory-only tool until the model stops calling it or `reviewMaxIterations` is reached. One review per session runs at a time; session disposal aborts the fork and clears its state.
+On every user-source `user/message` (delegations excluded) a per-session counter increments; reaching `nudgeInterval` arms a pending review. A live session seeds `$DSH_HOME/memories/.review-progress.json` as soon as it is created or the plugin mounts, so a browser refresh during the first unfinished turn still shows the remaining-turn countdown. Resumed sessions hydrate the counter from the prior completed-user-turn count (`prior % interval`). The armed review spawns when the next `turn/end` completes normally: `runMemoryReview` replays the whole session through the session's last routed request route, appends the review directive as one final user message, and loops with the memory-only tool until the model stops calling it or `reviewMaxIterations` is reached. One review per session runs at a time; session disposal aborts the fork and clears its state.
 
 Config fields (validated, all overridable from cordis.yml):
 
