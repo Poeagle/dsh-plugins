@@ -2,7 +2,7 @@
 
 English | [中文](README.zh.md)
 
-Bounded curated memory: two character-capped stores persisted as `MEMORY.md` / `USER.md`, a frozen snapshot injected into the system prompt, threat-scanned writes, and a background review fork that may consolidate entries after completed turns.
+Bounded curated memory: two character-capped stores persisted as `MEMORY.md` / `USER.md`, one frozen user-role context message per session, threat-scanned writes, and a background review fork that may consolidate entries after completed turns.
 
 This is a standalone profile plugin (same pattern as `dsh-cost-meter`), not an official repository package.
 
@@ -60,7 +60,7 @@ Overflow and zero-match failures count toward a per-turn consolidation budget. T
 
 ## Frozen snapshot
 
-`formatForSystemPrompt` returns the block captured at `loadFromDisk()` time, never live state. Mid-session writes hit disk but never the prompt; the new entries become visible on the next process/preset load. The section registers at `memory:snapshot` with `order: -50` so it precedes later prompt sections.
+`renderContextBlock` returns the block captured at `loadFromDisk()` time, never live state. The plugin inserts it once as a plugin-source user-role message when a session first enters a step. Mid-session writes hit disk but never alter that message; a new session receives the snapshot that was refreshed at its creation. If compaction replaces that message from the model-visible surface, the next entered step inserts the same frozen snapshot again.
 
 ## Background review
 
@@ -78,11 +78,11 @@ Config fields (validated, all overridable from cordis.yml):
 
 ## Model Experience
 
-### Frozen snapshot block
+### Frozen snapshot context
 
 #### What the model sees
 
-Each request whose preset mounts the plugin carries the load-time snapshot in the system prompt, one block per non-empty target. The header reports the frozen usage; entries are `§`-separated. An empty target renders nothing.
+The first entered step of a session carries one plugin-source user-role message containing the frozen snapshot, one block per non-empty target. The message remains in derived history for later requests; an empty target adds no message. The header's system prompt does not contain the snapshot.
 
 ##### Memory snapshot block layout
 
@@ -97,11 +97,11 @@ MEMORY (your personal notes) [<pct>% — <current>/<limit> chars]
 
 #### Token effect
 
-Fixed per-request cost bounded by the char limits (2200 + 1375 chars by default); usage strings inside the headers grow with the stores. Writes during a session do not change the block until the next load.
+One bounded user-role message per active surface, capped by the two store limits (2200 + 1375 chars by default). Writes during a session do not change the frozen message.
 
 #### KV Cache effect
 
-Stable repeated prefix within one process lifetime. A restart with different on-disk entries changes the block text and invalidates reuse from that system-prompt position onward; everything before it stays reusable.
+The injected message becomes a stable early history node. A new session with different on-disk entries changes history from that message onward; earlier request-prefix material remains reusable.
 
 ### Memory tool result
 
@@ -148,7 +148,7 @@ Independent model request; it shares no cache position with the session it revie
 ## Known Limitations and Deferred Work
 
 - **No write approval gate** — the upstream write-confirmation flow is deliberately not ported; memory writes from the review fork and live tool calls land without human review.
-- **The snapshot is frozen until reload** — mid-session writes are durable but invisible to subsequent requests in the same process; nothing refreshes the prompt blocks on write.
+- **The snapshot is frozen for each session** — mid-session writes are durable but invisible to subsequent requests in that session; only a newly created session receives a refreshed snapshot.
 - **Reviews run only after completed turns** — aborted or error-terminated turns never arm a review, and a session without a resolvable model route skips silently.
 - **One shared store per DSH_HOME** — every session and preset under the same home reads and writes the same two files; there is no per-workspace or per-agent partitioning.
 - **No sync or retention** — files are plain local text; the only backup is the drift `.bak.<epoch>` copy, and nothing ever prunes old backups.

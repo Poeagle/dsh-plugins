@@ -1,4 +1,4 @@
-import { d as memoryReviewNotices, f as MemoryStore, l as memoryReviewProgress, t as Config, u as remainingTurnsUntilReview } from "./src-BPklm9EU.js";
+import { d as memoryReviewNotices, f as MemoryStore, l as memoryReviewProgress, t as Config, u as remainingTurnsUntilReview } from "./src-Dtyemm0a.js";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 //#region src/settings.ts
@@ -72,8 +72,8 @@ function apply(ctx) {
 					let memSize = 0;
 					let userSize = 0;
 					try {
-						const memStat = await readFile(join(memDir, "MEMORY.md")).then((b) => b.length).catch(() => 0);
-						const userStat = await readFile(join(memDir, "USER.md")).then((b) => b.length).catch(() => 0);
+						const memStat = await readFile(join(memDir, "MEMORY.md")).then((bytes) => bytes.length).catch(() => 0);
+						const userStat = await readFile(join(memDir, "USER.md")).then((bytes) => bytes.length).catch(() => 0);
 						memSize = memStat;
 						userSize = userStat;
 					} catch {}

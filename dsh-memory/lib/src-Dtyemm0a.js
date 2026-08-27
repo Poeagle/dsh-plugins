@@ -706,7 +706,6 @@ var MemoryStore = class {
 	}
 	/** Load valid sidecar timestamps and fall back to the plaintext file mtime for legacy entries. */
 	async loadMetadata(target) {
-		new Set(this.entries[target].map(stripTimestamp$1));
 		const timestamps = /* @__PURE__ */ new Map();
 		try {
 			const raw = await readFile(this.metadataPathFor(target), "utf8");
@@ -1482,8 +1481,7 @@ const name = "memory";
 const inject = [
 	"tools",
 	"llm",
-	"agents",
-	"systemPrompt"
+	"agents"
 ];
 /** Character budget of the `memory` store, mirroring the upstream default. */
 const DEFAULT_MEMORY_CHAR_LIMIT = 2200;
@@ -1554,8 +1552,8 @@ function hasPendingCountedUserTurn(session) {
 }
 /**
 * Activate the memory subsystem: load the stores, register the tool and the
-* system-prompt snapshot section, and attach the per-session nudge counters
-* plus the background review spawner.
+* one-time user-role snapshot injection, and attach the per-session nudge
+* counters plus the background review spawner.
 * @param ctx - registrant context.
 * @param config - deployment memory policy.
 */
@@ -1566,11 +1564,6 @@ async function apply(ctx, config) {
 		userCharLimit: config.userCharLimit
 	});
 	await store.loadFromDisk();
-	ctx.systemPrompt.section({
-		name: "memory:snapshot",
-		order: -50,
-		text: () => store.renderContextBlock()
-	});
 	/**
 	* Resolve the effective nudge/review settings from the optional settings
 	* service, falling back to the composition config when the service is
@@ -1791,4 +1784,4 @@ async function apply(ctx, config) {
 //#endregion
 export { DEFAULT_USER_CHAR_LIMIT as a, name as c, memoryReviewNotices as d, MemoryStore as f, DEFAULT_REVIEW_MAX_ITERATIONS as i, memoryReviewProgress as l, DEFAULT_MEMORY_CHAR_LIMIT as n, apply as o, DEFAULT_NUDGE_INTERVAL as r, inject as s, Config as t, remainingTurnsUntilReview as u };
 
-//# sourceMappingURL=src-BPklm9EU.js.map
+//# sourceMappingURL=src-Dtyemm0a.js.map

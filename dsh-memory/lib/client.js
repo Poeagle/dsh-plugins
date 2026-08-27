@@ -550,6 +550,127 @@ window.__ModuleLoader__.load({
 				onClick: () => handleReset("all")
 			}, resetting === "all" ? "重置中…" : "重置全部")))) : null);
 		}
+		function MemoryReviewNotice({ sessionId }) {
+			const [notice, setNotice] = react.default.useState(void 0);
+			const [expanded, setExpanded] = react.default.useState(false);
+			react.default.useEffect(() => {
+				let disposed = false;
+				setNotice(void 0);
+				const read = () => {
+					fetchReviewHistory(sessionId).then((history) => {
+						if (!disposed) setNotice(history.at(-1));
+					});
+				};
+				read();
+				const interval = setInterval(read, 2e3);
+				return () => {
+					disposed = true;
+					clearInterval(interval);
+				};
+			}, [sessionId]);
+			react.default.useEffect(() => {
+				setExpanded(false);
+			}, [notice]);
+			if (notice === void 0) return null;
+			const summary = `后台复核 · 已保存 ${notice.changes.length} 项变更`;
+			const toggle = () => {
+				setExpanded((value) => !value);
+			};
+			return react.default.createElement("div", { style: {
+				display: "flex",
+				justifyContent: "center",
+				width: "100%",
+				maxWidth: "100%",
+				margin: "0 0 6px"
+			} }, react.default.createElement("div", { style: { width: "min(100%, 560px)" } }, react.default.createElement("div", {
+				style: {
+					display: "inline-flex",
+					maxWidth: "100%",
+					alignItems: "center",
+					gap: 8,
+					padding: "5px 9px",
+					border: "1px solid var(--dsw-alias-border-l2)",
+					borderRadius: 6,
+					background: "var(--dsw-alias-bg-layer-2)",
+					fontSize: 13,
+					lineHeight: "20px",
+					color: "var(--dsw-alias-label-primary)",
+					cursor: "pointer",
+					userSelect: "none"
+				},
+				role: "button",
+				tabIndex: 0,
+				"aria-expanded": expanded,
+				onClick: toggle,
+				onKeyDown: (event) => {
+					if (event.key === "Enter" || event.key === " ") {
+						event.preventDefault();
+						toggle();
+					}
+				}
+			}, react.default.createElement("span", { style: {
+				width: 8,
+				height: 8,
+				borderRadius: "50%",
+				flexShrink: 0,
+				background: "var(--dsw-alias-color-success, #22c55e)"
+			} }), react.default.createElement("span", { style: {
+				fontSize: 10,
+				color: "var(--dsw-alias-label-tertiary)",
+				flexShrink: 0,
+				transform: expanded ? "rotate(180deg)" : "rotate(0deg)",
+				transition: "transform 0.15s"
+			} }, expanded ? "▾" : "▸"), react.default.createElement("span", { style: {
+				fontSize: 12,
+				flexShrink: 0,
+				marginRight: 2
+			} }, "📝"), react.default.createElement("span", { style: {
+				fontWeight: 500,
+				flexShrink: 0
+			} }, "记忆"), react.default.createElement("span", { style: {
+				flex: 1,
+				minWidth: 0,
+				overflow: "hidden",
+				textOverflow: "ellipsis",
+				whiteSpace: "nowrap",
+				color: "var(--dsw-alias-label-secondary)",
+				fontSize: 12
+			} }, summary)), expanded ? react.default.createElement("div", { style: {
+				margin: "4px 0 0",
+				padding: 8,
+				border: "1px solid var(--dsw-alias-border-l2)",
+				borderRadius: 6,
+				background: "var(--dsw-alias-bg-layer-2)",
+				fontSize: 12,
+				lineHeight: "1.5",
+				display: "grid",
+				gap: 6
+			} }, react.default.createElement("div", { style: {
+				fontSize: 11,
+				color: "var(--dsw-alias-label-tertiary)",
+				fontWeight: 600
+			} }, "OUT · 已持久化变更"), notice.changes.map((change, index) => react.default.createElement("div", {
+				key: `${index}-${change.target}-${change.action}-${change.content}`,
+				style: {
+					display: "grid",
+					gridTemplateColumns: "auto auto 1fr",
+					gap: 6,
+					alignItems: "start",
+					padding: "6px 8px",
+					background: "var(--dsw-alias-bg-layer-3)",
+					borderRadius: 4,
+					whiteSpace: "pre-wrap",
+					wordBreak: "break-word",
+					color: "var(--dsw-alias-label-primary)"
+				}
+			}, react.default.createElement("span", { style: {
+				color: "var(--dsw-alias-label-tertiary)",
+				fontSize: 11
+			} }, change.target === "user" ? "USER" : "MEMORY"), react.default.createElement("span", { style: {
+				color: change.action === "added" ? "var(--dsw-alias-color-success, #22c55e)" : "var(--dsw-alias-label-error)",
+				fontWeight: 600
+			} }, change.action === "added" ? "＋" : "−"), react.default.createElement("span", null, change.content)))) : null));
+		}
 		function MemoryDock({ sessionId }) {
 			const [status, setStatus] = react.default.useState(null);
 			const [expandedReviews, setExpandedReviews] = react.default.useState(/* @__PURE__ */ new Set());
@@ -953,6 +1074,7 @@ window.__ModuleLoader__.load({
 			}, (props) => react.default.createElement(MemoryDock, { ...props })));
 		}
 		//#endregion
+		exports.MemoryReviewNotice = MemoryReviewNotice;
 		exports.apply = apply;
 		exports.inject = inject;
 		return module.exports;

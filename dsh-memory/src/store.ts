@@ -481,7 +481,6 @@ export class MemoryStore {
 
   /** Load valid sidecar timestamps and fall back to the plaintext file mtime for legacy entries. */
   private async loadMetadata(target: MemoryTarget): Promise<void> {
-    const entries = new Set(this.entries[target].map(stripTimestamp))
     const timestamps = new Map<string, string>()
     try {
       const raw = await readFile(this.metadataPathFor(target), 'utf8')

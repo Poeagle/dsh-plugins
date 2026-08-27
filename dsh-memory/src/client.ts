@@ -544,7 +544,7 @@ function MemorySettingsCard(_props: Record<string, unknown>) {
 
 // ── Background-review history ───────────────────────────────────────────
 
-function MemoryReviewNotice({ sessionId }: { sessionId: string }) {
+export function MemoryReviewNotice({ sessionId }: { sessionId: string }) {
   const [notice, setNotice] = React.useState<MemoryReviewRecord | undefined>(undefined)
   const [expanded, setExpanded] = React.useState(false)
   React.useEffect(() => {

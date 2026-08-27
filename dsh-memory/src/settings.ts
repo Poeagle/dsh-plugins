@@ -101,9 +101,9 @@ export function apply(ctx: Context): void {
           let userSize = 0
           try {
             const memStat = await readFile(join(memDir, 'MEMORY.md'))
-              .then((b: string) => b.length).catch(() => 0)
+              .then(bytes => bytes.length).catch(() => 0)
             const userStat = await readFile(join(memDir, 'USER.md'))
-              .then((b: string) => b.length).catch(() => 0)
+              .then(bytes => bytes.length).catch(() => 0)
             memSize = memStat
             userSize = userStat
           } catch { /* ignore */ }

@@ -1,8 +1,8 @@
 /**
  * Persistent bounded memory for DSH agents — a port of the upstream memory
  * subsystem. Two `§`-delimited files under `$DSH_HOME/memories/` hold the
- * entries; a frozen snapshot captured at activation feeds the system prompt;
- * the `memory` tool mutates the live lists on disk; and after gated completed
+ * entries; a frozen snapshot captured at activation enters each new session as
+ * one user-role context message; the `memory` tool mutates the live lists on disk; and after gated completed
  * turns a background review fork lets the model save durable facts on its
  * own.
  *
@@ -34,7 +34,7 @@ import { runMemoryReview } from './review.ts'
 export const name = 'memory'
 
 /** Services required before activation. */
-export const inject = ['tools', 'llm', 'agents', 'systemPrompt']
+export const inject = ['tools', 'llm', 'agents']
 
 /** Character budget of the `memory` store, mirroring the upstream default. */
 export const DEFAULT_MEMORY_CHAR_LIMIT = 2200
@@ -136,8 +136,8 @@ function hasPendingCountedUserTurn(session: Session): boolean {
 
 /**
  * Activate the memory subsystem: load the stores, register the tool and the
- * system-prompt snapshot section, and attach the per-session nudge counters
- * plus the background review spawner.
+ * one-time user-role snapshot injection, and attach the per-session nudge
+ * counters plus the background review spawner.
  * @param ctx - registrant context.
  * @param config - deployment memory policy.
  */
@@ -148,11 +148,6 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     userCharLimit: config.userCharLimit,
   })
   await store.loadFromDisk()
-  ctx.systemPrompt.section({
-    name: 'memory:snapshot',
-    order: -50,
-    text: () => store.renderContextBlock(),
-  })
 
   /**
    * Resolve the effective nudge/review settings from the optional settings

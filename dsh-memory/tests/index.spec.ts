@@ -14,7 +14,7 @@ import LlmRuntime, {
 } from '@deepseek-ai/dsh-llm'
 import { Session, SessionId, SessionStore, type SessionEvent } from '@deepseek-ai/dsh-session'
 import { agentEvents } from '@deepseek-ai/dsh-agent'
-import SystemPrompt, { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
+import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 import * as memory from '../src/index.ts'
 import { memoryReviewNotices } from '../src/review-notices.ts'
@@ -171,14 +171,29 @@ function makeAgent(c: Context, session: Session, options: { provider?: string; m
 }
 
 describe('memory plugin wiring', () => {
-  it('loads pre-existing entries into the frozen system-prompt snapshot', async () => {
+  it('injects the frozen snapshot as one user-role message, never into the system prompt', async () => {
     await seedFile('memory', 'Seeded memory fact')
     await seedFile('user', 'Seeded user fact')
     const c = await mount()
     expect(c.tools.schemas().map(schema => schema.name)).toContain('memory')
-    const prompt = renderPrompt(await c.systemPrompt.assemble())
-    expect(prompt).toContain('Seeded memory fact')
-    expect(prompt).toContain('Seeded user fact')
+    expect((await c.systemPrompt.assemble()).sections.map(section => section.name)).not.toContain('memory:snapshot')
+    const session = c.sessions.create(SessionId('user-role-snapshot'))
+    await settle()
+    const agent = makeAgent(c, session)
+    const decision = await agentEvents(c, agent).waterfall(
+      'agent/pre-step', { messages: [], turn: 1, step: 1, signal: SIGNAL },
+      () => Promise.resolve({ kind: 'enter', messages: [] }),
+    )
+    expect(decision).toMatchObject({ kind: 'enter' })
+    if (decision.kind !== 'enter') return
+    expect(decision.messages).toContainEqual(expect.objectContaining({
+      content: [{ type: 'text', text: expect.stringContaining('Seeded memory fact') }],
+      source: { kind: 'plugin', plugin: 'memory' },
+    }))
+    expect(decision.messages).toContainEqual(expect.objectContaining({
+      content: [{ type: 'text', text: expect.stringContaining('Seeded user fact') }],
+      source: { kind: 'plugin', plugin: 'memory' },
+    }))
   })
 
   it('reinjects memory when compaction shadows its earlier surface node', async () => {
@@ -217,25 +232,33 @@ describe('memory plugin wiring', () => {
     expect(onDisk).toContain('Added through the tool')
   })
 
-  it('keeps the snapshot frozen while mid-session writes reach disk', async () => {
+  it('keeps the injected snapshot frozen while mid-session writes reach disk', async () => {
     await seedFile('memory', 'Before the session')
     const c = await mount()
+    const session = c.sessions.create(SessionId('frozen-user-snapshot'))
+    await settle()
     await callMemory(c, { action: 'add', target: 'memory', content: 'Written during the session' })
-    const prompt = renderPrompt(await c.systemPrompt.assemble())
-    expect(prompt).toContain('Before the session')
-    expect(prompt).not.toContain('Written during the session')
+    const agent = makeAgent(c, session)
+    const decision = await agentEvents(c, agent).waterfall(
+      'agent/pre-step', { messages: [], turn: 1, step: 1, signal: SIGNAL },
+      () => Promise.resolve({ kind: 'enter', messages: [] }),
+    )
+    expect(decision).toMatchObject({ kind: 'enter' })
+    if (decision.kind !== 'enter') return
+    const snapshot = decision.messages.find(message => message.source.kind === 'plugin' && message.source.plugin === 'memory')
+    expect(snapshot).toBeDefined()
+    expect(snapshot?.content).toContainEqual({ type: 'text', text: expect.stringContaining('Before the session') })
+    expect(snapshot?.content).not.toContainEqual({ type: 'text', text: expect.stringContaining('Written during the session') })
     const onDisk = await readFile(join(home as string, 'memories', 'MEMORY.md'), 'utf8')
     expect(onDisk).toContain('Written during the session')
   })
 
-  it('renders nothing for empty stores and removes everything on disposal', async () => {
+  it('renders nothing for empty stores and removes the tool on disposal', async () => {
     const c = await mount()
-    expect(renderPrompt(await c.systemPrompt.assemble())).not.toContain('MEMORY')
+    expect((await c.systemPrompt.assemble()).sections.map(section => section.name)).not.toContain('memory:snapshot')
     await memoryFiber!.dispose()
     memoryFiber = undefined
     expect(c.tools.get('memory')).toBeUndefined()
-    const sections = (await c.systemPrompt.assemble()).sections.map(section => section.name)
-    expect(sections).not.toContain('memory:snapshot')
   })
 
   it('defaults and bounds the config through the schemastery schema', () => {
@@ -394,7 +417,7 @@ describe('nudge gating', () => {
       { type: 'user/message', seq: 0, time: 1, data: createUserMessage({ content: [{ type: 'text', text: 'old real user' }], source: { kind: 'user' } }), surfaceOp: 'append' },
       { type: 'turn/end', seq: 1, time: 2, data: { turn: 1, reason: { kind: 'completed' } } },
       { type: 'user/message', seq: 2, time: 3, data: createUserMessage({ content: [{ type: 'text', text: 'injected' }], source: { kind: 'plugin', plugin: 'memory' } }), surfaceOp: 'append' },
-      { type: 'user/message', seq: 3, time: 4, data: createUserMessage({ content: [{ type: 'text', text: 'catalog' }], source: { kind: 'skill-catalog' } }), surfaceOp: 'append' },
+      { type: 'user/message', seq: 3, time: 4, data: createUserMessage({ content: [{ type: 'text', text: 'tool context' }], source: { kind: 'tool', callId: CallId('context-call') } }), surfaceOp: 'append' },
     ]
     const session = c.sessions.create(SessionId('restored-settings'), { seed })
     session.append('request/header', { header: { config: { provider: 'mock', model: 'mock-model' } }, reason: 'initial' })
