@@ -2,8 +2,8 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import React from 'react'
-import type { ContextSurcharge, PricingConfig, PricingPeriod, PricingPlan, TokenRates } from './pricing.js'
-import { DEFAULT_PRICING, formatContextSurcharge, routeKey, validatePricing } from './pricing.js'
+import type { ContextSurcharge, ModelAssignment, PricingConfig, PricingGroup, PricingPeriod } from './pricing.js'
+import { DEFAULT_GROUP, DEFAULT_PRICING, formatContextSurcharge, normalizePricing, validatePricing } from './pricing.js'
 import {
   localDateOfHour,
   mapWithConcurrency,
@@ -35,6 +35,8 @@ interface CostFold {
   unitTokens: number
   pricingSource?: string | null
   pricingPeriod?: string | null
+  groupId?: string | null
+  groupName?: string | null
   details?: CostDetail[]
   hourly?: HourlyDetail[]
   subagents?: CostSubagent[]
@@ -50,7 +52,12 @@ interface CostDetail {
   periodName: string | null
   provider: string | null
   model: string | null
+  groupId?: string
+  groupName?: string
   rates: { input: number; cacheRead: number; cacheWrite: number; output: number }
+  periodMultiplier?: number
+  discountMultiplier?: number
+  modelMultiplier?: number
   contextMultiplier?: number
   contextAfterTokens?: number | null
   inputTokens: number
@@ -84,6 +91,8 @@ interface HourlyDetail {
   provider: string | null
   pricingSource: string | null
   periodName: string | null
+  groupId?: string | null
+  groupName?: string | null
   contextMultiplier?: number
   contextAfterTokens?: number | null
 }
@@ -188,22 +197,22 @@ class PricingRouteSource implements Observable<SettingsSnapshot> {
     }
     for (const listener of this.listeners) listener()
   }
-  async save(config: PricingConfig): Promise<boolean> {
+  async save(config: PricingConfig): Promise<string | null> {
     try {
       const response = await fetch(PRICING_ROUTE, {
         method: 'POST',
         headers: { 'content-type': 'application/json', accept: 'application/json' },
-        body: JSON.stringify(config),
+        body: JSON.stringify(normalizePricing(config)),
       })
-      if (!response.ok) return false
-      const body = (await response.json()) as { ok: boolean; value?: PricingConfig }
-      if (body.ok && body.value) {
-        this.snapshot = { status: 'ready', value: body.value, revision: 0, writable: true }
-        for (const listener of this.listeners) listener()
+      const body = (await response.json()) as { ok?: boolean; value?: PricingConfig; error?: unknown }
+      if (!response.ok || body.ok !== true || body.value === undefined) {
+        return typeof body.error === 'string' && body.error !== '' ? body.error : `保存失败（HTTP ${response.status}）`
       }
-      return body.ok === true
-    } catch {
-      return false
+      this.snapshot = { status: 'ready', value: body.value, revision: (this.snapshot.revision ?? 0) + 1, writable: true }
+      for (const listener of this.listeners) listener()
+      return null
+    } catch (error) {
+      return error instanceof Error ? error.message : '保存失败，请检查配置或刷新后重试。'
     }
   }
 }
@@ -230,7 +239,7 @@ class CatalogSource implements Observable<CatalogSnapshot> {
   }
 }
 
-const cloneConfig = (value?: PricingConfig): PricingConfig => JSON.parse(JSON.stringify(value ?? DEFAULT_PRICING)) as PricingConfig
+const cloneConfig = (value?: PricingConfig): PricingConfig => normalizePricing(JSON.parse(JSON.stringify(value ?? DEFAULT_PRICING)))
 const money = (value: number): string => value > 0 && value < 0.01 ? value.toFixed(4) : value.toFixed(2)
 const currencySymbol = (currency: string): string => ({ CNY: '¥', USD: '$', EUR: '€', JPY: '¥' })[currency.toUpperCase()] ?? `${currency} `
 const inputStyle: React.CSSProperties = { height: 32, minWidth: 0, border: '1px solid var(--dsw-alias-border-l2)', borderRadius: 6, padding: '0 9px', background: 'var(--dsw-alias-bg-layer-3)', color: 'var(--dsw-alias-label-primary)', font: 'inherit', fontSize: 12 }
@@ -241,12 +250,16 @@ const surchargeOf = (rows: ReadonlyArray<{ contextAfterTokens?: number | null; c
   const shared = sharedContextSurcharge(rows)
   return shared === null ? '-' : surchargeLabel(shared.afterTokens, shared.multiplier)
 }
-const RATE_FIELDS: Array<{ key: keyof TokenRates; label: string }> = [
-  { key: 'input', label: '未缓存输入' },
-  { key: 'cacheRead', label: '缓存读取' },
-  { key: 'cacheWrite', label: '缓存写入' },
-  { key: 'output', label: '输出' },
-]
+function sourceLabelOf(source: string | null | undefined): string {
+  return source === 'group-period' ? '分组时段价' : '分组基准价'
+}
+
+function newGroupId(groups: readonly PricingGroup[]): string {
+  const used = new Set(groups.map(group => group.id))
+  let index = 1
+  while (used.has(`group-${index}`)) index += 1
+  return `group-${index}`
+}
 
 function NumberInput(props: { value: number | undefined; placeholder?: string; onChange(value: number | undefined): void }) {
   return React.createElement('input', {
@@ -257,41 +270,30 @@ function NumberInput(props: { value: number | undefined; placeholder?: string; o
   })
 }
 
-function RatesGrid(props: { rates: Partial<TokenRates>; fallback?: TokenRates; onChange(rates: Partial<TokenRates>): void }) {
-  return React.createElement('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(4, minmax(96px, 1fr))', gap: 8 } },
-    ...RATE_FIELDS.map(field => React.createElement('label', { key: field.key, style: { display: 'flex', flexDirection: 'column', gap: 5, fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } },
-      field.label,
-      React.createElement(NumberInput, {
-        value: props.rates[field.key],
-        placeholder: props.fallback ? String(props.fallback[field.key]) : undefined,
-        onChange: value => props.onChange({ ...props.rates, [field.key]: value }),
-      }),
-    )),
-  )
+function field(label: string, child: React.ReactNode): React.ReactElement {
+  return React.createElement('label', { style: { display: 'flex', flexDirection: 'column', gap: 5, fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, label, child)
 }
 
-function PeriodEditor(props: { period: PricingPeriod; fallback: TokenRates; onChange(period: PricingPeriod): void; onRemove(): void }) {
+function PeriodEditor(props: { period: PricingPeriod; onChange(period: PricingPeriod): void; onRemove(): void }) {
   const set = <K extends keyof PricingPeriod>(key: K, value: PricingPeriod[K]) => props.onChange({ ...props.period, [key]: value })
-  return React.createElement('div', { style: { borderTop: '1px solid var(--dsw-alias-border-l2)', paddingTop: 10, display: 'flex', flexDirection: 'column', gap: 8 } },
-    React.createElement('div', { style: { display: 'grid', gridTemplateColumns: 'minmax(120px, 1fr) 100px 100px auto', gap: 8, alignItems: 'end' } },
-      React.createElement('label', { style: { display: 'flex', flexDirection: 'column', gap: 5, fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, '时段名称', React.createElement('input', { style: inputStyle, value: props.period.name, onChange: (event: React.ChangeEvent<HTMLInputElement>) => set('name', event.target.value) })),
-      React.createElement('label', { style: { display: 'flex', flexDirection: 'column', gap: 5, fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, '开始', React.createElement('input', { style: inputStyle, type: 'time', value: props.period.start, onChange: (event: React.ChangeEvent<HTMLInputElement>) => set('start', event.target.value) })),
-      React.createElement('label', { style: { display: 'flex', flexDirection: 'column', gap: 5, fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, '结束', React.createElement('input', { style: inputStyle, type: 'time', value: props.period.end, onChange: (event: React.ChangeEvent<HTMLInputElement>) => set('end', event.target.value) })),
-      React.createElement('button', { type: 'button', style: buttonStyle, onClick: props.onRemove }, '删除'),
-    ),
-    React.createElement(RatesGrid, { rates: props.period.rates, fallback: props.fallback, onChange: rates => set('rates', rates) }),
+  return React.createElement('div', { style: { display: 'grid', gridTemplateColumns: 'minmax(120px, 1fr) 100px 100px 96px auto', gap: 8, alignItems: 'end' } },
+    field('时段名称', React.createElement('input', { style: inputStyle, value: props.period.name, onChange: (event: React.ChangeEvent<HTMLInputElement>) => set('name', event.target.value) })),
+    field('开始', React.createElement('input', { style: inputStyle, type: 'time', value: props.period.start, onChange: (event: React.ChangeEvent<HTMLInputElement>) => set('start', event.target.value) })),
+    field('结束', React.createElement('input', { style: inputStyle, type: 'time', value: props.period.end, onChange: (event: React.ChangeEvent<HTMLInputElement>) => set('end', event.target.value) })),
+    field('倍率', React.createElement(NumberInput, { value: props.period.multiplier, placeholder: '1', onChange: value => set('multiplier', value ?? 1) })),
+    React.createElement('button', { type: 'button', style: buttonStyle, onClick: props.onRemove }, '删除'),
   )
 }
 
-function PeriodsEditor(props: { periods: PricingPeriod[]; fallback: TokenRates; onChange(periods: PricingPeriod[]): void }) {
-  const add = () => props.onChange([...props.periods, { id: `period-${Date.now()}-${props.periods.length}`, name: '低峰', start: '00:00', end: '08:00', rates: {} }])
+function PeriodsEditor(props: { periods: PricingPeriod[]; onChange(periods: PricingPeriod[]): void }) {
+  const add = () => props.onChange([...props.periods, { id: `period-${Date.now()}-${props.periods.length}`, name: '低峰', start: '00:00', end: '08:00', multiplier: 1 }])
   return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 10 } },
     ...props.periods.map((period, index) => React.createElement(PeriodEditor, {
-      key: period.id, period, fallback: props.fallback,
+      key: period.id, period,
       onChange: next => props.onChange(props.periods.map((item, at) => at === index ? next : item)),
       onRemove: () => props.onChange(props.periods.filter((_item, at) => at !== index)),
     })),
-    React.createElement('button', { type: 'button', style: { ...buttonStyle, alignSelf: 'flex-start' }, onClick: add }, '+ 添加计价时段'),
+    React.createElement('button', { type: 'button', style: { ...buttonStyle, alignSelf: 'flex-start' }, onClick: add }, '+ 添加时段倍率'),
   )
 }
 
@@ -318,37 +320,244 @@ function ContextSurchargesEditor(props: { tiers: ContextSurcharge[]; hint?: stri
   )
 }
 
-function ModelPricingRow(props: { provider: ModelGroup; model: ModelItem; config: PricingConfig; onChange(config: PricingConfig): void }) {
-  const key = routeKey(props.provider.id, props.model.id)!
-  const plan = props.config.models[key]
-  const enabled = plan !== undefined
-  const [collapsed, setCollapsed] = React.useState(true)
-  const setPlan = (next: PricingPlan) => props.onChange({ ...props.config, models: { ...props.config.models, [key]: next } })
-  const toggle = () => {
-    if (enabled) {
-      const { [key]: _removed, ...models } = props.config.models
-      props.onChange({ ...props.config, models })
-    } else setPlan({ rates: {}, periods: [] })
+interface CatalogRoute {
+  key: string
+  providerId: string
+  providerName: string
+  modelId: string
+  modelName: string
+}
+
+function catalogRoutes(catalog: CatalogSnapshot): CatalogRoute[] {
+  return catalog.groups.flatMap(provider => provider.models.map(model => ({
+    key: `${provider.id}/${model.id}`,
+    providerId: provider.id,
+    providerName: provider.name,
+    modelId: model.id,
+    modelName: model.name,
+  })))
+}
+
+function routeFromKey(key: string, catalog: CatalogSnapshot): CatalogRoute {
+  const found = catalogRoutes(catalog).find(route => route.key === key)
+  if (found !== undefined) return found
+  const slash = key.indexOf('/')
+  const providerId = slash === -1 ? key : key.slice(0, slash)
+  const modelId = slash === -1 ? key : key.slice(slash + 1)
+  return { key, providerId, providerName: providerId, modelId, modelName: modelId }
+}
+
+function GroupModelRow(props: {
+  route: CatalogRoute
+  assignment: ModelAssignment
+  onChange(assignment: ModelAssignment): void
+  onRemove(): void
+}) {
+  const set = (next: ModelAssignment) => props.onChange(next)
+  return React.createElement('div', { style: { borderTop: '1px solid var(--dsw-alias-border-l2)', padding: '10px 0', display: 'flex', flexDirection: 'column', gap: 8 } },
+    React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } },
+      React.createElement('div', { style: { flex: 1, minWidth: 0 } },
+        React.createElement('div', { style: { fontSize: 13, fontWeight: 500, color: 'var(--dsw-alias-label-primary)' } }, props.route.modelName),
+        React.createElement('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)', marginTop: 2 } }, props.route.key),
+      ),
+      React.createElement('button', { type: 'button', style: buttonStyle, onClick: props.onRemove }, '移出'),
+    ),
+    React.createElement('div', { style: { display: 'grid', gridTemplateColumns: 'minmax(110px, 1fr) minmax(110px, 1fr) auto', gap: 8, alignItems: 'end' } },
+      field('优惠倍率', React.createElement(NumberInput, {
+        value: props.assignment.discountMultiplier,
+        placeholder: '1',
+        onChange: value => set({ ...props.assignment, discountMultiplier: value }),
+      })),
+      field('模型倍率', React.createElement(NumberInput, {
+        value: props.assignment.modelMultiplier,
+        placeholder: '1',
+        onChange: value => set({ ...props.assignment, modelMultiplier: value }),
+      })),
+      React.createElement('label', { style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: 'var(--dsw-alias-label-secondary)', paddingBottom: 6 } },
+        React.createElement('input', {
+          type: 'checkbox',
+          checked: props.assignment.reasoningExtra === true,
+          onChange: (event: React.ChangeEvent<HTMLInputElement>) => {
+            const next = { ...props.assignment }
+            if (event.target.checked) next.reasoningExtra = true
+            else delete next.reasoningExtra
+            set(next)
+          },
+        }),
+        '推理另计',
+      ),
+    ),
+  )
+}
+
+function GroupModelPicker(props: {
+  groupId: string
+  groups: PricingGroup[]
+  models: Record<string, ModelAssignment>
+  catalog: CatalogSnapshot
+  onAdd(keys: string[]): void
+}) {
+  const [open, setOpen] = React.useState(false)
+  const [query, setQuery] = React.useState('')
+  const [selected, setSelected] = React.useState<Set<string>>(new Set())
+  const groupName = (id: string): string => props.groups.find(group => group.id === id)?.name ?? id
+  const needle = query.trim().toLowerCase()
+  const candidates = catalogRoutes(props.catalog)
+    .filter(route => props.models[route.key]?.groupId !== props.groupId)
+    .filter(route => needle === '' || `${route.key} ${route.providerName} ${route.modelName}`.toLowerCase().includes(needle))
+  const visibleKeys = candidates.map(route => route.key)
+  const allVisibleSelected = visibleKeys.length > 0 && visibleKeys.every(key => selected.has(key))
+  const toggle = (key: string) => setSelected(current => {
+    const next = new Set(current)
+    if (next.has(key)) next.delete(key)
+    else next.add(key)
+    return next
+  })
+  const toggleVisible = () => setSelected(current => {
+    const next = new Set(current)
+    if (allVisibleSelected) {
+      for (const key of visibleKeys) next.delete(key)
+    } else {
+      for (const key of visibleKeys) next.add(key)
+    }
+    return next
+  })
+  const add = (keys: string[]) => {
+    if (keys.length === 0) return
+    props.onAdd(keys)
+    setSelected(current => {
+      const next = new Set(current)
+      for (const key of keys) next.delete(key)
+      return next
+    })
   }
-  return React.createElement('div', { style: { borderTop: '1px solid var(--dsw-alias-border-l2)', padding: '12px 0', display: 'flex', flexDirection: 'column', gap: 10 } },
+  return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 8 } },
+    React.createElement('button', { type: 'button', style: { ...buttonStyle, alignSelf: 'flex-start' }, onClick: () => setOpen(!open) }, open ? '收起模型目录' : '+ 向此分组添加模型'),
+    open ? React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 8, border: '1px solid var(--dsw-alias-border-l2)', borderRadius: 6, padding: 10 } },
+      React.createElement('input', {
+        style: inputStyle,
+        value: query,
+        placeholder: '搜索 provider / 模型…',
+        onChange: (event: React.ChangeEvent<HTMLInputElement>) => setQuery(event.target.value),
+      }),
+      React.createElement('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 } },
+        React.createElement('label', { style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--dsw-alias-label-secondary)' } },
+          React.createElement('input', { type: 'checkbox', checked: allVisibleSelected, disabled: visibleKeys.length === 0, onChange: toggleVisible }),
+          visibleKeys.length === 0 ? '无可添加模型' : `全选当前列表（${visibleKeys.length}）`,
+        ),
+        React.createElement('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, selected.size > 0 ? `已选 ${selected.size}` : '可多选后一次加入'),
+      ),
+      React.createElement('div', { style: { maxHeight: 220, overflow: 'auto', display: 'flex', flexDirection: 'column' } },
+        candidates.length === 0 ? React.createElement('p', { style: { margin: 0, fontSize: 12, color: 'var(--dsw-alias-label-tertiary)' } }, props.catalog.status === 'loading' ? '正在加载模型…' : '没有可添加的模型') : null,
+        ...candidates.map(route => {
+          const current = props.models[route.key]
+          return React.createElement('label', {
+            key: route.key,
+            style: { display: 'flex', alignItems: 'center', gap: 8, padding: '6px 0', borderTop: '1px solid var(--dsw-alias-border-l2)', fontSize: 12 },
+          },
+            React.createElement('input', { type: 'checkbox', checked: selected.has(route.key), onChange: () => toggle(route.key) }),
+            React.createElement('span', { style: { flex: 1, minWidth: 0 } },
+              React.createElement('span', { style: { color: 'var(--dsw-alias-label-primary)' } }, route.modelName),
+              React.createElement('span', { style: { color: 'var(--dsw-alias-label-tertiary)', marginLeft: 8 } }, route.key),
+            ),
+            current !== undefined ? React.createElement('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, `现属 ${groupName(current.groupId)}`) : null,
+          )
+        }),
+      ),
+      React.createElement('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8 } },
+        React.createElement('button', { type: 'button', style: primaryButtonStyle, disabled: selected.size === 0, onClick: () => add([...selected]) }, selected.size === 0 ? '添加所选' : `添加所选（${selected.size}）`),
+      ),
+    ) : null,
+  )
+}
+
+function GroupEditor(props: {
+  group: PricingGroup
+  config: PricingConfig
+  catalog: CatalogSnapshot
+  onChange(config: PricingConfig): void
+  onRemove(): void
+}) {
+  const [collapsed, setCollapsed] = React.useState(props.group.id !== 'default')
+  const [modelsOpen, setModelsOpen] = React.useState(true)
+  const setGroup = (next: PricingGroup) => props.onChange({
+    ...props.config,
+    groups: props.config.groups.map(group => group.id === props.group.id ? next : group),
+  })
+  const set = <K extends keyof PricingGroup>(key: K, value: PricingGroup[K]) => setGroup({ ...props.group, [key]: value })
+  const assigned = Object.entries(props.config.models)
+    .filter(([, assignment]) => assignment.groupId === props.group.id)
+    .sort(([left], [right]) => left.localeCompare(right))
+  const setAssignment = (key: string, assignment: ModelAssignment) => props.onChange({
+    ...props.config,
+    models: { ...props.config.models, [key]: assignment },
+  })
+  const removeModel = (key: string) => {
+    const { [key]: _removed, ...models } = props.config.models
+    props.onChange({ ...props.config, models })
+  }
+  const addModels = (keys: string[]) => {
+    const models = { ...props.config.models }
+    for (const key of keys) {
+      const previous = models[key]
+      models[key] = previous === undefined
+        ? { groupId: props.group.id }
+        : { ...previous, groupId: props.group.id }
+    }
+    props.onChange({ ...props.config, models })
+  }
+  return React.createElement('div', { style: { border: '1px solid var(--dsw-alias-border-l2)', borderRadius: 8, padding: 12, display: 'flex', flexDirection: 'column', gap: 10 } },
     React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer' }, onClick: () => setCollapsed(!collapsed) },
       React.createElement('span', { 'aria-hidden': true, style: { transform: collapsed ? 'rotate(-90deg)' : undefined, transition: 'transform 0.15s', fontSize: 12, color: 'var(--dsw-alias-label-tertiary)' } }, '▾'),
       React.createElement('div', { style: { flex: 1, minWidth: 0 } },
-        React.createElement('div', { style: { fontSize: 13, fontWeight: 500, color: 'var(--dsw-alias-label-primary)' } }, props.model.name),
-        React.createElement('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)', marginTop: 2 } }, key),
+        React.createElement('div', { style: { fontSize: 13, fontWeight: 600, color: 'var(--dsw-alias-label-primary)' } }, props.group.name),
+        React.createElement('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)', marginTop: 2 } }, `${props.group.id} · ${assigned.length} 个模型`),
       ),
-      React.createElement('span', { style: { fontSize: 11, color: enabled ? 'var(--dsw-alias-label-secondary)' : 'var(--dsw-alias-label-tertiary)' } }, enabled ? '专属计价' : '使用默认价格'),
-      React.createElement('input', { type: 'checkbox', checked: enabled, onClick: (event: React.MouseEvent) => event.stopPropagation(), onChange: toggle, 'aria-label': `${key} 专属计价` }),
+      props.config.groups.length > 1 ? React.createElement('button', { type: 'button', style: buttonStyle, onClick: (event: React.MouseEvent) => { event.stopPropagation(); props.onRemove() } }, '删除分组') : null,
     ),
-    !collapsed && enabled && plan ? React.createElement(React.Fragment, null,
-      React.createElement(RatesGrid, { rates: plan.rates ?? {}, fallback: props.config.default.rates, onChange: rates => setPlan({ ...plan, rates }) }),
-      React.createElement(PeriodsEditor, { periods: plan.periods ?? [], fallback: { ...props.config.default.rates, ...(plan.rates ?? {}) }, onChange: periods => setPlan({ ...plan, periods }) }),
-      React.createElement(ContextSurchargesEditor, {
-        tiers: plan.contextSurcharges ?? [],
-        hint: '未配置时沿用默认上下文翻倍；清空列表表示该模型不翻倍。单次请求上下文（未缓存输入 + 缓存读 + 缓存写）超过阈值后，该请求整单费用按倍率计。',
-        onChange: contextSurcharges => setPlan({ ...plan, contextSurcharges }),
+    collapsed ? null : React.createElement(React.Fragment, null,
+      React.createElement('div', { style: { display: 'grid', gridTemplateColumns: 'minmax(140px, 1fr) minmax(110px, 1fr) minmax(110px, 1fr)', gap: 8 } },
+        field('分组名称', React.createElement('input', { style: inputStyle, value: props.group.name, onChange: (event: React.ChangeEvent<HTMLInputElement>) => set('name', event.target.value) })),
+        field('基准输入', React.createElement(NumberInput, { value: props.group.input, onChange: value => set('input', value ?? 0) })),
+        field('基准输出', React.createElement(NumberInput, { value: props.group.output, onChange: value => set('output', value ?? 0) })),
+      ),
+      React.createElement('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(2, minmax(140px, 1fr))', gap: 8 } },
+        field('缓存输入倍率', React.createElement(NumberInput, { value: props.group.cacheReadMultiplier, onChange: value => set('cacheReadMultiplier', value ?? 0) })),
+        field('缓存写入倍率', React.createElement(NumberInput, { value: props.group.cacheWriteMultiplier, onChange: value => set('cacheWriteMultiplier', value ?? 0) })),
+      ),
+      React.createElement('p', { style: { margin: 0, fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, `缓存读 = 基准输入 × ${props.group.cacheReadMultiplier}；缓存写 = 基准输入 × ${props.group.cacheWriteMultiplier}。时段与上下文倍率作用于整单。`),
+      React.createElement('h4', { style: { margin: '4px 0 0', fontSize: 12, fontWeight: 600 } }, '不同时段倍率'),
+      React.createElement(PeriodsEditor, { periods: props.group.periods ?? [], onChange: periods => set('periods', periods) }),
+      React.createElement('h4', { style: { margin: '4px 0 0', fontSize: 12, fontWeight: 600 } }, '超过上下文倍率'),
+      React.createElement(ContextSurchargesEditor, { tiers: props.group.contextSurcharges ?? [], onChange: contextSurcharges => set('contextSurcharges', contextSurcharges) }),
+      React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
+        React.createElement('button', {
+          type: 'button',
+          style: { ...buttonStyle, padding: '4px 8px' },
+          onClick: () => setModelsOpen(!modelsOpen),
+          'aria-expanded': modelsOpen,
+        }, modelsOpen ? '收起模型列表' : `展开模型列表（${assigned.length}）`),
+        React.createElement('h4', { style: { margin: 0, fontSize: 12, fontWeight: 600 } }, '此分组的模型'),
+      ),
+      React.createElement('p', { style: { margin: 0, fontSize: 12, color: 'var(--dsw-alias-label-tertiary)' } }, '在分组内添加模型，再改每个模型的优惠倍率和模型倍率。一个模型只能属于一个分组；从目录移入会从原分组带走。未加入任何分组的模型使用 default 分组。'),
+      assigned.length === 0 ? React.createElement('p', { style: { margin: 0, fontSize: 12, color: 'var(--dsw-alias-label-tertiary)' } }, '还没有模型。') : null,
+      modelsOpen && assigned.length > 0 ? React.createElement('div', { style: { maxHeight: 320, overflow: 'auto', border: '1px solid var(--dsw-alias-border-l2)', borderRadius: 6, padding: '0 10px' } },
+        ...assigned.map(([key, assignment]) => React.createElement(GroupModelRow, {
+          key,
+          route: routeFromKey(key, props.catalog),
+          assignment,
+          onChange: next => setAssignment(key, next),
+          onRemove: () => removeModel(key),
+        })),
+      ) : null,
+      React.createElement(GroupModelPicker, {
+        groupId: props.group.id,
+        groups: props.config.groups,
+        models: props.config.models,
+        catalog: props.catalog,
+        onAdd: addModels,
       }),
-    ) : null,
+    ),
   )
 }
 
@@ -356,7 +565,7 @@ function PricingSettingsCard(props: {
   usePricing<T>(selector: (snapshot: SettingsSnapshot) => T): T
   useCatalog<T>(selector: (snapshot: CatalogSnapshot) => T): T
   refreshCatalog(): Promise<void>
-  save(config: PricingConfig, revision?: number): Promise<boolean>
+  save(config: PricingConfig): Promise<string | null>
 }) {
   const settings = props.usePricing(snapshot => snapshot)
   const catalog = props.useCatalog(snapshot => snapshot)
@@ -381,53 +590,68 @@ function PricingSettingsCard(props: {
   const dirty = JSON.stringify(draft) !== JSON.stringify(baseline)
   let invalid: string | null = null
   try { validatePricing(draft) } catch (error) { invalid = error instanceof Error ? error.message : String(error) }
-  const setDefaultRates = (rates: Partial<TokenRates>) => setDraft({ ...draft, default: { ...draft.default, rates: rates as TokenRates } })
-  const displayGroups = catalog.groups
+  const setGroups = (groups: PricingGroup[]) => {
+    const ids = new Set(groups.map(group => group.id))
+    const models = Object.fromEntries(Object.entries(draft.models).flatMap(([key, assignment]) => (
+      ids.has(assignment.groupId) ? [[key, assignment]] : []
+    )))
+    setDraft({ ...draft, groups, models })
+  }
   const save = async () => {
     if (invalid || !dirty) return
     setSaving(true)
     setFailure(null)
-    const ok = await props.save(draft, settings.revision)
+    const error = await props.save(draft)
     setSaving(false)
-    if (ok) {
+    if (error === null) {
       setSaved(true)
       setTimeout(() => setSaved(false), 2000)
     } else {
-      setFailure('保存失败，请检查配置或刷新后重试。')
+      setFailure(error)
     }
   }
   return React.createElement('li', { style: { listStyle: 'none', border: '1px solid var(--dsw-alias-border-l2)', borderRadius: 8, background: 'var(--dsw-alias-bg-layer-3)' } },
     React.createElement('button', { type: 'button', onClick: () => setOpen(!open), 'aria-expanded': open, style: { width: '100%', border: 0, background: 'transparent', color: 'inherit', textAlign: 'left', padding: '14px 16px', display: 'flex', alignItems: 'center', gap: 12, cursor: 'pointer' } },
       React.createElement('span', { style: { flex: 1, display: 'flex', flexDirection: 'column', gap: 4 } },
         React.createElement('strong', { style: { fontSize: 15, fontWeight: 600 } }, 'API 费用统计'),
-        React.createElement('span', { style: { fontSize: 13, color: 'var(--dsw-alias-label-tertiary)' } }, '按实际 provider、模型和时段配置估算输入、缓存与输出费用。'),
+        React.createElement('span', { style: { fontSize: 13, color: 'var(--dsw-alias-label-tertiary)' } }, '按基准费用分组统一管理多个模型：最终单价 = 分组基准（含缓存/时段/上下文倍率）× 优惠倍率 × 模型倍率。'),
       ),
       dirty ? React.createElement('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary)' } }, '未保存') : null,
       React.createElement('span', { 'aria-hidden': true, style: { transform: open ? 'rotate(180deg)' : undefined } }, '⌄'),
     ),
     open ? React.createElement('div', { style: { margin: '0 16px', padding: '14px 0 10px', borderTop: '1px solid var(--dsw-alias-border-l2)', display: 'flex', flexDirection: 'column', gap: 16 } },
       React.createElement('section', { style: { display: 'flex', flexDirection: 'column', gap: 10 } },
-        React.createElement('h3', { style: { margin: 0, fontSize: 13, fontWeight: 600 } }, '默认计价'),
+        React.createElement('h3', { style: { margin: 0, fontSize: 13, fontWeight: 600 } }, '全局'),
         React.createElement('div', { style: { display: 'grid', gridTemplateColumns: '120px 160px 1fr', gap: 8 } },
-          React.createElement('label', { style: { display: 'flex', flexDirection: 'column', gap: 5, fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, '币种', React.createElement('input', { style: inputStyle, value: draft.currency, onChange: (event: React.ChangeEvent<HTMLInputElement>) => setDraft({ ...draft, currency: event.target.value.toUpperCase() }) })),
-          React.createElement('label', { style: { display: 'flex', flexDirection: 'column', gap: 5, fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, '每多少 Token', React.createElement(NumberInput, { value: draft.unitTokens, onChange: value => setDraft({ ...draft, unitTokens: value ?? 0 }) })),
-          React.createElement('label', { style: { display: 'flex', flexDirection: 'column', gap: 5, fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, '计价时区', React.createElement('input', { style: inputStyle, value: draft.timezone, onChange: (event: React.ChangeEvent<HTMLInputElement>) => setDraft({ ...draft, timezone: event.target.value }) })),
+          field('币种', React.createElement('input', { style: inputStyle, value: draft.currency, onChange: (event: React.ChangeEvent<HTMLInputElement>) => setDraft({ ...draft, currency: event.target.value.toUpperCase() }) })),
+          field('每多少 Token', React.createElement(NumberInput, { value: draft.unitTokens, onChange: value => setDraft({ ...draft, unitTokens: value ?? 0 }) })),
+          field('计价时区', React.createElement('input', { style: inputStyle, value: draft.timezone, onChange: (event: React.ChangeEvent<HTMLInputElement>) => setDraft({ ...draft, timezone: event.target.value }) })),
         ),
-        React.createElement(RatesGrid, { rates: draft.default.rates, onChange: setDefaultRates }),
-        React.createElement(PeriodsEditor, { periods: draft.default.periods ?? [], fallback: draft.default.rates, onChange: periods => setDraft({ ...draft, default: { ...draft.default, periods } }) }),
-        React.createElement('h4', { style: { margin: '6px 0 0', fontSize: 12, fontWeight: 600 } }, '上下文翻倍'),
-        React.createElement(ContextSurchargesEditor, { tiers: draft.default.contextSurcharges ?? [], onChange: contextSurcharges => setDraft({ ...draft, default: { ...draft.default, contextSurcharges } }) }),
       ),
-      React.createElement('section', null,
-        React.createElement('h3', { style: { margin: '0 0 4px', fontSize: 13, fontWeight: 600 } }, '可用模型'),
-        React.createElement('p', { style: { margin: '0 0 8px', fontSize: 12, color: 'var(--dsw-alias-label-tertiary)' } }, '未启用专属计价的模型自动使用默认价格。空白专属字段也逐项回退到默认价格。'),
-        catalog.status === 'loading' ? React.createElement('p', { style: { fontSize: 12, color: 'var(--dsw-alias-label-tertiary)' } }, '正在加载模型…') : null,
-        catalog.status === 'error' ? React.createElement('p', { style: { fontSize: 12, color: 'var(--dsw-alias-label-error)' } }, '模型目录加载失败。') : null,
-        ...displayGroups.flatMap(group => [
-          React.createElement('h4', { key: `group:${group.id}`, style: { margin: '14px 0 0', fontSize: 12, color: 'var(--dsw-alias-label-secondary)' } }, `${group.name} · ${group.id}`),
-          ...group.models.map(model => React.createElement(ModelPricingRow, { key: `${group.id}/${model.id}`, provider: group, model, config: draft, onChange: setDraft })),
-        ]),
+      React.createElement('section', { style: { display: 'flex', flexDirection: 'column', gap: 10 } },
+        React.createElement('h3', { style: { margin: 0, fontSize: 13, fontWeight: 600 } }, '基准费用分组'),
+        React.createElement('p', { style: { margin: 0, fontSize: 12, color: 'var(--dsw-alias-label-tertiary)' } }, '添加分组，再在分组里选择模型并改每个模型的倍率。未加入任何分组的模型使用 id 为 default 的分组，没有则用第一个分组。'),
+        ...draft.groups.map(group => React.createElement(GroupEditor, {
+          key: group.id,
+          group,
+          config: draft,
+          catalog,
+          onChange: setDraft,
+          onRemove: () => setGroups(draft.groups.filter(item => item.id !== group.id)),
+        })),
+        React.createElement('button', {
+          type: 'button',
+          style: { ...buttonStyle, alignSelf: 'flex-start' },
+          onClick: () => setGroups([...draft.groups, {
+            ...DEFAULT_GROUP,
+            id: newGroupId(draft.groups),
+            name: '新分组',
+            periods: [],
+            contextSurcharges: [],
+          }]),
+        }, '+ 添加基准费用分组'),
       ),
+      catalog.status === 'error' ? React.createElement('p', { role: 'alert', style: { margin: 0, fontSize: 12, color: 'var(--dsw-alias-label-error)' } }, '模型目录加载失败，仍可编辑已加入分组的模型。') : null,
       invalid ? React.createElement('p', { role: 'alert', style: { margin: 0, fontSize: 12, color: 'var(--dsw-alias-label-error)' } }, invalid) : null,
       failure ? React.createElement('p', { role: 'alert', style: { margin: 0, fontSize: 12, color: 'var(--dsw-alias-label-error)' } }, failure) : null,
       React.createElement('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8, borderTop: '1px solid var(--dsw-alias-border-l2)', paddingTop: 12 } },
@@ -642,7 +866,7 @@ function CostDock(props: { sessionId: string; costMeter: CostMeterFace; sessions
     tooltipTimerRef.current = setTimeout(() => setTooltip(false), 200)
   }
   const route = state.route ?? '未知模型'
-  const pricingInfo = state.pricingPeriod ? `${state.pricingPeriod} · ${state.pricingSource === 'model-period' ? '模型时段价' : state.pricingSource === 'model' ? '模型基准价' : state.pricingSource === 'default-period' ? '默认时段价' : '默认价格'}` : '默认价格'
+  const pricingInfo = `${state.groupName ?? '默认分组'}${state.pricingPeriod ? ` · ${state.pricingPeriod}` : ''} · ${sourceLabelOf(state.pricingSource)}`
   const cellBase = { fontSize: 12, padding: '4px 8px', textAlign: 'right' as const, whiteSpace: 'nowrap' as const }
   const cellLeft = { ...cellBase, textAlign: 'left' as const }
   const headerStyle = { ...cellBase, fontWeight: 600, background: 'var(--dsw-alias-bg-layer-3, #f5f5f5)', borderBottom: '1px solid var(--dsw-alias-border-l2, #ddd)', position: 'sticky' as const, top: 0, zIndex: 1 }
@@ -704,12 +928,19 @@ function CostDock(props: { sessionId: string; costMeter: CostMeterFace; sessions
         React.createElement('div', { style: { fontWeight: 600, fontSize: 13, marginBottom: 4 } }, 'API 费用明细'),
         ...(state.details && state.details.length > 0 ? state.details.flatMap((detail, di) => {
           const rateSymbol = (rate: number) => `${symbol}${rate}`
-          const sourceLabel = detail.source === 'model-period' ? '模型时段价' : detail.source === 'model' ? '模型基准价' : detail.source === 'default-period' ? '默认时段价' : '默认价格'
           const ds = detail
+          const extras = [
+            ds.groupName,
+            sourceLabelOf(ds.source),
+            ds.periodName,
+            ds.discountMultiplier !== undefined && ds.discountMultiplier !== 1 ? `优惠 ×${ds.discountMultiplier}` : null,
+            ds.modelMultiplier !== undefined && ds.modelMultiplier !== 1 ? `模型 ×${ds.modelMultiplier}` : null,
+            formatContextSurcharge(ds.contextAfterTokens, ds.contextMultiplier),
+          ].filter((value): value is string => Boolean(value))
           return [
             di > 0 ? React.createElement('div', { key: `sep-${di}`, style: { borderTop: '1px solid var(--dsw-alias-border-l2, #333)', margin: '2px 0' } }) : null,
             React.createElement('div', { key: `hdr-${di}`, style: { fontWeight: 600, fontSize: 12, marginTop: di > 0 ? 2 : 0 } },
-              `${ds.provider ?? '?'}/${ds.model ?? '?'} · ${sourceLabel}${ds.periodName ? ` · ${ds.periodName}` : ''}${formatContextSurcharge(ds.contextAfterTokens, ds.contextMultiplier) ? ` · ${formatContextSurcharge(ds.contextAfterTokens, ds.contextMultiplier)}` : ''}`,
+              `${ds.provider ?? '?'}/${ds.model ?? '?'}${extras.length > 0 ? ` · ${extras.join(' · ')}` : ''}`,
             ),
             React.createElement('div', { key: `rates-${di}`, style: { display: 'grid', gridTemplateColumns: 'auto auto auto auto', gap: '0 14px', fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } },
               React.createElement('span', {}, `输入 ${rateSymbol(ds.rates.input)}/M`),

@@ -1,4 +1,4 @@
-import { M as validatePricing, t as Config } from "./src-BgHEVWo3.js";
+import { F as normalizePricing, H as validatePricing, t as Config } from "./src-BuB4G30_.js";
 //#region src/settings.ts
 const SETTINGS_NS = "cost-meter";
 const ROUTE_PATH = "/cost-meter/pricing";
@@ -35,7 +35,7 @@ function apply(ctx, config) {
 	if (settings === void 0) return;
 	const scope = settings.register(SETTINGS_NS, Config, {
 		base: config,
-		validate: validatePricing
+		validate: (value) => validatePricing(normalizePricing(value))
 	});
 	ctx.inject(["webServer"], (webCtx) => {
 		webCtx.webServer.register({
@@ -58,7 +58,7 @@ function apply(ctx, config) {
 					try {
 						send(200, {
 							ok: true,
-							value: scope.get()
+							value: normalizePricing(scope.get())
 						});
 					} catch (error) {
 						send(409, {
@@ -87,12 +87,12 @@ function apply(ctx, config) {
 						}
 						chunks.push(chunk);
 					}
-					const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+					const body = normalizePricing(JSON.parse(Buffer.concat(chunks).toString("utf8")));
 					validatePricing(body);
 					await settings.replace(SETTINGS_NS, body);
 					send(200, {
 						ok: true,
-						value: scope.get()
+						value: body
 					});
 				} catch (error) {
 					send(400, {

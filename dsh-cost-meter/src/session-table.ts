@@ -19,6 +19,8 @@ export interface HourlySlice {
   model: string | null
   provider: string | null
   periodName: string | null
+  groupId?: string | null
+  groupName?: string | null
   contextMultiplier?: number
   contextAfterTokens?: number | null
 }
@@ -228,6 +230,8 @@ function emptyHourlySlice(hour = '', hourLabel = ''): HourlySlice {
     model: null,
     provider: null,
     periodName: null,
+    groupId: null,
+    groupName: null,
   }
 }
 
@@ -266,6 +270,8 @@ function asHourlySlice(value: Partial<HourlySlice> & { provider: string | null; 
     model: value.model ?? null,
     provider: value.provider ?? null,
     periodName: value.periodName ?? null,
+    groupId: value.groupId ?? null,
+    groupName: value.groupName ?? null,
     contextMultiplier: value.contextMultiplier,
     contextAfterTokens: value.contextAfterTokens ?? null,
   }

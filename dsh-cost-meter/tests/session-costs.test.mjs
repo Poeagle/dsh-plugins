@@ -155,7 +155,7 @@ test('own-fold cache invalidates on pricing change, live rewrite, and deleted se
   assert.equal(store.size, 1)
   assert.equal(afterRewrite[0].cost.inputTokens, 2_000_000)
   const cheaper = structuredClone(DEFAULT_PRICING)
-  cheaper.default.rates.input = 0.5
+  cheaper.groups[0].input = 0.5
   const afterPrice = await collectSessionCosts(query, cheaper, store, liveMap)
   assert.equal(afterPrice[0].cost.inputCost, 1)
   assert.equal(afterRewrite[0].cost.inputCost, 2)

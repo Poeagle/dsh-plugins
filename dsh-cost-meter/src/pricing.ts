@@ -14,12 +14,13 @@ export interface PartialTokenRates {
   output?: number
 }
 
+/** Time window that scales every group rate by one multiplier. */
 export interface PricingPeriod {
   id: string
   name: string
   start: string
   end: string
-  rates: PartialTokenRates
+  multiplier: number
 }
 
 /** Multiply one request's entire cost when its context exceeds `afterTokens`. */
@@ -28,43 +29,93 @@ export interface ContextSurcharge {
   multiplier: number
 }
 
-export interface PricingPlan {
-  rates?: PartialTokenRates
+/** Shared base rates and adjustment multipliers for a set of models. */
+export interface PricingGroup {
+  id: string
+  name: string
+  /** Base uncached-input price per `unitTokens`. */
+  input: number
+  /** Base output price per `unitTokens`. */
+  output: number
+  /** Cache-read price as a multiple of `input`. */
+  cacheReadMultiplier: number
+  /** Cache-write price as a multiple of `input`. */
+  cacheWriteMultiplier: number
   periods?: PricingPeriod[]
   contextSurcharges?: ContextSurcharge[]
+}
+
+/**
+ * Per-model assignment onto a pricing group.
+ * Final price = group rates (after period) × discountMultiplier × modelMultiplier,
+ * then the request-wide context surcharge.
+ */
+export interface ModelAssignment {
+  groupId: string
+  /** 优惠倍率. Omitted or empty treats as 1. */
+  discountMultiplier?: number
+  /** 模型倍率. Omitted or empty treats as 1. */
+  modelMultiplier?: number
+  /**
+   * When true, `reasoningTokens` are billed at the output rate in addition to
+   * `outputTokens` (Wanzhao grok: `completion_tokens` is visible-only).
+   * When false, reasoning is treated as a subset of `outputTokens`.
+   * When omitted, extra billing applies only if `reasoningTokens > outputTokens`.
+   */
+  reasoningExtra?: boolean
+}
+
+/** @deprecated Legacy per-model absolute plan; accepted only by `normalizePricing()`. */
+export interface PricingPlan {
+  groupId?: string
+  discountMultiplier?: number
+  modelMultiplier?: number
+  rates?: PartialTokenRates
+  periods?: Array<PricingPeriod | { id: string; name: string; start: string; end: string; rates?: PartialTokenRates; multiplier?: number }>
+  contextSurcharges?: ContextSurcharge[]
+  reasoningExtra?: boolean
 }
 
 export interface PricingConfig {
   currency: string
   unitTokens: number
   timezone: string
-  default: {
-    rates: TokenRates
-    periods?: PricingPeriod[]
-    contextSurcharges?: ContextSurcharge[]
-  }
-  models: Record<string, PricingPlan>
+  groups: PricingGroup[]
+  models: Record<string, ModelAssignment>
 }
 
 export interface ResolvedPricing {
   rates: TokenRates
-  source: 'model-period' | 'model' | 'default-period' | 'default'
+  source: 'group-period' | 'group'
   periodName?: string
+  groupId: string
+  groupName: string
+  periodMultiplier: number
+  discountMultiplier: number
+  modelMultiplier: number
+}
+
+export const DEFAULT_GROUP: PricingGroup = {
+  id: 'default',
+  name: '默认',
+  input: 1,
+  output: 2,
+  cacheReadMultiplier: 0.02,
+  cacheWriteMultiplier: 1,
+  periods: [],
+  contextSurcharges: [],
 }
 
 export const DEFAULT_PRICING: PricingConfig = {
   currency: 'CNY',
   unitTokens: 1_000_000,
   timezone: 'Asia/Shanghai',
-  default: {
-    rates: { input: 1, cacheRead: 0.02, cacheWrite: 1, output: 2 },
-    periods: [],
-  },
+  groups: [DEFAULT_GROUP],
   models: {},
 }
 
 const TIME_PATTERN = /^(?:[01]\d|2[0-3]):[0-5]\d$/
-const RATE_KEYS = ['input', 'cacheRead', 'cacheWrite', 'output'] as const
+const DEFAULT_GROUP_ID = 'default'
 
 export function routeKey(provider: string | null, model: string | null): string | null {
   return provider && model ? `${provider}/${model}` : null
@@ -97,24 +148,57 @@ function activePeriod(periods: readonly PricingPeriod[] | undefined, minute: num
   return periods?.find(period => includesMinute(period, minute))
 }
 
-function rateValue(...values: Array<number | undefined>): number {
-  return values.find(value => value !== undefined) ?? 0
+function finiteOr(value: number | undefined, fallback: number): number {
+  return value !== undefined && Number.isFinite(value) ? value : fallback
+}
+
+/** One when the multiplier is omitted, empty, or non-finite. */
+export function multiplierOrOne(value: number | undefined): number {
+  return value !== undefined && Number.isFinite(value) ? value : 1
+}
+
+export function findGroup(config: PricingConfig, groupId: string | undefined): PricingGroup {
+  const id = groupId !== undefined && groupId.trim() !== '' ? groupId : DEFAULT_GROUP_ID
+  return config.groups.find(group => group.id === id)
+    ?? config.groups.find(group => group.id === DEFAULT_GROUP_ID)
+    ?? config.groups[0]
+    ?? DEFAULT_GROUP
+}
+
+export function assignmentOf(config: PricingConfig, provider: string | null, model: string | null): ModelAssignment | undefined {
+  const key = routeKey(provider, model)
+  return key === null ? undefined : config.models[key]
+}
+
+function groupRates(group: PricingGroup, periodMultiplier: number, discountMultiplier: number, modelMultiplier: number): TokenRates {
+  const scale = periodMultiplier * discountMultiplier * modelMultiplier
+  return {
+    input: group.input * scale,
+    cacheRead: group.input * group.cacheReadMultiplier * scale,
+    cacheWrite: group.input * group.cacheWriteMultiplier * scale,
+    output: group.output * scale,
+  }
 }
 
 export function resolvePricing(config: PricingConfig, provider: string | null, model: string | null, time: number): ResolvedPricing {
+  config = normalizePricing(config)
   const minute = localMinute(time, config.timezone)
-  const key = routeKey(provider, model)
-  const plan = key === null ? undefined : config.models[key]
-  const modelPeriod = activePeriod(plan?.periods, minute)
-  const defaultPeriod = activePeriod(config.default.periods, minute)
-  const rates = Object.fromEntries(RATE_KEYS.map(rate => [
-    rate,
-    rateValue(modelPeriod?.rates[rate], plan?.rates?.[rate], defaultPeriod?.rates[rate], config.default.rates[rate]),
-  ])) as unknown as TokenRates
-  if (modelPeriod !== undefined) return { rates, source: 'model-period', periodName: modelPeriod.name }
-  if (plan?.rates !== undefined && RATE_KEYS.some(rate => plan.rates?.[rate] !== undefined)) return { rates, source: 'model' }
-  if (defaultPeriod !== undefined) return { rates, source: 'default-period', periodName: defaultPeriod.name }
-  return { rates, source: 'default' }
+  const assignment = assignmentOf(config, provider, model)
+  const group = findGroup(config, assignment?.groupId)
+  const period = activePeriod(group.periods, minute)
+  const periodMultiplier = multiplierOrOne(period?.multiplier)
+  const discountMultiplier = multiplierOrOne(assignment?.discountMultiplier)
+  const modelMultiplier = multiplierOrOne(assignment?.modelMultiplier)
+  return {
+    rates: groupRates(group, periodMultiplier, discountMultiplier, modelMultiplier),
+    source: period !== undefined ? 'group-period' : 'group',
+    periodName: period?.name,
+    groupId: group.id,
+    groupName: group.name,
+    periodMultiplier,
+    discountMultiplier,
+    modelMultiplier,
+  }
 }
 
 /**
@@ -128,9 +212,9 @@ export function contextTokensOf(tokens: { input: number; cacheRead: number; cach
 
 /**
  * Resolve the request-wide cost multiplier for one context size.
- * A model list, including `[]`, replaces the default list. Among matching
- * tiers (`contextTokens > afterTokens`), the highest threshold wins.
- * @param config Live pricing, including optional default and model surcharge lists.
+ * The assigned group's list is used. Among matching tiers
+ * (`contextTokens > afterTokens`), the highest threshold wins.
+ * @param config Live pricing, including group surcharge lists.
  * @param provider Request provider id, or null when unknown.
  * @param model Request model id, or null when unknown.
  * @param contextTokens Prompt-side token count from `contextTokensOf()`.
@@ -142,9 +226,10 @@ export function resolveContextSurcharge(
   model: string | null,
   contextTokens: number,
 ): ContextSurcharge | null {
-  const key = routeKey(provider, model)
-  const plan = key === null ? undefined : config.models[key]
-  const tiers = plan?.contextSurcharges ?? config.default.contextSurcharges
+  config = normalizePricing(config)
+  const assignment = assignmentOf(config, provider, model)
+  const group = findGroup(config, assignment?.groupId)
+  const tiers = group.contextSurcharges
   if (tiers === undefined) return null
   let matched: ContextSurcharge | undefined
   for (const tier of tiers) {
@@ -155,7 +240,7 @@ export function resolveContextSurcharge(
 }
 
 /**
- * @param config Live pricing, including optional default and model surcharge lists.
+ * @param config Live pricing, including group surcharge lists.
  * @param provider Request provider id, or null when unknown.
  * @param model Request model id, or null when unknown.
  * @param contextTokens Prompt-side token count from `contextTokensOf()`.
@@ -178,25 +263,46 @@ export function formatTokenThreshold(tokens: number): string {
 }
 
 /**
- * @param afterTokens Threshold that triggered the surcharge, or null when none applied.
- * @param multiplier Request-wide cost multiplier.
- * @returns A label such as `超过 200K ×2`, or null when the request is uncharged.
+ * Whether this route bills `reasoningTokens` on top of `outputTokens`.
+ * @param config Live pricing.
+ * @param provider Request provider id, or null when unknown.
+ * @param model Request model id, or null when unknown.
+ * @returns The model plan flag, or undefined when the plan does not declare one.
  */
+export function resolveReasoningExtra(
+  config: PricingConfig,
+  provider: string | null,
+  model: string | null,
+): boolean | undefined {
+  return assignmentOf(normalizePricing(config), provider, model)?.reasoningExtra
+}
+
+/**
+ * Output tokens that should be billed at the output rate.
+ * @param outputTokens Visible / `completion_tokens` count from the usage report.
+ * @param reasoningTokens `reasoningTokens` or `completion_tokens_details.reasoning_tokens`.
+ * @param reasoningExtra Model-plan flag from `resolveReasoningExtra()`.
+ * @returns `output + reasoning` when they are disjoint; otherwise `output`.
+ */
+export function billedOutputTokens(
+  outputTokens: number,
+  reasoningTokens: number,
+  reasoningExtra: boolean | undefined,
+): number {
+  if (reasoningTokens <= 0) return outputTokens
+  if (reasoningExtra === true) return outputTokens + reasoningTokens
+  if (reasoningExtra === false) return outputTokens
+  return reasoningTokens > outputTokens ? outputTokens + reasoningTokens : outputTokens
+}
+
 export function formatContextSurcharge(afterTokens: number | null | undefined, multiplier: number | null | undefined): string | null {
   if (multiplier === undefined || multiplier === null || multiplier === 1) return null
   if (afterTokens === undefined || afterTokens === null) return `×${multiplier}`
   return `超过 ${formatTokenThreshold(afterTokens)} ×${multiplier}`
 }
 
-function assertRates(rates: PartialTokenRates, path: string, complete: boolean): void {
-  for (const key of RATE_KEYS) {
-    const value = rates[key]
-    if (value === undefined) {
-      if (complete) throw new TypeError(`${path}.${key} is required`)
-      continue
-    }
-    if (!Number.isFinite(value) || value < 0) throw new TypeError(`${path}.${key} must be a non-negative finite number`)
-  }
+function assertNonNegative(value: number, path: string): void {
+  if (!Number.isFinite(value) || value < 0) throw new TypeError(`${path} must be a non-negative finite number`)
 }
 
 function minuteSegments(period: PricingPeriod): Array<[number, number]> {
@@ -221,7 +327,7 @@ function assertPeriods(periods: readonly PricingPeriod[] | undefined, path: stri
     if (!TIME_PATTERN.test(period.start) || !TIME_PATTERN.test(period.end) || period.start === period.end) {
       throw new TypeError(`${itemPath} must use distinct HH:mm start and end times`)
     }
-    assertRates(period.rates, `${itemPath}.rates`, false)
+    assertNonNegative(period.multiplier, `${itemPath}.multiplier`)
   }
   for (let left = 0; left < periods.length; left += 1) {
     for (let right = left + 1; right < periods.length; right += 1) {
@@ -240,13 +346,211 @@ function assertContextSurcharges(tiers: readonly ContextSurcharge[] | undefined,
     }
     if (thresholds.has(tier.afterTokens)) throw new TypeError(`${path} contains duplicate afterTokens`)
     thresholds.add(tier.afterTokens)
-    if (!Number.isFinite(tier.multiplier) || tier.multiplier < 0) {
-      throw new TypeError(`${itemPath}.multiplier must be a non-negative finite number`)
-    }
+    assertNonNegative(tier.multiplier, `${itemPath}.multiplier`)
   }
 }
 
+interface LegacyPeriod {
+  id: string
+  name: string
+  start: string
+  end: string
+  rates?: PartialTokenRates
+  multiplier?: number
+}
+
+interface LegacyPlan {
+  groupId?: string
+  discountMultiplier?: number
+  modelMultiplier?: number
+  rates?: PartialTokenRates
+  periods?: LegacyPeriod[]
+  contextSurcharges?: ContextSurcharge[]
+  reasoningExtra?: boolean
+}
+
+interface LegacyConfig {
+  currency?: string
+  unitTokens?: number
+  timezone?: string
+  groups?: PricingGroup[]
+  default?: {
+    rates?: PartialTokenRates
+    periods?: LegacyPeriod[]
+    contextSurcharges?: ContextSurcharge[]
+  }
+  models?: Record<string, LegacyPlan>
+}
+
+function slugify(value: string): string {
+  const slug = value.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
+  return slug === '' ? 'group' : slug.slice(0, 40)
+}
+
+function uniqueId(base: string, used: Set<string>): string {
+  if (!used.has(base)) {
+    used.add(base)
+    return base
+  }
+  let index = 2
+  while (used.has(`${base}-${index}`)) index += 1
+  const id = `${base}-${index}`
+  used.add(id)
+  return id
+}
+
+function periodMultiplierOf(period: LegacyPeriod, base: TokenRates): number {
+  if (period.multiplier !== undefined && Number.isFinite(period.multiplier)) return period.multiplier
+  const rates = period.rates
+  if (rates === undefined) return 1
+  if (rates.input !== undefined && Number.isFinite(rates.input) && base.input > 0) return rates.input / base.input
+  if (rates.output !== undefined && Number.isFinite(rates.output) && base.output > 0) return rates.output / base.output
+  const ratios: number[] = []
+  for (const key of ['cacheRead', 'cacheWrite'] as const) {
+    const value = rates[key]
+    const denom = base[key]
+    if (value === undefined || !Number.isFinite(value) || denom <= 0) continue
+    ratios.push(value / denom)
+  }
+  if (ratios.length === 0) return 1
+  return ratios.reduce((sum, value) => sum + value, 0) / ratios.length
+}
+
+function normalizePeriods(periods: readonly LegacyPeriod[] | undefined, base: TokenRates): PricingPeriod[] {
+  if (periods === undefined) return []
+  return periods.map(period => ({
+    id: period.id,
+    name: period.name,
+    start: period.start,
+    end: period.end,
+    multiplier: periodMultiplierOf(period, base),
+  }))
+}
+
+function tokenRatesOf(partial: PartialTokenRates | undefined, fallback: TokenRates): TokenRates {
+  return {
+    input: finiteOr(partial?.input, fallback.input),
+    cacheRead: finiteOr(partial?.cacheRead, fallback.cacheRead),
+    cacheWrite: finiteOr(partial?.cacheWrite, fallback.cacheWrite),
+    output: finiteOr(partial?.output, fallback.output),
+  }
+}
+
+function ratio(numerator: number, denominator: number): number {
+  if (denominator <= 0) return 0
+  return Number((numerator / denominator).toPrecision(12))
+}
+
+function groupFromRates(id: string, name: string, rates: TokenRates, periods: PricingPeriod[], contextSurcharges: ContextSurcharge[] | undefined): PricingGroup {
+  const input = rates.input
+  return {
+    id,
+    name,
+    input,
+    output: rates.output,
+    cacheReadMultiplier: ratio(rates.cacheRead, input),
+    cacheWriteMultiplier: ratio(rates.cacheWrite, input),
+    periods,
+    contextSurcharges: contextSurcharges ?? [],
+  }
+}
+
+function sameGroup(left: PricingGroup, right: PricingGroup): boolean {
+  return left.input === right.input
+    && left.output === right.output
+    && left.cacheReadMultiplier === right.cacheReadMultiplier
+    && left.cacheWriteMultiplier === right.cacheWriteMultiplier
+    && JSON.stringify(left.periods ?? []) === JSON.stringify(right.periods ?? [])
+    && JSON.stringify(left.contextSurcharges ?? []) === JSON.stringify(right.contextSurcharges ?? [])
+}
+
+function assignmentFromPlan(plan: LegacyPlan, groupId: string): ModelAssignment {
+  const assignment: ModelAssignment = { groupId }
+  if (plan.discountMultiplier !== undefined) assignment.discountMultiplier = plan.discountMultiplier
+  if (plan.modelMultiplier !== undefined) assignment.modelMultiplier = plan.modelMultiplier
+  if (plan.reasoningExtra !== undefined) assignment.reasoningExtra = plan.reasoningExtra
+  return assignment
+}
+
+/**
+ * Accept the current group/assignment document and the previous
+ * default/models absolute-rate document. Always returns a group-based config.
+ */
+export function normalizePricing(raw: unknown): PricingConfig {
+  const input = (raw !== null && typeof raw === 'object' ? raw : {}) as LegacyConfig
+  const currency = typeof input.currency === 'string' && input.currency.trim() !== '' ? input.currency : DEFAULT_PRICING.currency
+  const unitTokens = Number.isSafeInteger(input.unitTokens) && (input.unitTokens ?? 0) >= 1 ? input.unitTokens! : DEFAULT_PRICING.unitTokens
+  const timezone = typeof input.timezone === 'string' && input.timezone.trim() !== '' ? input.timezone : DEFAULT_PRICING.timezone
+  const hasGroups = Array.isArray(input.groups) && input.groups.length > 0
+  if (hasGroups) {
+    const groups = input.groups!.map(group => ({
+      ...group,
+      periods: (group.periods ?? []).map(period => ({
+        id: period.id,
+        name: period.name,
+        start: period.start,
+        end: period.end,
+        multiplier: multiplierOrOne((period as LegacyPeriod).multiplier),
+      })),
+      contextSurcharges: group.contextSurcharges ?? [],
+    }))
+    const models: Record<string, ModelAssignment> = {}
+    for (const [key, plan] of Object.entries(input.models ?? {})) {
+      if (plan === undefined) continue
+      models[key] = assignmentFromPlan(plan, plan.groupId ?? DEFAULT_GROUP_ID)
+    }
+    return { currency, unitTokens, timezone, groups, models }
+  }
+  const fallbackRates = DEFAULT_GROUP
+  const defaultRates = tokenRatesOf(input.default?.rates, {
+    input: fallbackRates.input,
+    cacheRead: fallbackRates.input * fallbackRates.cacheReadMultiplier,
+    cacheWrite: fallbackRates.input * fallbackRates.cacheWriteMultiplier,
+    output: fallbackRates.output,
+  })
+  const defaultGroup = groupFromRates(
+    DEFAULT_GROUP_ID,
+    '默认',
+    defaultRates,
+    normalizePeriods(input.default?.periods, defaultRates),
+    input.default?.contextSurcharges,
+  )
+  const groups: PricingGroup[] = [defaultGroup]
+  const used = new Set<string>([DEFAULT_GROUP_ID])
+  const models: Record<string, ModelAssignment> = {}
+  for (const [key, plan] of Object.entries(input.models ?? {})) {
+    if (plan === undefined) continue
+    const rates = tokenRatesOf(plan.rates, defaultRates)
+    const periods = plan.periods === undefined || plan.periods.length === 0
+      ? defaultGroup.periods ?? []
+      : normalizePeriods(plan.periods, rates)
+    const contextSurcharges = plan.contextSurcharges ?? defaultGroup.contextSurcharges
+    const candidate = groupFromRates(uniqueId(slugify(key), used), key, rates, periods, contextSurcharges)
+    const existing = groups.find(group => sameGroup(group, candidate))
+    if (existing !== undefined) {
+      used.delete(candidate.id)
+      models[key] = assignmentFromPlan(plan, existing.id)
+      continue
+    }
+    groups.push(candidate)
+    models[key] = assignmentFromPlan(plan, candidate.id)
+  }
+  return { currency, unitTokens, timezone, groups, models }
+}
+
+function assertGroup(group: PricingGroup, path: string): void {
+  if (group.id.trim() === '') throw new TypeError(`${path}.id must be non-empty`)
+  if (group.name.trim() === '') throw new TypeError(`${path}.name is required`)
+  assertNonNegative(group.input, `${path}.input`)
+  assertNonNegative(group.output, `${path}.output`)
+  assertNonNegative(group.cacheReadMultiplier, `${path}.cacheReadMultiplier`)
+  assertNonNegative(group.cacheWriteMultiplier, `${path}.cacheWriteMultiplier`)
+  assertPeriods(group.periods, `${path}.periods`)
+  assertContextSurcharges(group.contextSurcharges, `${path}.contextSurcharges`)
+}
+
 export function validatePricing(config: PricingConfig): void {
+  config = normalizePricing(config)
   if (config.currency.trim() === '' || config.currency.length > 8) throw new TypeError('currency must contain 1-8 characters')
   if (!Number.isSafeInteger(config.unitTokens) || config.unitTokens < 1) throw new TypeError('unitTokens must be a positive safe integer')
   try {
@@ -254,14 +558,21 @@ export function validatePricing(config: PricingConfig): void {
   } catch {
     throw new TypeError(`timezone "${config.timezone}" is not an IANA time zone`)
   }
-  assertRates(config.default.rates, 'default.rates', true)
-  assertPeriods(config.default.periods, 'default.periods')
-  assertContextSurcharges(config.default.contextSurcharges, 'default.contextSurcharges')
-  for (const [key, plan] of Object.entries(config.models)) {
+  if (!Array.isArray(config.groups) || config.groups.length === 0) throw new TypeError('groups must contain at least one pricing group')
+  const ids = new Set<string>()
+  for (const [index, group] of config.groups.entries()) {
+    const path = `groups[${index}]`
+    if (ids.has(group.id)) throw new TypeError(`${path}.id "${group.id}" is not unique`)
+    ids.add(group.id)
+    assertGroup(group, path)
+  }
+  for (const [key, assignment] of Object.entries(config.models)) {
     if (key.trim() === '' || !key.includes('/')) throw new TypeError(`model key "${key}" must be provider/model`)
-    if (plan.rates !== undefined) assertRates(plan.rates, `models.${key}.rates`, false)
-    assertPeriods(plan.periods, `models.${key}.periods`)
-    assertContextSurcharges(plan.contextSurcharges, `models.${key}.contextSurcharges`)
+    if (assignment.groupId === undefined || assignment.groupId.trim() === '' || !ids.has(assignment.groupId)) {
+      throw new TypeError(`models.${key}.groupId "${assignment.groupId}" does not match a pricing group`)
+    }
+    if (assignment.discountMultiplier !== undefined) assertNonNegative(assignment.discountMultiplier, `models.${key}.discountMultiplier`)
+    if (assignment.modelMultiplier !== undefined) assertNonNegative(assignment.modelMultiplier, `models.${key}.modelMultiplier`)
   }
 }
 
@@ -280,11 +591,16 @@ export interface CostEvent {
 
 /** One pricing-context slice within a cumulative fold. */
 export interface CostDetail {
-  source: 'model-period' | 'model' | 'default-period' | 'default'
+  source: 'group-period' | 'group'
   periodName: string | null
   provider: string | null
   model: string | null
+  groupId: string
+  groupName: string
   rates: TokenRates
+  periodMultiplier: number
+  discountMultiplier: number
+  modelMultiplier: number
   contextMultiplier: number
   contextAfterTokens: number | null
   inputTokens: number
@@ -319,6 +635,8 @@ export interface HourlyDetail {
   provider: string | null
   pricingSource: string | null
   periodName: string | null
+  groupId: string | null
+  groupName: string | null
   contextMultiplier: number
   contextAfterTokens: number | null
 }
@@ -345,8 +663,10 @@ export interface CostFold {
   route: string | null
   currency: string
   unitTokens: number
-  pricingSource: 'model-period' | 'model' | 'default-period' | 'default' | null
+  pricingSource: 'group-period' | 'group' | null
   pricingPeriod: string | null
+  groupId: string | null
+  groupName: string | null
   details: CostDetail[]
   hourly: HourlyDetail[]
   subagents: CostSubagent[]
@@ -383,9 +703,11 @@ export function normalizeUsage(raw: Record<string, unknown>): {
   cacheReadTokens: number
   cacheWriteTokens: number
   outputTokens: number
+  reasoningTokens: number
 } {
   const promptDetails = object(raw.prompt_tokens_details)
   const inputDetails = object(raw.input_tokens_details)
+  const completionDetails = object(raw.completion_tokens_details)
   const cacheRead = firstNumber(
     raw.cacheReadTokens,
     raw.cache_read_input_tokens,
@@ -416,6 +738,11 @@ export function normalizeUsage(raw: Record<string, unknown>): {
     cacheReadTokens: cacheRead,
     cacheWriteTokens: cacheWrite,
     outputTokens: firstNumber(raw.outputTokens, raw.output_tokens, raw.completion_tokens),
+    reasoningTokens: firstNumber(
+      raw.reasoningTokens,
+      raw.reasoning_tokens,
+      completionDetails.reasoning_tokens,
+    ),
   }
 }
 
@@ -437,6 +764,8 @@ function emptyFold(config: PricingConfig): CostFold {
     unitTokens: config.unitTokens,
     pricingSource: null,
     pricingPeriod: null,
+    groupId: null,
+    groupName: null,
     details: [],
     hourly: [],
     subagents: [],
@@ -465,6 +794,8 @@ interface HourBucket {
   provider: string | null
   pricingSource: string
   periodName: string | null
+  groupId: string
+  groupName: string
   contextMultiplier: number
   contextAfterTokens: number | null
   inputTokens: number
@@ -480,6 +811,7 @@ interface HourBucket {
 
 /** Fold request routes and provider usage into a cumulative estimate. */
 export function foldSession(events: readonly CostEvent[], config: PricingConfig = DEFAULT_PRICING): CostFold {
+  config = normalizePricing(config)
   const out = emptyFold(config)
   let provider: string | null = null
   let model: string | null = null
@@ -487,10 +819,10 @@ export function foldSession(events: readonly CostEvent[], config: PricingConfig 
   let lastPricing: ResolvedPricing | null = null
   let lastHourKey: string | null = null
   const detailMap = new Map<string, CostDetail>()
-  const detailKey = (p: string | null, m: string | null, s: string, pn: string | null, multiplier: number, afterTokens: number | null): string =>
-    `${p ?? ''}|${m ?? ''}|${s}|${pn ?? ''}|${multiplier}|${afterTokens ?? ''}`
+  const detailKey = (p: string | null, m: string | null, s: string, pn: string | null, groupId: string, discount: number, modelMul: number, multiplier: number, afterTokens: number | null): string =>
+    `${p ?? ''}|${m ?? ''}|${s}|${pn ?? ''}|${groupId}|${discount}|${modelMul}|${multiplier}|${afterTokens ?? ''}`
   const ensureDetail = (pricing: ResolvedPricing, multiplier: number, afterTokens: number | null): CostDetail => {
-    const key = detailKey(provider, model, pricing.source, pricing.periodName ?? null, multiplier, afterTokens)
+    const key = detailKey(provider, model, pricing.source, pricing.periodName ?? null, pricing.groupId, pricing.discountMultiplier, pricing.modelMultiplier, multiplier, afterTokens)
     let detail = detailMap.get(key)
     if (detail === undefined) {
       detail = {
@@ -498,7 +830,12 @@ export function foldSession(events: readonly CostEvent[], config: PricingConfig 
         periodName: pricing.periodName ?? null,
         provider,
         model,
+        groupId: pricing.groupId,
+        groupName: pricing.groupName,
         rates: { ...pricing.rates },
+        periodMultiplier: pricing.periodMultiplier,
+        discountMultiplier: pricing.discountMultiplier,
+        modelMultiplier: pricing.modelMultiplier,
         contextMultiplier: multiplier,
         contextAfterTokens: afterTokens,
         inputTokens: 0,
@@ -517,7 +854,7 @@ export function foldSession(events: readonly CostEvent[], config: PricingConfig 
   }
   const hourMap = new Map<string, HourBucket>()
   const hourBucketKey = (hKey: string, pricing: ResolvedPricing, multiplier: number, afterTokens: number | null): string =>
-    `${hKey}|${provider ?? ''}|${model ?? ''}|${pricing.source}|${pricing.periodName ?? ''}|${multiplier}|${afterTokens ?? ''}`
+    `${hKey}|${provider ?? ''}|${model ?? ''}|${pricing.source}|${pricing.periodName ?? ''}|${pricing.groupId}|${pricing.discountMultiplier}|${pricing.modelMultiplier}|${multiplier}|${afterTokens ?? ''}`
   const ensureHour = (hKey: string, pricing: ResolvedPricing, multiplier: number, afterTokens: number | null): HourBucket => {
     const key = hourBucketKey(hKey, pricing, multiplier, afterTokens)
     let bucket = hourMap.get(key)
@@ -532,6 +869,8 @@ export function foldSession(events: readonly CostEvent[], config: PricingConfig 
         provider,
         pricingSource: pricing.source,
         periodName: pricing.periodName ?? null,
+        groupId: pricing.groupId,
+        groupName: pricing.groupName,
         contextMultiplier: multiplier,
         contextAfterTokens: afterTokens,
         inputTokens: 0,
@@ -572,7 +911,11 @@ export function foldSession(events: readonly CostEvent[], config: PricingConfig 
       input: normalized.inputTokens,
       cacheRead: normalized.cacheReadTokens,
       cacheWrite: normalized.cacheWriteTokens,
-      output: normalized.outputTokens,
+      output: billedOutputTokens(
+        normalized.outputTokens,
+        normalized.reasoningTokens,
+        resolveReasoningExtra(config, provider, model),
+      ),
     }
     const surcharge = resolveContextSurcharge(config, provider, model, contextTokensOf(tokens))
     const contextMultiplier = surcharge?.multiplier ?? 1
@@ -631,6 +974,8 @@ export function foldSession(events: readonly CostEvent[], config: PricingConfig 
     out.route = routeKey(provider, model)
     out.pricingSource = pricing.source
     out.pricingPeriod = pricing.periodName ?? null
+    out.groupId = pricing.groupId
+    out.groupName = pricing.groupName
     last = { turn: event.data.turn, step: event.data.step, costs, tokens, hourBucketKey: hourBucketKey(hKey, pricing, contextMultiplier, contextAfterTokens), contextMultiplier, contextAfterTokens }
     lastPricing = pricing
     lastHourKey = hKey
@@ -685,6 +1030,8 @@ export function foldSession(events: readonly CostEvent[], config: PricingConfig 
       provider: bucket.provider,
       pricingSource: bucket.pricingSource,
       periodName: bucket.periodName,
+      groupId: bucket.groupId,
+      groupName: bucket.groupName,
       contextMultiplier: bucket.contextMultiplier,
       contextAfterTokens: bucket.contextAfterTokens,
     }]

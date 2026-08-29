@@ -1,5 +1,6 @@
 import { TypertRemoteService } from "@deepseek-ai/dsh-typert-protocol";
-//#region ../../../../../../opt/homebrew/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/cosmokit/lib/index.js
+import { AsyncLocalStorage } from "node:async_hooks";
+//#region ../../../../../opt/homebrew/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/cosmokit/lib/index.js
 /** Return true when a value is `null` or `undefined`. */
 function isNullable(value) {
 	return value === null || value === void 0;
@@ -195,7 +196,7 @@ var Time;
 	Time.template = template;
 })(Time || (Time = {}));
 //#endregion
-//#region ../../../../../../opt/homebrew/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/schemastery/lib/index.mjs
+//#region ../../../../../opt/homebrew/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/schemastery/lib/index.mjs
 const kSchema = Symbol.for("schemastery");
 const kValidationError = Symbol.for("ValidationError");
 globalThis.__schemastery_index__ ??= 0;
@@ -790,28 +791,25 @@ defineMethod("transform", [
 ], ({ inner }, isInner) => inner.toString(isInner));
 //#endregion
 //#region src/pricing.ts
+const DEFAULT_GROUP = {
+	id: "default",
+	name: "默认",
+	input: 1,
+	output: 2,
+	cacheReadMultiplier: .02,
+	cacheWriteMultiplier: 1,
+	periods: [],
+	contextSurcharges: []
+};
 const DEFAULT_PRICING = {
 	currency: "CNY",
 	unitTokens: 1e6,
 	timezone: "Asia/Shanghai",
-	default: {
-		rates: {
-			input: 1,
-			cacheRead: .02,
-			cacheWrite: 1,
-			output: 2
-		},
-		periods: []
-	},
+	groups: [DEFAULT_GROUP],
 	models: {}
 };
 const TIME_PATTERN = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
-const RATE_KEYS = [
-	"input",
-	"cacheRead",
-	"cacheWrite",
-	"output"
-];
+const DEFAULT_GROUP_ID = "default";
 function routeKey(provider, model) {
 	return provider && model ? `${provider}/${model}` : null;
 }
@@ -838,33 +836,48 @@ function includesMinute(period, minute) {
 function activePeriod(periods, minute) {
 	return periods?.find((period) => includesMinute(period, minute));
 }
-function rateValue(...values) {
-	return values.find((value) => value !== void 0) ?? 0;
+function finiteOr(value, fallback) {
+	return value !== void 0 && Number.isFinite(value) ? value : fallback;
+}
+/** One when the multiplier is omitted, empty, or non-finite. */
+function multiplierOrOne(value) {
+	return value !== void 0 && Number.isFinite(value) ? value : 1;
+}
+function findGroup(config, groupId) {
+	const id = groupId !== void 0 && groupId.trim() !== "" ? groupId : DEFAULT_GROUP_ID;
+	return config.groups.find((group) => group.id === id) ?? config.groups.find((group) => group.id === DEFAULT_GROUP_ID) ?? config.groups[0] ?? DEFAULT_GROUP;
+}
+function assignmentOf(config, provider, model) {
+	const key = routeKey(provider, model);
+	return key === null ? void 0 : config.models[key];
+}
+function groupRates(group, periodMultiplier, discountMultiplier, modelMultiplier) {
+	const scale = periodMultiplier * discountMultiplier * modelMultiplier;
+	return {
+		input: group.input * scale,
+		cacheRead: group.input * group.cacheReadMultiplier * scale,
+		cacheWrite: group.input * group.cacheWriteMultiplier * scale,
+		output: group.output * scale
+	};
 }
 function resolvePricing(config, provider, model, time) {
+	config = normalizePricing(config);
 	const minute = localMinute(time, config.timezone);
-	const key = routeKey(provider, model);
-	const plan = key === null ? void 0 : config.models[key];
-	const modelPeriod = activePeriod(plan?.periods, minute);
-	const defaultPeriod = activePeriod(config.default.periods, minute);
-	const rates = Object.fromEntries(RATE_KEYS.map((rate) => [rate, rateValue(modelPeriod?.rates[rate], plan?.rates?.[rate], defaultPeriod?.rates[rate], config.default.rates[rate])]));
-	if (modelPeriod !== void 0) return {
-		rates,
-		source: "model-period",
-		periodName: modelPeriod.name
-	};
-	if (plan?.rates !== void 0 && RATE_KEYS.some((rate) => plan.rates?.[rate] !== void 0)) return {
-		rates,
-		source: "model"
-	};
-	if (defaultPeriod !== void 0) return {
-		rates,
-		source: "default-period",
-		periodName: defaultPeriod.name
-	};
+	const assignment = assignmentOf(config, provider, model);
+	const group = findGroup(config, assignment?.groupId);
+	const period = activePeriod(group.periods, minute);
+	const periodMultiplier = multiplierOrOne(period?.multiplier);
+	const discountMultiplier = multiplierOrOne(assignment?.discountMultiplier);
+	const modelMultiplier = multiplierOrOne(assignment?.modelMultiplier);
 	return {
-		rates,
-		source: "default"
+		rates: groupRates(group, periodMultiplier, discountMultiplier, modelMultiplier),
+		source: period !== void 0 ? "group-period" : "group",
+		periodName: period?.name,
+		groupId: group.id,
+		groupName: group.name,
+		periodMultiplier,
+		discountMultiplier,
+		modelMultiplier
 	};
 }
 /**
@@ -877,17 +890,18 @@ function contextTokensOf(tokens) {
 }
 /**
 * Resolve the request-wide cost multiplier for one context size.
-* A model list, including `[]`, replaces the default list. Among matching
-* tiers (`contextTokens > afterTokens`), the highest threshold wins.
-* @param config Live pricing, including optional default and model surcharge lists.
+* The assigned group's list is used. Among matching tiers
+* (`contextTokens > afterTokens`), the highest threshold wins.
+* @param config Live pricing, including group surcharge lists.
 * @param provider Request provider id, or null when unknown.
 * @param model Request model id, or null when unknown.
 * @param contextTokens Prompt-side token count from `contextTokensOf()`.
 * @returns The matching tier, or null when no surcharge applies.
 */
 function resolveContextSurcharge(config, provider, model, contextTokens) {
-	const key = routeKey(provider, model);
-	const tiers = (key === null ? void 0 : config.models[key])?.contextSurcharges ?? config.default.contextSurcharges;
+	config = normalizePricing(config);
+	const assignment = assignmentOf(config, provider, model);
+	const tiers = findGroup(config, assignment?.groupId).contextSurcharges;
 	if (tiers === void 0) return null;
 	let matched;
 	for (const tier of tiers) {
@@ -897,7 +911,7 @@ function resolveContextSurcharge(config, provider, model, contextTokens) {
 	return matched ?? null;
 }
 /**
-* @param config Live pricing, including optional default and model surcharge lists.
+* @param config Live pricing, including group surcharge lists.
 * @param provider Request provider id, or null when unknown.
 * @param model Request model id, or null when unknown.
 * @param contextTokens Prompt-side token count from `contextTokensOf()`.
@@ -913,24 +927,35 @@ function formatTokenThreshold(tokens) {
 	return tokens.toLocaleString("zh-CN");
 }
 /**
-* @param afterTokens Threshold that triggered the surcharge, or null when none applied.
-* @param multiplier Request-wide cost multiplier.
-* @returns A label such as `超过 200K ×2`, or null when the request is uncharged.
+* Whether this route bills `reasoningTokens` on top of `outputTokens`.
+* @param config Live pricing.
+* @param provider Request provider id, or null when unknown.
+* @param model Request model id, or null when unknown.
+* @returns The model plan flag, or undefined when the plan does not declare one.
 */
+function resolveReasoningExtra(config, provider, model) {
+	return assignmentOf(normalizePricing(config), provider, model)?.reasoningExtra;
+}
+/**
+* Output tokens that should be billed at the output rate.
+* @param outputTokens Visible / `completion_tokens` count from the usage report.
+* @param reasoningTokens `reasoningTokens` or `completion_tokens_details.reasoning_tokens`.
+* @param reasoningExtra Model-plan flag from `resolveReasoningExtra()`.
+* @returns `output + reasoning` when they are disjoint; otherwise `output`.
+*/
+function billedOutputTokens(outputTokens, reasoningTokens, reasoningExtra) {
+	if (reasoningTokens <= 0) return outputTokens;
+	if (reasoningExtra === true) return outputTokens + reasoningTokens;
+	if (reasoningExtra === false) return outputTokens;
+	return reasoningTokens > outputTokens ? outputTokens + reasoningTokens : outputTokens;
+}
 function formatContextSurcharge(afterTokens, multiplier) {
 	if (multiplier === void 0 || multiplier === null || multiplier === 1) return null;
 	if (afterTokens === void 0 || afterTokens === null) return `×${multiplier}`;
 	return `超过 ${formatTokenThreshold(afterTokens)} ×${multiplier}`;
 }
-function assertRates(rates, path, complete) {
-	for (const key of RATE_KEYS) {
-		const value = rates[key];
-		if (value === void 0) {
-			if (complete) throw new TypeError(`${path}.${key} is required`);
-			continue;
-		}
-		if (!Number.isFinite(value) || value < 0) throw new TypeError(`${path}.${key} must be a non-negative finite number`);
-	}
+function assertNonNegative(value, path) {
+	if (!Number.isFinite(value) || value < 0) throw new TypeError(`${path} must be a non-negative finite number`);
 }
 function minuteSegments(period) {
 	const start = minuteOfDay(period.start);
@@ -949,7 +974,7 @@ function assertPeriods(periods, path) {
 		ids.add(period.id);
 		if (period.name.trim() === "") throw new TypeError(`${itemPath}.name is required`);
 		if (!TIME_PATTERN.test(period.start) || !TIME_PATTERN.test(period.end) || period.start === period.end) throw new TypeError(`${itemPath} must use distinct HH:mm start and end times`);
-		assertRates(period.rates, `${itemPath}.rates`, false);
+		assertNonNegative(period.multiplier, `${itemPath}.multiplier`);
 	}
 	for (let left = 0; left < periods.length; left += 1) for (let right = left + 1; right < periods.length; right += 1) if (overlaps(periods[left], periods[right])) throw new TypeError(`${path} contains overlapping periods`);
 }
@@ -961,10 +986,165 @@ function assertContextSurcharges(tiers, path) {
 		if (!Number.isSafeInteger(tier.afterTokens) || tier.afterTokens < 0) throw new TypeError(`${itemPath}.afterTokens must be a non-negative safe integer`);
 		if (thresholds.has(tier.afterTokens)) throw new TypeError(`${path} contains duplicate afterTokens`);
 		thresholds.add(tier.afterTokens);
-		if (!Number.isFinite(tier.multiplier) || tier.multiplier < 0) throw new TypeError(`${itemPath}.multiplier must be a non-negative finite number`);
+		assertNonNegative(tier.multiplier, `${itemPath}.multiplier`);
 	}
 }
+function slugify(value) {
+	const slug = value.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+	return slug === "" ? "group" : slug.slice(0, 40);
+}
+function uniqueId(base, used) {
+	if (!used.has(base)) {
+		used.add(base);
+		return base;
+	}
+	let index = 2;
+	while (used.has(`${base}-${index}`)) index += 1;
+	const id = `${base}-${index}`;
+	used.add(id);
+	return id;
+}
+function periodMultiplierOf(period, base) {
+	if (period.multiplier !== void 0 && Number.isFinite(period.multiplier)) return period.multiplier;
+	const rates = period.rates;
+	if (rates === void 0) return 1;
+	if (rates.input !== void 0 && Number.isFinite(rates.input) && base.input > 0) return rates.input / base.input;
+	if (rates.output !== void 0 && Number.isFinite(rates.output) && base.output > 0) return rates.output / base.output;
+	const ratios = [];
+	for (const key of ["cacheRead", "cacheWrite"]) {
+		const value = rates[key];
+		const denom = base[key];
+		if (value === void 0 || !Number.isFinite(value) || denom <= 0) continue;
+		ratios.push(value / denom);
+	}
+	if (ratios.length === 0) return 1;
+	return ratios.reduce((sum, value) => sum + value, 0) / ratios.length;
+}
+function normalizePeriods(periods, base) {
+	if (periods === void 0) return [];
+	return periods.map((period) => ({
+		id: period.id,
+		name: period.name,
+		start: period.start,
+		end: period.end,
+		multiplier: periodMultiplierOf(period, base)
+	}));
+}
+function tokenRatesOf(partial, fallback) {
+	return {
+		input: finiteOr(partial?.input, fallback.input),
+		cacheRead: finiteOr(partial?.cacheRead, fallback.cacheRead),
+		cacheWrite: finiteOr(partial?.cacheWrite, fallback.cacheWrite),
+		output: finiteOr(partial?.output, fallback.output)
+	};
+}
+function ratio(numerator, denominator) {
+	if (denominator <= 0) return 0;
+	return Number((numerator / denominator).toPrecision(12));
+}
+function groupFromRates(id, name, rates, periods, contextSurcharges) {
+	const input = rates.input;
+	return {
+		id,
+		name,
+		input,
+		output: rates.output,
+		cacheReadMultiplier: ratio(rates.cacheRead, input),
+		cacheWriteMultiplier: ratio(rates.cacheWrite, input),
+		periods,
+		contextSurcharges: contextSurcharges ?? []
+	};
+}
+function sameGroup(left, right) {
+	return left.input === right.input && left.output === right.output && left.cacheReadMultiplier === right.cacheReadMultiplier && left.cacheWriteMultiplier === right.cacheWriteMultiplier && JSON.stringify(left.periods ?? []) === JSON.stringify(right.periods ?? []) && JSON.stringify(left.contextSurcharges ?? []) === JSON.stringify(right.contextSurcharges ?? []);
+}
+function assignmentFromPlan(plan, groupId) {
+	const assignment = { groupId };
+	if (plan.discountMultiplier !== void 0) assignment.discountMultiplier = plan.discountMultiplier;
+	if (plan.modelMultiplier !== void 0) assignment.modelMultiplier = plan.modelMultiplier;
+	if (plan.reasoningExtra !== void 0) assignment.reasoningExtra = plan.reasoningExtra;
+	return assignment;
+}
+/**
+* Accept the current group/assignment document and the previous
+* default/models absolute-rate document. Always returns a group-based config.
+*/
+function normalizePricing(raw) {
+	const input = raw !== null && typeof raw === "object" ? raw : {};
+	const currency = typeof input.currency === "string" && input.currency.trim() !== "" ? input.currency : DEFAULT_PRICING.currency;
+	const unitTokens = Number.isSafeInteger(input.unitTokens) && (input.unitTokens ?? 0) >= 1 ? input.unitTokens : DEFAULT_PRICING.unitTokens;
+	const timezone = typeof input.timezone === "string" && input.timezone.trim() !== "" ? input.timezone : DEFAULT_PRICING.timezone;
+	if (Array.isArray(input.groups) && input.groups.length > 0) {
+		const groups = input.groups.map((group) => ({
+			...group,
+			periods: (group.periods ?? []).map((period) => ({
+				id: period.id,
+				name: period.name,
+				start: period.start,
+				end: period.end,
+				multiplier: multiplierOrOne(period.multiplier)
+			})),
+			contextSurcharges: group.contextSurcharges ?? []
+		}));
+		const models = {};
+		for (const [key, plan] of Object.entries(input.models ?? {})) {
+			if (plan === void 0) continue;
+			models[key] = assignmentFromPlan(plan, plan.groupId ?? DEFAULT_GROUP_ID);
+		}
+		return {
+			currency,
+			unitTokens,
+			timezone,
+			groups,
+			models
+		};
+	}
+	const fallbackRates = DEFAULT_GROUP;
+	const defaultRates = tokenRatesOf(input.default?.rates, {
+		input: fallbackRates.input,
+		cacheRead: fallbackRates.input * fallbackRates.cacheReadMultiplier,
+		cacheWrite: fallbackRates.input * fallbackRates.cacheWriteMultiplier,
+		output: fallbackRates.output
+	});
+	const defaultGroup = groupFromRates(DEFAULT_GROUP_ID, "默认", defaultRates, normalizePeriods(input.default?.periods, defaultRates), input.default?.contextSurcharges);
+	const groups = [defaultGroup];
+	const used = /* @__PURE__ */ new Set([DEFAULT_GROUP_ID]);
+	const models = {};
+	for (const [key, plan] of Object.entries(input.models ?? {})) {
+		if (plan === void 0) continue;
+		const rates = tokenRatesOf(plan.rates, defaultRates);
+		const periods = plan.periods === void 0 || plan.periods.length === 0 ? defaultGroup.periods ?? [] : normalizePeriods(plan.periods, rates);
+		const contextSurcharges = plan.contextSurcharges ?? defaultGroup.contextSurcharges;
+		const candidate = groupFromRates(uniqueId(slugify(key), used), key, rates, periods, contextSurcharges);
+		const existing = groups.find((group) => sameGroup(group, candidate));
+		if (existing !== void 0) {
+			used.delete(candidate.id);
+			models[key] = assignmentFromPlan(plan, existing.id);
+			continue;
+		}
+		groups.push(candidate);
+		models[key] = assignmentFromPlan(plan, candidate.id);
+	}
+	return {
+		currency,
+		unitTokens,
+		timezone,
+		groups,
+		models
+	};
+}
+function assertGroup(group, path) {
+	if (group.id.trim() === "") throw new TypeError(`${path}.id must be non-empty`);
+	if (group.name.trim() === "") throw new TypeError(`${path}.name is required`);
+	assertNonNegative(group.input, `${path}.input`);
+	assertNonNegative(group.output, `${path}.output`);
+	assertNonNegative(group.cacheReadMultiplier, `${path}.cacheReadMultiplier`);
+	assertNonNegative(group.cacheWriteMultiplier, `${path}.cacheWriteMultiplier`);
+	assertPeriods(group.periods, `${path}.periods`);
+	assertContextSurcharges(group.contextSurcharges, `${path}.contextSurcharges`);
+}
 function validatePricing(config) {
+	config = normalizePricing(config);
 	if (config.currency.trim() === "" || config.currency.length > 8) throw new TypeError("currency must contain 1-8 characters");
 	if (!Number.isSafeInteger(config.unitTokens) || config.unitTokens < 1) throw new TypeError("unitTokens must be a positive safe integer");
 	try {
@@ -972,14 +1152,19 @@ function validatePricing(config) {
 	} catch {
 		throw new TypeError(`timezone "${config.timezone}" is not an IANA time zone`);
 	}
-	assertRates(config.default.rates, "default.rates", true);
-	assertPeriods(config.default.periods, "default.periods");
-	assertContextSurcharges(config.default.contextSurcharges, "default.contextSurcharges");
-	for (const [key, plan] of Object.entries(config.models)) {
+	if (!Array.isArray(config.groups) || config.groups.length === 0) throw new TypeError("groups must contain at least one pricing group");
+	const ids = /* @__PURE__ */ new Set();
+	for (const [index, group] of config.groups.entries()) {
+		const path = `groups[${index}]`;
+		if (ids.has(group.id)) throw new TypeError(`${path}.id "${group.id}" is not unique`);
+		ids.add(group.id);
+		assertGroup(group, path);
+	}
+	for (const [key, assignment] of Object.entries(config.models)) {
 		if (key.trim() === "" || !key.includes("/")) throw new TypeError(`model key "${key}" must be provider/model`);
-		if (plan.rates !== void 0) assertRates(plan.rates, `models.${key}.rates`, false);
-		assertPeriods(plan.periods, `models.${key}.periods`);
-		assertContextSurcharges(plan.contextSurcharges, `models.${key}.contextSurcharges`);
+		if (assignment.groupId === void 0 || assignment.groupId.trim() === "" || !ids.has(assignment.groupId)) throw new TypeError(`models.${key}.groupId "${assignment.groupId}" does not match a pricing group`);
+		if (assignment.discountMultiplier !== void 0) assertNonNegative(assignment.discountMultiplier, `models.${key}.discountMultiplier`);
+		if (assignment.modelMultiplier !== void 0) assertNonNegative(assignment.modelMultiplier, `models.${key}.modelMultiplier`);
 	}
 }
 function num(value) {
@@ -989,13 +1174,14 @@ function firstNumber(...values) {
 	for (const value of values) if (typeof value === "number" && Number.isFinite(value) && value >= 0) return value;
 	return 0;
 }
-function object(value) {
+function object$1(value) {
 	return value !== null && typeof value === "object" ? value : {};
 }
 /** Normalize common provider usage responses into DSH's disjoint token buckets. */
 function normalizeUsage(raw) {
-	const promptDetails = object(raw.prompt_tokens_details);
-	const inputDetails = object(raw.input_tokens_details);
+	const promptDetails = object$1(raw.prompt_tokens_details);
+	const inputDetails = object$1(raw.input_tokens_details);
+	const completionDetails = object$1(raw.completion_tokens_details);
 	const cacheRead = firstNumber(raw.cacheReadTokens, raw.cache_read_input_tokens, raw.cache_read_tokens, promptDetails.cached_tokens, inputDetails.cached_tokens, raw.prompt_cache_hit_tokens);
 	const cacheWrite = firstNumber(raw.cacheWriteTokens, raw.cache_write_input_tokens, raw.cache_write_tokens, raw.cache_creation_input_tokens, raw.cache_creation_tokens, promptDetails.cache_creation_input_tokens, inputDetails.cache_creation_input_tokens);
 	const canonicalInput = raw.inputTokens;
@@ -1005,7 +1191,8 @@ function normalizeUsage(raw) {
 		inputTokens: canonicalInput !== void 0 ? num(canonicalInput) : anthropicInput !== void 0 ? num(anthropicInput) : Math.max(0, promptTotal - cacheRead - cacheWrite),
 		cacheReadTokens: cacheRead,
 		cacheWriteTokens: cacheWrite,
-		outputTokens: firstNumber(raw.outputTokens, raw.output_tokens, raw.completion_tokens)
+		outputTokens: firstNumber(raw.outputTokens, raw.output_tokens, raw.completion_tokens),
+		reasoningTokens: firstNumber(raw.reasoningTokens, raw.reasoning_tokens, completionDetails.reasoning_tokens)
 	};
 }
 function emptyFold(config) {
@@ -1026,6 +1213,8 @@ function emptyFold(config) {
 		unitTokens: config.unitTokens,
 		pricingSource: null,
 		pricingPeriod: null,
+		groupId: null,
+		groupName: null,
 		details: [],
 		hourly: [],
 		subagents: []
@@ -1043,6 +1232,7 @@ function hourLabel(time) {
 }
 /** Fold request routes and provider usage into a cumulative estimate. */
 function foldSession(events, config = DEFAULT_PRICING) {
+	config = normalizePricing(config);
 	const out = emptyFold(config);
 	let provider = null;
 	let model = null;
@@ -1050,9 +1240,9 @@ function foldSession(events, config = DEFAULT_PRICING) {
 	let lastPricing = null;
 	let lastHourKey = null;
 	const detailMap = /* @__PURE__ */ new Map();
-	const detailKey = (p, m, s, pn, multiplier, afterTokens) => `${p ?? ""}|${m ?? ""}|${s}|${pn ?? ""}|${multiplier}|${afterTokens ?? ""}`;
+	const detailKey = (p, m, s, pn, groupId, discount, modelMul, multiplier, afterTokens) => `${p ?? ""}|${m ?? ""}|${s}|${pn ?? ""}|${groupId}|${discount}|${modelMul}|${multiplier}|${afterTokens ?? ""}`;
 	const ensureDetail = (pricing, multiplier, afterTokens) => {
-		const key = detailKey(provider, model, pricing.source, pricing.periodName ?? null, multiplier, afterTokens);
+		const key = detailKey(provider, model, pricing.source, pricing.periodName ?? null, pricing.groupId, pricing.discountMultiplier, pricing.modelMultiplier, multiplier, afterTokens);
 		let detail = detailMap.get(key);
 		if (detail === void 0) {
 			detail = {
@@ -1060,7 +1250,12 @@ function foldSession(events, config = DEFAULT_PRICING) {
 				periodName: pricing.periodName ?? null,
 				provider,
 				model,
+				groupId: pricing.groupId,
+				groupName: pricing.groupName,
 				rates: { ...pricing.rates },
+				periodMultiplier: pricing.periodMultiplier,
+				discountMultiplier: pricing.discountMultiplier,
+				modelMultiplier: pricing.modelMultiplier,
 				contextMultiplier: multiplier,
 				contextAfterTokens: afterTokens,
 				inputTokens: 0,
@@ -1078,7 +1273,7 @@ function foldSession(events, config = DEFAULT_PRICING) {
 		return detail;
 	};
 	const hourMap = /* @__PURE__ */ new Map();
-	const hourBucketKey = (hKey, pricing, multiplier, afterTokens) => `${hKey}|${provider ?? ""}|${model ?? ""}|${pricing.source}|${pricing.periodName ?? ""}|${multiplier}|${afterTokens ?? ""}`;
+	const hourBucketKey = (hKey, pricing, multiplier, afterTokens) => `${hKey}|${provider ?? ""}|${model ?? ""}|${pricing.source}|${pricing.periodName ?? ""}|${pricing.groupId}|${pricing.discountMultiplier}|${pricing.modelMultiplier}|${multiplier}|${afterTokens ?? ""}`;
 	const ensureHour = (hKey, pricing, multiplier, afterTokens) => {
 		const key = hourBucketKey(hKey, pricing, multiplier, afterTokens);
 		let bucket = hourMap.get(key);
@@ -1093,6 +1288,8 @@ function foldSession(events, config = DEFAULT_PRICING) {
 				provider,
 				pricingSource: pricing.source,
 				periodName: pricing.periodName ?? null,
+				groupId: pricing.groupId,
+				groupName: pricing.groupName,
 				contextMultiplier: multiplier,
 				contextAfterTokens: afterTokens,
 				inputTokens: 0,
@@ -1132,7 +1329,7 @@ function foldSession(events, config = DEFAULT_PRICING) {
 			input: normalized.inputTokens,
 			cacheRead: normalized.cacheReadTokens,
 			cacheWrite: normalized.cacheWriteTokens,
-			output: normalized.outputTokens
+			output: billedOutputTokens(normalized.outputTokens, normalized.reasoningTokens, resolveReasoningExtra(config, provider, model))
 		};
 		const surcharge = resolveContextSurcharge(config, provider, model, contextTokensOf(tokens));
 		const contextMultiplier = surcharge?.multiplier ?? 1;
@@ -1191,6 +1388,8 @@ function foldSession(events, config = DEFAULT_PRICING) {
 		out.route = routeKey(provider, model);
 		out.pricingSource = pricing.source;
 		out.pricingPeriod = pricing.periodName ?? null;
+		out.groupId = pricing.groupId;
+		out.groupName = pricing.groupName;
 		last = {
 			turn: event.data.turn,
 			step: event.data.step,
@@ -1250,6 +1449,8 @@ function foldSession(events, config = DEFAULT_PRICING) {
 			provider: bucket.provider,
 			pricingSource: bucket.pricingSource,
 			periodName: bucket.periodName,
+			groupId: bucket.groupId,
+			groupName: bucket.groupName,
 			contextMultiplier: bucket.contextMultiplier,
 			contextAfterTokens: bucket.contextAfterTokens
 		}];
@@ -1367,6 +1568,208 @@ var SessionFoldCache = class {
 	}
 };
 //#endregion
+//#region src/usage-tap.ts
+/** Capture gateway `reasoning_tokens` without rewriting the upstream body. */
+/**
+* Read `reasoning_tokens` from an OpenAI-compat usage object.
+* Wanzhao grok keeps this disjoint from `completion_tokens`.
+* @param usage Wire `usage` object, or undefined when the chunk has none.
+* @returns A positive reasoning count, or 0 when the field is absent.
+*/
+function reasoningFromWireUsage(usage) {
+	if (usage === null || typeof usage !== "object") return 0;
+	const raw = usage;
+	const completionDetails = object(raw.completion_tokens_details);
+	const outputDetails = object(raw.output_tokens_details);
+	for (const value of [
+		raw.reasoning_tokens,
+		completionDetails.reasoning_tokens,
+		outputDetails.reasoning_tokens
+	]) if (typeof value === "number" && Number.isFinite(value) && value > 0) return value;
+	return 0;
+}
+/**
+* Record reasoning from one wire usage object onto the in-flight tap slot.
+* @param slot Request-local slot created around one `llm.stream` call.
+* @param usage Wire `usage` object.
+*/
+function applyWireUsage(slot, usage) {
+	const reasoning = reasoningFromWireUsage(usage);
+	if (reasoning > 0) slot.reasoningTokens = reasoning;
+}
+/**
+* Scan an SSE buffer for `data:` frames that carry `usage`.
+* Incomplete trailing JSON is ignored until more bytes arrive.
+* @param buffer Decoded SSE text received so far.
+* @param slot Request-local slot to update.
+*/
+function scanSseBuffer(buffer, slot) {
+	for (const line of buffer.split("\n")) {
+		const trimmed = line.trim();
+		if (!trimmed.startsWith("data:")) continue;
+		const data = trimmed.slice(5).trim();
+		if (data === "" || data === "[DONE]") continue;
+		try {
+			const payload = JSON.parse(data);
+			if (payload.usage !== void 0) applyWireUsage(slot, payload.usage);
+		} catch {}
+	}
+}
+/**
+* Attach captured reasoning onto a harness usage chunk if the adapter omitted it.
+* @param chunk One value yielded by `llm.stream`.
+* @param reasoningTokens Captured gateway reasoning count.
+* @returns The original chunk, or a shallow copy with `usage.reasoningTokens`.
+*/
+function attachReasoningToChunk(chunk, reasoningTokens) {
+	if (reasoningTokens === void 0 || reasoningTokens <= 0) return chunk;
+	if (chunk === null || typeof chunk !== "object") return chunk;
+	const typed = chunk;
+	if (typed.type !== "usage" || typed.usage === null || typeof typed.usage !== "object") return chunk;
+	const usage = typed.usage;
+	if (typeof usage.reasoningTokens === "number" && usage.reasoningTokens > 0) return chunk;
+	return {
+		...typed,
+		usage: {
+			...usage,
+			reasoningTokens
+		}
+	};
+}
+/**
+* @param input `fetch` input (URL string, URL, or Request).
+* @returns Whether this request is an OpenAI-compat completion/response call.
+*/
+function shouldTapRequest(input) {
+	const url = requestUrl(input);
+	return url.includes("/chat/completions") || url.includes("/responses");
+}
+/**
+* Pass upstream bytes through unchanged while parsing usage on the same chunks.
+* Reasoning is written to `slot` before the official client sees those bytes.
+* @param response Upstream `fetch` response. The body is consumed via a wrapper.
+* @param slot Request-local slot to update.
+* @returns A response with identical status, headers, and body bytes.
+*/
+function tapFetchResponse(response, slot) {
+	if (response.body === null) return response;
+	const reader = response.body.getReader();
+	const decoder = new TextDecoder();
+	let buffer = "";
+	const stream = new ReadableStream({
+		async pull(controller) {
+			const { done, value } = await reader.read();
+			if (done) {
+				buffer += decoder.decode();
+				ingestBuffer(buffer, slot);
+				controller.close();
+				return;
+			}
+			buffer += decoder.decode(value, { stream: true });
+			ingestBuffer(buffer, slot);
+			controller.enqueue(value);
+		},
+		cancel(reason) {
+			return reader.cancel(reason);
+		}
+	});
+	return new Response(stream, {
+		status: response.status,
+		statusText: response.statusText,
+		headers: response.headers
+	});
+}
+/**
+* Wrap `globalThis.fetch` so in-flight `llm.stream` calls can see gateway usage.
+* Responses outside an active tap slot, or to other URLs, pass through untouched.
+* @param slot AsyncLocalStorage holding the current stream's usage slot.
+* @returns Disposer that restores the previous `fetch`.
+*/
+function installFetchTap(slot) {
+	const original = globalThis.fetch;
+	if (typeof original !== "function") return () => {};
+	const tapped = async (input, init) => {
+		const response = await original(input, init);
+		const store = slot.getStore();
+		if (store === void 0 || !shouldTapRequest(input)) return response;
+		return tapFetchResponse(response, store);
+	};
+	globalThis.fetch = tapped;
+	return () => {
+		if (globalThis.fetch === tapped) globalThis.fetch = original;
+	};
+}
+/**
+* Wrap `llm.stream` so each call has a tap slot and usage chunks carry reasoning.
+* @param stream Original `llm.stream` bound to the service.
+* @param slot AsyncLocalStorage used by the fetch tap.
+* @returns A replacement `stream` with the same call signature.
+*/
+function wrapLlmStream(stream, slot) {
+	return (options) => {
+		const store = {};
+		const inner = slot.run(store, () => stream(options));
+		return { [Symbol.asyncIterator]() {
+			const iterator = inner[Symbol.asyncIterator]();
+			return {
+				next: () => slot.run(store, async () => {
+					const result = await iterator.next();
+					if (result.done) return result;
+					return {
+						done: false,
+						value: attachReasoningToChunk(result.value, store.reasoningTokens)
+					};
+				}),
+				return: (value) => iterator.return?.(value) ?? Promise.resolve({
+					done: true,
+					value
+				}),
+				throw: (error) => iterator.throw?.(error) ?? Promise.reject(error)
+			};
+		} };
+	};
+}
+/**
+* Install the fetch tap and wrap `ctx.llm.stream` when the LLM service is present.
+* @param ctx Host context. `llm` is optional so tests without it still load.
+* @returns Disposer that unwraps fetch and `llm.stream`.
+*/
+function installUsageTap(ctx) {
+	const slot = new AsyncLocalStorage();
+	const restoreFetch = installFetchTap(slot);
+	let restoreStream = () => {};
+	ctx.inject(["llm"], (inner) => {
+		const llm = inner.llm;
+		if (llm === void 0 || typeof llm.stream !== "function") return;
+		const original = llm.stream.bind(llm);
+		llm.stream = wrapLlmStream(original, slot);
+		restoreStream = () => {
+			llm.stream = original;
+		};
+	});
+	return () => {
+		restoreStream();
+		restoreFetch();
+	};
+}
+function object(value) {
+	return value !== null && typeof value === "object" ? value : {};
+}
+function requestUrl(input) {
+	if (typeof input === "string") return input;
+	if (input instanceof URL) return input.href;
+	if (input !== null && typeof input === "object" && "url" in input) return String(input.url);
+	return "";
+}
+function ingestBuffer(buffer, slot) {
+	scanSseBuffer(buffer, slot);
+	const trimmed = buffer.trim();
+	if (!trimmed.startsWith("{")) return;
+	try {
+		applyWireUsage(slot, JSON.parse(trimmed).usage);
+	} catch {}
+}
+//#endregion
 //#region src/session-table.ts
 /** Combine one listed session with its independently folded cost. */
 function mergeListedSessionCost(item, cost) {
@@ -1479,7 +1882,9 @@ function emptyHourlySlice(hour = "", hourLabel = "") {
 		cacheRate: 0,
 		model: null,
 		provider: null,
-		periodName: null
+		periodName: null,
+		groupId: null,
+		groupName: null
 	};
 }
 /** Local calendar date of an hourly ISO bucket. */
@@ -1512,6 +1917,8 @@ function asHourlySlice(value) {
 		model: value.model ?? null,
 		provider: value.provider ?? null,
 		periodName: value.periodName ?? null,
+		groupId: value.groupId ?? null,
+		groupName: value.groupName ?? null,
 		contextMultiplier: value.contextMultiplier,
 		contextAfterTokens: value.contextAfterTokens ?? null
 	};
@@ -1608,43 +2015,14 @@ function sharedContextSurcharge(rows) {
 }
 //#endregion
 //#region src/index.ts
-const ratesSchema = Schema.object({
-	input: Schema.number().min(0),
-	cacheRead: Schema.number().min(0),
-	cacheWrite: Schema.number().min(0),
-	output: Schema.number().min(0)
-});
-const periodSchema = Schema.object({
-	id: Schema.string().required(),
-	name: Schema.string().required(),
-	start: Schema.string().required(),
-	end: Schema.string().required(),
-	rates: ratesSchema
-});
-const contextSurchargeSchema = Schema.object({
-	afterTokens: Schema.number().step(1).min(0),
-	multiplier: Schema.number().min(0)
-});
-const planSchema = Schema.object({
-	rates: ratesSchema,
-	periods: Schema.array(periodSchema),
-	contextSurcharges: Schema.union([Schema.array(contextSurchargeSchema), Schema.const(void 0)])
-});
-const Config = Schema.object({
-	currency: Schema.string().default(DEFAULT_PRICING.currency),
-	unitTokens: Schema.number().step(1).min(1).default(DEFAULT_PRICING.unitTokens),
-	timezone: Schema.string().default(DEFAULT_PRICING.timezone),
-	default: Schema.object({
-		rates: Schema.object({
-			input: Schema.number().min(0).default(DEFAULT_PRICING.default.rates.input),
-			cacheRead: Schema.number().min(0).default(DEFAULT_PRICING.default.rates.cacheRead),
-			cacheWrite: Schema.number().min(0).default(DEFAULT_PRICING.default.rates.cacheWrite),
-			output: Schema.number().min(0).default(DEFAULT_PRICING.default.rates.output)
-		}),
-		periods: Schema.array(periodSchema),
-		contextSurcharges: Schema.array(contextSurchargeSchema)
-	}),
-	models: Schema.dict(planSchema).default({})
+/**
+* Settings schema admits both the current group document and the previous
+* default/models document, then stores the normalized group form.
+*/
+const Config = Schema.transform(Schema.any(), (value) => {
+	const normalized = normalizePricing(value ?? {});
+	validatePricing(normalized);
+	return normalized;
 });
 const SETTINGS_NS = "cost-meter";
 function subagentChildren(records) {
@@ -1763,13 +2141,14 @@ var CostMeterService = class extends TypertRemoteService {
 	folds = new SessionFoldCache();
 	constructor(ctx) {
 		super(ctx, "costMeter");
+		ctx.effect(() => installUsageTap(ctx));
 	}
 	/** Compute one session's cost together with every descendant subagent session. */
 	async sessionCost(sessionId) {
 		if (typeof sessionId !== "string" || sessionId.length === 0) return null;
 		const sessions = this.ctx.get("sessions");
 		const query = this.ctx.get("sessionQuery");
-		const config = this.ctx.settings.get(SETTINGS_NS) ?? DEFAULT_PRICING;
+		const config = normalizePricing(this.ctx.settings.get(SETTINGS_NS) ?? DEFAULT_PRICING);
 		const cost = await ownFoldFor(sessionId, config, sessions, query, this.folds);
 		if (cost === void 0) return null;
 		if (query === void 0) return cost;
@@ -1779,8 +2158,8 @@ var CostMeterService = class extends TypertRemoteService {
 	async sessionCosts() {
 		const query = this.ctx.get("sessionQuery");
 		const sessions = this.ctx.get("sessions");
-		return collectSessionCosts(query, this.ctx.settings.get(SETTINGS_NS) ?? DEFAULT_PRICING, this.folds, sessions);
+		return collectSessionCosts(query, normalizePricing(this.ctx.settings.get(SETTINGS_NS) ?? DEFAULT_PRICING), this.folds, sessions);
 	}
 };
 //#endregion
-export { resolvePricing as A, contextTokensOf as C, normalizeUsage as D, formatTokenThreshold as E, validatePricing as M, resolveContextMultiplier as O, DEFAULT_PRICING as S, formatContextSurcharge as T, sumHourlySlices as _, filterSessionRows as a, logFingerprint as b, localDateOfHour as c, queryHourlyOverview as d, querySessionRows as f, sortSessionRows as g, sharedContextSurcharge as h, filterHourlyEntries as i, routeKey as j, resolveContextSurcharge as k, mapWithConcurrency as l, sessionTotalTokens as m, CostMeterService as n, flattenHourlyEntries as o, sessionRoutes as p, collectSessionCosts as r, groupHourlyEntries as s, Config as t, mergeListedSessionCost as u, toggleSessionTableSort as v, foldSession as w, pricingFingerprint as x, SessionFoldCache as y };
+export { billedOutputTokens as A, resolveReasoningExtra as B, shouldTapRequest as C, pricingFingerprint as D, logFingerprint as E, normalizePricing as F, validatePricing as H, normalizeUsage as I, resolveContextMultiplier as L, foldSession as M, formatContextSurcharge as N, DEFAULT_GROUP as O, formatTokenThreshold as P, resolveContextSurcharge as R, scanSseBuffer as S, SessionFoldCache as T, routeKey as V, sumHourlySlices as _, filterSessionRows as a, attachReasoningToChunk as b, localDateOfHour as c, queryHourlyOverview as d, querySessionRows as f, sortSessionRows as g, sharedContextSurcharge as h, filterHourlyEntries as i, contextTokensOf as j, DEFAULT_PRICING as k, mapWithConcurrency as l, sessionTotalTokens as m, CostMeterService as n, flattenHourlyEntries as o, sessionRoutes as p, collectSessionCosts as r, groupHourlyEntries as s, Config as t, mergeListedSessionCost as u, toggleSessionTableSort as v, tapFetchResponse as w, reasoningFromWireUsage as x, applyWireUsage as y, resolvePricing as z };

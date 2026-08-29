@@ -4,15 +4,19 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import {
+  DEFAULT_GROUP,
   DEFAULT_PRICING,
+  billedOutputTokens,
   contextTokensOf,
   foldSession,
   formatContextSurcharge,
   formatTokenThreshold,
+  normalizePricing,
   normalizeUsage,
   resolveContextMultiplier,
   resolveContextSurcharge,
   resolvePricing,
+  resolveReasoningExtra,
   routeKey,
   validatePricing,
   type CostEvent,
@@ -20,8 +24,10 @@ import {
   type PricingConfig,
 } from './pricing.js'
 import { SessionFoldCache, logFingerprint, pricingFingerprint } from './session-fold-cache.js'
+import { installUsageTap } from './usage-tap.js'
 
-export { DEFAULT_PRICING, contextTokensOf, foldSession, formatContextSurcharge, formatTokenThreshold, normalizeUsage, resolveContextMultiplier, resolveContextSurcharge, resolvePricing, routeKey, validatePricing }
+export { DEFAULT_GROUP, DEFAULT_PRICING, billedOutputTokens, contextTokensOf, foldSession, formatContextSurcharge, formatTokenThreshold, normalizePricing, normalizeUsage, resolveContextMultiplier, resolveContextSurcharge, resolvePricing, resolveReasoningExtra, routeKey, validatePricing }
+export { applyWireUsage, attachReasoningToChunk, reasoningFromWireUsage, scanSseBuffer, shouldTapRequest, tapFetchResponse } from './usage-tap.js'
 export { SessionFoldCache, logFingerprint, pricingFingerprint }
 export {
   filterHourlyEntries,
@@ -40,7 +46,7 @@ export {
   sumHourlySlices,
   toggleSessionTableSort,
 } from './session-table.js'
-export type { ContextSurcharge, CostDetail, CostFold, CostSubagent, HourlyDetail, PartialTokenRates, PricingConfig, PricingPeriod, PricingPlan, TokenRates } from './pricing.js'
+export type { ContextSurcharge, CostDetail, CostFold, CostSubagent, HourlyDetail, ModelAssignment, PartialTokenRates, PricingConfig, PricingGroup, PricingPeriod, PricingPlan, TokenRates } from './pricing.js'
 export type {
   HourlyOverviewFilter,
   HourlyOverviewGroup,
@@ -53,44 +59,14 @@ export type {
   SessionTableSortKey,
 } from './session-table.js'
 
-const ratesSchema = z.object({
-  input: z.number().min(0),
-  cacheRead: z.number().min(0),
-  cacheWrite: z.number().min(0),
-  output: z.number().min(0),
-})
-const periodSchema = z.object({
-  id: z.string().required(),
-  name: z.string().required(),
-  start: z.string().required(),
-  end: z.string().required(),
-  rates: ratesSchema,
-})
-const contextSurchargeSchema = z.object({
-  afterTokens: z.number().step(1).min(0),
-  multiplier: z.number().min(0),
-})
-const planSchema = z.object({
-  rates: ratesSchema,
-  periods: z.array(periodSchema),
-  contextSurcharges: z.union([z.array(contextSurchargeSchema), z.const(undefined)]),
-})
-
-export const Config: z<PricingConfig> = z.object({
-  currency: z.string().default(DEFAULT_PRICING.currency),
-  unitTokens: z.number().step(1).min(1).default(DEFAULT_PRICING.unitTokens),
-  timezone: z.string().default(DEFAULT_PRICING.timezone),
-  default: z.object({
-    rates: z.object({
-      input: z.number().min(0).default(DEFAULT_PRICING.default.rates.input),
-      cacheRead: z.number().min(0).default(DEFAULT_PRICING.default.rates.cacheRead),
-      cacheWrite: z.number().min(0).default(DEFAULT_PRICING.default.rates.cacheWrite),
-      output: z.number().min(0).default(DEFAULT_PRICING.default.rates.output),
-    }),
-    periods: z.array(periodSchema),
-    contextSurcharges: z.array(contextSurchargeSchema),
-  }),
-  models: z.dict(planSchema).default({}),
+/**
+ * Settings schema admits both the current group document and the previous
+ * default/models document, then stores the normalized group form.
+ */
+export const Config = z.transform(z.any(), (value) => {
+  const normalized = normalizePricing(value ?? {})
+  validatePricing(normalized)
+  return normalized
 })
 
 const SETTINGS_NS = 'cost-meter'
@@ -282,6 +258,7 @@ export default class CostMeterService extends TypertRemoteService {
 
   constructor(ctx: Context) {
     super(ctx, 'costMeter')
+    ctx.effect(() => installUsageTap(ctx as unknown as Parameters<typeof installUsageTap>[0]))
   }
 
   /** Compute one session's cost together with every descendant subagent session. */
@@ -290,7 +267,7 @@ export default class CostMeterService extends TypertRemoteService {
     const sessions = this.ctx.get('sessions') as SessionsFace | undefined
     const query = this.ctx.get('sessionQuery') as SessionQueryFace | undefined
     const pricing = (this.ctx as Context & { settings: SettingsReaderFace }).settings.get(SETTINGS_NS) as PricingConfig | undefined
-    const config = pricing ?? DEFAULT_PRICING
+    const config = normalizePricing(pricing ?? DEFAULT_PRICING)
     const cost = await ownFoldFor(sessionId, config, sessions, query, this.folds)
     if (cost === undefined) return null
     if (query === undefined) return cost
@@ -304,6 +281,6 @@ export default class CostMeterService extends TypertRemoteService {
     const query = this.ctx.get('sessionQuery') as SessionQueryFace | undefined
     const sessions = this.ctx.get('sessions') as SessionsFace | undefined
     const pricing = (this.ctx as Context & { settings: SettingsReaderFace }).settings.get(SETTINGS_NS) as PricingConfig | undefined
-    return collectSessionCosts(query, pricing ?? DEFAULT_PRICING, this.folds, sessions)
+    return collectSessionCosts(query, normalizePricing(pricing ?? DEFAULT_PRICING), this.folds, sessions)
   }
 }

@@ -1,7 +1,7 @@
 {
   "name": "dsh-cost-meter",
-  "version": "0.3.0",
-  "description": "Configurable per-model API cost meter with cache and time-window pricing.",
+  "version": "0.4.0",
+  "description": "Configurable API cost meter with pricing groups, cache multipliers, and per-model discount/model multipliers.",
   "license": "MIT",
   "type": "module",
   "main": "lib/index.js",

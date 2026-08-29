@@ -2,7 +2,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import { Config } from './index.js'
-import { validatePricing, type PricingConfig } from './pricing.js'
+import { normalizePricing, validatePricing, type PricingConfig } from './pricing.js'
 
 interface SettingsScopeFace<T> {
   get(): T
@@ -62,7 +62,7 @@ export function apply(ctx: Context, config: PricingConfig): void {
   if (settings === undefined) return
   const scope = settings.register(SETTINGS_NS, Config, {
     base: config,
-    validate: validatePricing,
+    validate: (value) => validatePricing(normalizePricing(value)),
   })
   ctx.inject(['webServer'], (webCtx) => {
     const webServer = (webCtx as Context & { webServer: WebServerFace }).webServer
@@ -81,7 +81,7 @@ export function apply(ctx: Context, config: PricingConfig): void {
         }
         if (req.method === 'GET') {
           try {
-            send(200, { ok: true, value: scope.get() })
+            send(200, { ok: true, value: normalizePricing(scope.get()) })
           } catch (error) {
             send(409, { ok: false, error: String(error instanceof Error ? error.message : error) })
           }
@@ -103,10 +103,10 @@ export function apply(ctx: Context, config: PricingConfig): void {
             }
             chunks.push(chunk)
           }
-          const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as PricingConfig
+          const body = normalizePricing(JSON.parse(Buffer.concat(chunks).toString('utf8')))
           validatePricing(body)
           await settings.replace(SETTINGS_NS, body)
-          send(200, { ok: true, value: scope.get() })
+          send(200, { ok: true, value: body })
         } catch (error) {
           send(400, { ok: false, error: String(error instanceof Error ? error.message : error) })
         }
