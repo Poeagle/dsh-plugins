@@ -1,5 +1,4 @@
 import { TypertRemoteService } from "@deepseek-ai/dsh-typert-protocol";
-import { AsyncLocalStorage } from "node:async_hooks";
 //#region ../../../../../opt/homebrew/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/cosmokit/lib/index.js
 /** Return true when a value is `null` or `undefined`. */
 function isNullable(value) {
@@ -806,7 +805,13 @@ const DEFAULT_PRICING = {
 	unitTokens: 1e6,
 	timezone: "Asia/Shanghai",
 	groups: [DEFAULT_GROUP],
-	models: {}
+	models: {},
+	billingProbe: {
+		enabled: false,
+		intervalMinutes: 30,
+		timeoutMs: 1e4,
+		concurrency: 2
+	}
 };
 const TIME_PATTERN = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
 const DEFAULT_GROUP_ID = "default";
@@ -851,6 +856,28 @@ function assignmentOf(config, provider, model) {
 	const key = routeKey(provider, model);
 	return key === null ? void 0 : config.models[key];
 }
+/** Latest automatic-probe timestamp on one model assignment, or null when none. */
+function lastProbeAt(assignment) {
+	if (assignment?.lastProbedAt !== void 0 && Number.isFinite(assignment.lastProbedAt) && assignment.lastProbedAt > 0) return assignment.lastProbedAt;
+	const history = assignment?.discountMultiplierHistory ?? [];
+	for (let index = history.length - 1; index >= 0; index -= 1) {
+		const entry = history[index];
+		if (entry.source === "manual") continue;
+		if (entry.effectiveAt > 0 && (entry.source === "probe" || entry.source === void 0)) return entry.effectiveAt;
+	}
+	return null;
+}
+/** Resolve the latest observed discount whose effective time is not after the request. */
+function discountMultiplierAt(assignment, time) {
+	const history = assignment?.discountMultiplierHistory ?? [];
+	if (history.length === 0) return multiplierOrOne(assignment?.discountMultiplier);
+	let multiplier = history[0].discountMultiplier;
+	for (const entry of history) {
+		if (entry.effectiveAt > time) break;
+		multiplier = entry.discountMultiplier;
+	}
+	return multiplier;
+}
 function groupRates(group, periodMultiplier, discountMultiplier, modelMultiplier) {
 	const scale = periodMultiplier * discountMultiplier * modelMultiplier;
 	return {
@@ -867,7 +894,7 @@ function resolvePricing(config, provider, model, time) {
 	const group = findGroup(config, assignment?.groupId);
 	const period = activePeriod(group.periods, minute);
 	const periodMultiplier = multiplierOrOne(period?.multiplier);
-	const discountMultiplier = multiplierOrOne(assignment?.discountMultiplier);
+	const discountMultiplier = discountMultiplierAt(assignment, time);
 	const modelMultiplier = multiplierOrOne(assignment?.modelMultiplier);
 	return {
 		rates: groupRates(group, periodMultiplier, discountMultiplier, modelMultiplier),
@@ -1061,6 +1088,8 @@ function sameGroup(left, right) {
 function assignmentFromPlan(plan, groupId) {
 	const assignment = { groupId };
 	if (plan.discountMultiplier !== void 0) assignment.discountMultiplier = plan.discountMultiplier;
+	if (plan.discountMultiplierHistory !== void 0) assignment.discountMultiplierHistory = [...plan.discountMultiplierHistory].sort((left, right) => left.effectiveAt - right.effectiveAt);
+	if (plan.lastProbedAt !== void 0) assignment.lastProbedAt = plan.lastProbedAt;
 	if (plan.modelMultiplier !== void 0) assignment.modelMultiplier = plan.modelMultiplier;
 	if (plan.reasoningExtra !== void 0) assignment.reasoningExtra = plan.reasoningExtra;
 	return assignment;
@@ -1074,6 +1103,14 @@ function normalizePricing(raw) {
 	const currency = typeof input.currency === "string" && input.currency.trim() !== "" ? input.currency : DEFAULT_PRICING.currency;
 	const unitTokens = Number.isSafeInteger(input.unitTokens) && (input.unitTokens ?? 0) >= 1 ? input.unitTokens : DEFAULT_PRICING.unitTokens;
 	const timezone = typeof input.timezone === "string" && input.timezone.trim() !== "" ? input.timezone : DEFAULT_PRICING.timezone;
+	const rawProbe = input.billingProbe;
+	const billingProbe = rawProbe !== null && typeof rawProbe === "object" ? {
+		enabled: rawProbe.enabled === true,
+		intervalMinutes: rawProbe.intervalMinutes ?? 30,
+		timeoutMs: rawProbe.timeoutMs ?? 1e4,
+		concurrency: rawProbe.concurrency ?? 2,
+		providers: Array.isArray(rawProbe.providers) ? [...rawProbe.providers] : void 0
+	} : DEFAULT_PRICING.billingProbe;
 	if (Array.isArray(input.groups) && input.groups.length > 0) {
 		const groups = input.groups.map((group) => ({
 			...group,
@@ -1096,7 +1133,8 @@ function normalizePricing(raw) {
 			unitTokens,
 			timezone,
 			groups,
-			models
+			models,
+			billingProbe
 		};
 	}
 	const fallbackRates = DEFAULT_GROUP;
@@ -1130,7 +1168,8 @@ function normalizePricing(raw) {
 		unitTokens,
 		timezone,
 		groups,
-		models
+		models,
+		billingProbe
 	};
 }
 function assertGroup(group, path) {
@@ -1152,6 +1191,14 @@ function validatePricing(config) {
 	} catch {
 		throw new TypeError(`timezone "${config.timezone}" is not an IANA time zone`);
 	}
+	const probe = config.billingProbe;
+	if (probe !== void 0) {
+		if (typeof probe.enabled !== "boolean") throw new TypeError("billingProbe.enabled must be boolean");
+		if (probe.intervalMinutes !== void 0 && (!Number.isSafeInteger(probe.intervalMinutes) || probe.intervalMinutes < 5 || probe.intervalMinutes > 1440)) throw new TypeError("billingProbe.intervalMinutes must be an integer from 5 to 1440");
+		if (probe.timeoutMs !== void 0 && (!Number.isSafeInteger(probe.timeoutMs) || probe.timeoutMs < 1e3 || probe.timeoutMs > 6e4)) throw new TypeError("billingProbe.timeoutMs must be an integer from 1000 to 60000");
+		if (probe.concurrency !== void 0 && (!Number.isSafeInteger(probe.concurrency) || probe.concurrency < 1 || probe.concurrency > 8)) throw new TypeError("billingProbe.concurrency must be an integer from 1 to 8");
+		if (probe.providers !== void 0 && (!Array.isArray(probe.providers) || probe.providers.some((provider) => typeof provider !== "string" || provider.trim() === ""))) throw new TypeError("billingProbe.providers must contain non-empty strings");
+	}
 	if (!Array.isArray(config.groups) || config.groups.length === 0) throw new TypeError("groups must contain at least one pricing group");
 	const ids = /* @__PURE__ */ new Set();
 	for (const [index, group] of config.groups.entries()) {
@@ -1164,6 +1211,15 @@ function validatePricing(config) {
 		if (key.trim() === "" || !key.includes("/")) throw new TypeError(`model key "${key}" must be provider/model`);
 		if (assignment.groupId === void 0 || assignment.groupId.trim() === "" || !ids.has(assignment.groupId)) throw new TypeError(`models.${key}.groupId "${assignment.groupId}" does not match a pricing group`);
 		if (assignment.discountMultiplier !== void 0) assertNonNegative(assignment.discountMultiplier, `models.${key}.discountMultiplier`);
+		let previousEffectiveAt = -1;
+		for (const [index, entry] of (assignment.discountMultiplierHistory ?? []).entries()) {
+			if (!Number.isSafeInteger(entry.effectiveAt) || entry.effectiveAt < 0 || entry.effectiveAt <= previousEffectiveAt) throw new TypeError(`models.${key}.discountMultiplierHistory[${index}].effectiveAt must be strictly increasing epoch milliseconds`);
+			assertNonNegative(entry.discountMultiplier, `models.${key}.discountMultiplierHistory[${index}].discountMultiplier`);
+			if (entry.source !== void 0 && entry.source !== "probe" && entry.source !== "manual") throw new TypeError(`models.${key}.discountMultiplierHistory[${index}].source must be probe or manual`);
+			previousEffectiveAt = entry.effectiveAt;
+		}
+		if (assignment.discountMultiplierHistory !== void 0 && !Array.isArray(assignment.discountMultiplierHistory)) throw new TypeError(`models.${key}.discountMultiplierHistory must be an array`);
+		if (assignment.lastProbedAt !== void 0 && (!Number.isSafeInteger(assignment.lastProbedAt) || assignment.lastProbedAt < 0)) throw new TypeError(`models.${key}.lastProbedAt must be a non-negative epoch millisecond`);
 		if (assignment.modelMultiplier !== void 0) assertNonNegative(assignment.modelMultiplier, `models.${key}.modelMultiplier`);
 	}
 }
@@ -1292,6 +1348,7 @@ function foldSession(events, config = DEFAULT_PRICING) {
 				groupName: pricing.groupName,
 				contextMultiplier: multiplier,
 				contextAfterTokens: afterTokens,
+				rates: { ...pricing.rates },
 				inputTokens: 0,
 				cacheReadTokens: 0,
 				cacheWriteTokens: 0,
@@ -1452,7 +1509,8 @@ function foldSession(events, config = DEFAULT_PRICING) {
 			groupId: bucket.groupId,
 			groupName: bucket.groupName,
 			contextMultiplier: bucket.contextMultiplier,
-			contextAfterTokens: bucket.contextAfterTokens
+			contextAfterTokens: bucket.contextAfterTokens,
+			rates: bucket.rates
 		}];
 	}).sort((a, b) => a.hour.localeCompare(b.hour) || (a.provider ?? "").localeCompare(b.provider ?? "") || (a.model ?? "").localeCompare(b.model ?? "") || a.contextMultiplier - b.contextMultiplier);
 	return out;
@@ -1569,7 +1627,6 @@ var SessionFoldCache = class {
 };
 //#endregion
 //#region src/usage-tap.ts
-/** Capture gateway `reasoning_tokens` without rewriting the upstream body. */
 /**
 * Read `reasoning_tokens` from an OpenAI-compat usage object.
 * Wanzhao grok keeps this disjoint from `completion_tokens`.
@@ -1682,15 +1739,16 @@ function tapFetchResponse(response, slot) {
 /**
 * Wrap `globalThis.fetch` so in-flight `llm.stream` calls can see gateway usage.
 * Responses outside an active tap slot, or to other URLs, pass through untouched.
-* @param slot AsyncLocalStorage holding the current stream's usage slot.
+* @param slots Active stream slots. Async generators drop AsyncLocalStorage
+*   across `await`, so the fetch tap reads this stack, not ALS alone.
 * @returns Disposer that restores the previous `fetch`.
 */
-function installFetchTap(slot) {
+function installFetchTap(slots) {
 	const original = globalThis.fetch;
 	if (typeof original !== "function") return () => {};
 	const tapped = async (input, init) => {
 		const response = await original(input, init);
-		const store = slot.getStore();
+		const store = slots.at(-1);
 		if (store === void 0 || !shouldTapRequest(input)) return response;
 		return tapFetchResponse(response, store);
 	};
@@ -1699,56 +1757,128 @@ function installFetchTap(slot) {
 		if (globalThis.fetch === tapped) globalThis.fetch = original;
 	};
 }
+function popSlot(slots, store) {
+	const index = slots.lastIndexOf(store);
+	if (index >= 0) slots.splice(index, 1);
+}
 /**
 * Wrap `llm.stream` so each call has a tap slot and usage chunks carry reasoning.
+* The slot stays on the stack until the iterator settles so `fetch` inside an
+* async generator still sees it. AsyncLocalStorage does not survive that hop.
 * @param stream Original `llm.stream` bound to the service.
-* @param slot AsyncLocalStorage used by the fetch tap.
+* @param slots Active stream slots read by the fetch tap.
 * @returns A replacement `stream` with the same call signature.
 */
-function wrapLlmStream(stream, slot) {
+function wrapLlmStream(stream, slots) {
 	return (options) => {
 		const store = {};
-		const inner = slot.run(store, () => stream(options));
+		slots.push(store);
+		let released = false;
+		const release = () => {
+			if (released) return;
+			released = true;
+			popSlot(slots, store);
+		};
+		let inner;
+		try {
+			inner = stream(options);
+		} catch (error) {
+			release();
+			throw error;
+		}
 		return { [Symbol.asyncIterator]() {
 			const iterator = inner[Symbol.asyncIterator]();
 			return {
-				next: () => slot.run(store, async () => {
-					const result = await iterator.next();
-					if (result.done) return result;
-					return {
-						done: false,
-						value: attachReasoningToChunk(result.value, store.reasoningTokens)
-					};
-				}),
-				return: (value) => iterator.return?.(value) ?? Promise.resolve({
-					done: true,
-					value
-				}),
-				throw: (error) => iterator.throw?.(error) ?? Promise.reject(error)
+				next: async () => {
+					try {
+						const result = await iterator.next();
+						if (result.done) {
+							release();
+							return result;
+						}
+						return {
+							done: false,
+							value: attachReasoningToChunk(result.value, store.reasoningTokens)
+						};
+					} catch (error) {
+						release();
+						throw error;
+					}
+				},
+				return: async (value) => {
+					try {
+						return await (iterator.return?.(value) ?? Promise.resolve({
+							done: true,
+							value
+						}));
+					} finally {
+						release();
+					}
+				},
+				throw: async (error) => {
+					try {
+						return await (iterator.throw?.(error) ?? Promise.reject(error));
+					} finally {
+						release();
+					}
+				}
 			};
 		} };
 	};
 }
 /**
-* Install the fetch tap and wrap `ctx.llm.stream` when the LLM service is present.
+* Wrap `llm.prepareCall` so the one-shot stream the agent loop actually
+* iterates also carries the fetch-tap slot. `preparedCall.stream` bypasses
+* `llm.stream`; wrapping only the latter leaves grok reasoning off the log.
+* @param prepareCall Original `llm.prepareCall` bound to the service.
+* @param slots Active stream slots read by the fetch tap.
+* @returns A replacement `prepareCall` that taps the returned stream.
+*/
+function wrapPrepareCall(prepareCall, slots) {
+	return async (config, signal) => {
+		const prepared = await prepareCall(config, signal);
+		if (prepared === null || typeof prepared !== "object" || typeof prepared.stream !== "function") return prepared;
+		return {
+			...prepared,
+			stream: wrapLlmStream(prepared.stream.bind(prepared), slots)
+		};
+	};
+}
+/**
+* Install the fetch tap and wrap `ctx.llm.stream` plus `ctx.llm.prepareCall`.
+* The agent loop dispatches through `preparedCall.stream`; title and
+* compaction still use `llm.stream`. Both must enter the same tap slot.
 * @param ctx Host context. `llm` is optional so tests without it still load.
-* @returns Disposer that unwraps fetch and `llm.stream`.
+* @returns Disposer that unwraps fetch, `llm.stream`, and `llm.prepareCall`.
 */
 function installUsageTap(ctx) {
-	const slot = new AsyncLocalStorage();
-	const restoreFetch = installFetchTap(slot);
-	let restoreStream = () => {};
+	const slots = [];
+	const restoreFetch = installFetchTap(slots);
+	let restoreLlm = () => {};
 	ctx.inject(["llm"], (inner) => {
 		const llm = inner.llm;
-		if (llm === void 0 || typeof llm.stream !== "function") return;
-		const original = llm.stream.bind(llm);
-		llm.stream = wrapLlmStream(original, slot);
-		restoreStream = () => {
-			llm.stream = original;
+		if (llm === void 0) return;
+		const restorers = [];
+		if (typeof llm.stream === "function") {
+			const original = llm.stream;
+			llm.stream = wrapLlmStream(original.bind(llm), slots);
+			restorers.push(() => {
+				llm.stream = original;
+			});
+		}
+		if (typeof llm.prepareCall === "function") {
+			const original = llm.prepareCall;
+			llm.prepareCall = wrapPrepareCall(original.bind(llm), slots);
+			restorers.push(() => {
+				llm.prepareCall = original;
+			});
+		}
+		restoreLlm = () => {
+			for (const restore of restorers) restore();
 		};
 	});
 	return () => {
-		restoreStream();
+		restoreLlm();
 		restoreFetch();
 	};
 }
@@ -1771,6 +1901,7 @@ function ingestBuffer(buffer, slot) {
 }
 //#endregion
 //#region src/session-table.ts
+/** Pure session-overview query helpers shared by the host tests and the dock UI. */
 /** Combine one listed session with its independently folded cost. */
 function mergeListedSessionCost(item, cost) {
 	return {
@@ -1920,7 +2051,8 @@ function asHourlySlice(value) {
 		groupId: value.groupId ?? null,
 		groupName: value.groupName ?? null,
 		contextMultiplier: value.contextMultiplier,
-		contextAfterTokens: value.contextAfterTokens ?? null
+		contextAfterTokens: value.contextAfterTokens ?? null,
+		rates: value.rates ?? null
 	};
 }
 /** Flatten each session's own hourly buckets; parent rows do not include child sessions. */
@@ -1994,6 +2126,38 @@ function groupHourlyEntries(entries) {
 function queryHourlyOverview(rows, filter) {
 	return groupHourlyEntries(filterHourlyEntries(flattenHourlyEntries(rows), filter));
 }
+/** Local calendar date of an epoch millisecond, or the current time when omitted. */
+function localTodayDate(now = Date.now()) {
+	return localDateOfHour(new Date(now).toISOString());
+}
+/** Group hourly overview buckets by local date, oldest day first. */
+function groupDailyOverview(groups) {
+	const days = /* @__PURE__ */ new Map();
+	for (const group of groups) {
+		const date = localDateOfHour(group.hour);
+		const existing = days.get(date);
+		if (existing === void 0) days.set(date, [group]);
+		else existing.push(group);
+	}
+	return [...days.entries()].sort((left, right) => left[0].localeCompare(right[0])).map(([date, hours]) => ({
+		date,
+		hours,
+		totals: sumHourlySlices(hours.map((hour) => hour.totals), date, date)
+	}));
+}
+function queryDailyOverview(rows, filter) {
+	return groupDailyOverview(queryHourlyOverview(rows, filter));
+}
+/** Sum independently folded hourly cost, optionally restricted to one local date. */
+function overviewCost(rows, date = "") {
+	return sumHourlySlices(queryHourlyOverview(rows, {
+		date,
+		hour: "",
+		sessionId: "",
+		origin: "",
+		route: ""
+	}).flatMap((group) => group.sessions.map((item) => item.entry))).cost;
+}
 /**
 * Collapse one or more hourly slices to a single surcharge label.
 * Mixed multipliers, including a mix of charged and uncharged requests,
@@ -2011,6 +2175,487 @@ function sharedContextSurcharge(rows) {
 	return {
 		afterTokens,
 		multiplier
+	};
+}
+const NUMERIC_DISPLAY_COLUMNS = /* @__PURE__ */ new Set([
+	"activity",
+	"input",
+	"cache",
+	"output",
+	"usage"
+]);
+function surchargeText(entry) {
+	return formatContextSurcharge(entry.contextAfterTokens, entry.contextMultiplier) ?? "";
+}
+function cellText(row, key) {
+	const value = row[key];
+	if (value === null || value === void 0) return "";
+	return String(value);
+}
+function rowTotalTokens(row) {
+	return row.inputTokens + row.cacheTokens + row.outputTokens;
+}
+function metricTokens(row, key) {
+	if (key === "input") return row.inputTokens;
+	if (key === "cache") return row.cacheTokens;
+	if (key === "output") return row.outputTokens;
+	return rowTotalTokens(row);
+}
+function metricCost(row, key) {
+	if (key === "input") return row.inputCost;
+	if (key === "cache") return row.cacheCost;
+	if (key === "output") return row.outputCost;
+	return row.cost;
+}
+function averageUnitPrice(cost, tokens, unitTokens) {
+	if (!(tokens > 0) || !Number.isFinite(cost) || !Number.isFinite(unitTokens) || unitTokens <= 0) return null;
+	return cost / tokens * unitTokens;
+}
+function formatUsageCell(tokens, cost, unitTokens, _symbol) {
+	const tokenText = String(tokens);
+	const costText = formatMoneyAmount(cost);
+	const avg = averageUnitPrice(cost, tokens, unitTokens);
+	return avg === null ? `${tokenText}(${costText})` : `${tokenText}(${costText}/${formatMoneyAmount(avg)})`;
+}
+function activityText(row) {
+	return `${row.turns} 轮 / ${row.steps} 步 / ${row.toolCalls} 工具`;
+}
+function displayCellText(row, key, unitTokens = 1e6, symbol = "") {
+	if (key === "activity") return activityText(row);
+	if (key === "input" || key === "cache" || key === "output" || key === "usage") return formatUsageCell(metricTokens(row, key), metricCost(row, key), unitTokens, symbol);
+	return cellText(row, key);
+}
+function displaySortValue(row, key) {
+	if (key === "activity") return row.turns;
+	if (key === "input") return row.inputCost;
+	if (key === "cache") return row.cacheCost;
+	if (key === "output") return row.outputCost;
+	if (key === "usage") return row.cost;
+	return cellText(row, key);
+}
+/** One table row per independent hourly bucket. Time view labels by date+hour; model view labels by route. */
+function flattenCostTableRows(entries, view) {
+	return entries.map((item, index) => {
+		const route = hourlyRoute(item.entry) ?? "-";
+		const date = localDateOfHour(item.entry.hour);
+		return {
+			id: `${item.sessionId}:${item.entry.hour}:${route}:${item.entry.contextMultiplier ?? 1}:${index}`,
+			dimension: view === "model" ? route : `${date} ${item.entry.hourLabel}`,
+			date,
+			hour: item.entry.hour,
+			hourLabel: item.entry.hourLabel,
+			sessionId: item.sessionId,
+			origin: item.origin ?? "",
+			route,
+			periodName: item.entry.periodName ?? "",
+			surcharge: surchargeText(item.entry),
+			turns: item.entry.turns,
+			steps: item.entry.steps,
+			toolCalls: item.entry.toolCalls,
+			inputTokens: item.entry.inputTokens,
+			inputCost: item.entry.inputCost,
+			cacheTokens: item.entry.cacheReadTokens + item.entry.cacheWriteTokens,
+			cacheCost: item.entry.cacheReadCost + item.entry.cacheWriteCost,
+			outputTokens: item.entry.outputTokens,
+			outputCost: item.entry.outputCost,
+			cacheRate: item.entry.cacheRate,
+			cost: item.entry.cost,
+			inputRate: item.entry.rates?.input ?? null,
+			cacheReadRate: item.entry.rates?.cacheRead ?? null,
+			cacheWriteRate: item.entry.rates?.cacheWrite ?? null,
+			outputRate: item.entry.rates?.output ?? null
+		};
+	});
+}
+function formatUnitTokensLabel(unitTokens) {
+	if (unitTokens === 1e6) return "每 100 万 Token";
+	if (unitTokens === 1e3) return "每 1 千 Token";
+	return `每 ${unitTokens.toLocaleString("zh-CN")} Token`;
+}
+function formatMoneyAmount(value) {
+	if (!Number.isFinite(value)) return "0.00";
+	const abs = Math.abs(value);
+	if (abs > 0 && abs < .01) return value.toFixed(4);
+	const two = value.toFixed(2);
+	if (Math.abs(value - Number(two)) < 1e-9) return two;
+	return value.toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
+}
+const RATE_LABEL = {
+	input: "输入基础价",
+	cacheRead: "缓存读基础价",
+	cacheWrite: "缓存写基础价",
+	output: "输出基础价"
+};
+function formatRatedCost(amount, rate, kind, unitTokens, symbol) {
+	const money = `${symbol}${formatMoneyAmount(amount)}`;
+	if (rate === null || rate === void 0 || !Number.isFinite(rate)) return money;
+	return `${money}（${RATE_LABEL[kind]} ${symbol}${formatMoneyAmount(rate)} / ${formatUnitTokensLabel(unitTokens)}）`;
+}
+function formatCacheRatedCost(amount, cacheReadRate, cacheWriteRate, unitTokens, symbol) {
+	const money = `${symbol}${formatMoneyAmount(amount)}`;
+	const unit = formatUnitTokensLabel(unitTokens);
+	const read = cacheReadRate !== null && cacheReadRate !== void 0 && Number.isFinite(cacheReadRate) ? `缓存读基础价 ${symbol}${formatMoneyAmount(cacheReadRate)} / ${unit}` : "";
+	const write = cacheWriteRate !== null && cacheWriteRate !== void 0 && Number.isFinite(cacheWriteRate) ? `缓存写基础价 ${symbol}${formatMoneyAmount(cacheWriteRate)} / ${unit}` : "";
+	if (read !== "" && write !== "" && cacheReadRate === cacheWriteRate) return `${money}（缓存基础价 ${symbol}${formatMoneyAmount(cacheReadRate)} / ${unit}）`;
+	if (read !== "" && write !== "") return `${money}（${read}；${write}）`;
+	if (read !== "") return `${money}（${read}）`;
+	if (write !== "") return `${money}（${write}）`;
+	return money;
+}
+const PARENT_OPTIONAL_COLUMNS = [
+	"route",
+	"activity",
+	"input",
+	"cache",
+	"output"
+];
+const CHILD_OPTIONAL_COLUMNS = [
+	"sessionId",
+	"origin",
+	"route",
+	"surcharge",
+	"periodName",
+	"activity",
+	"input",
+	"cache",
+	"output"
+];
+function optionalCostTableColumns(level = "parent") {
+	return level === "child" ? CHILD_OPTIONAL_COLUMNS : PARENT_OPTIONAL_COLUMNS;
+}
+function defaultVisibleCostColumns(view, level = "parent") {
+	return (level === "child" ? CHILD_OPTIONAL_COLUMNS : PARENT_OPTIONAL_COLUMNS).filter((key) => (level === "parent" && view === "model" ? key !== "route" : true) && (level === "child" && view === "model" ? key !== "route" : true));
+}
+function resolveVisibleCostColumns(view, selected, level = "parent") {
+	const allowed = new Set(optionalCostTableColumns(level));
+	return [
+		"dimension",
+		...selected.filter((key) => allowed.has(key) && (view !== "model" || key !== "route")),
+		"usage"
+	];
+}
+function filterCostTableRows(rows, filter, unitTokens = 1e6, symbol = "") {
+	return rows.filter((row) => {
+		for (const [key, raw] of Object.entries(filter)) {
+			if (raw === void 0) continue;
+			const needle = raw.trim().toLowerCase();
+			if (needle === "") continue;
+			if (!displayCellText(row, key, unitTokens, symbol).toLowerCase().includes(needle)) return false;
+		}
+		return true;
+	});
+}
+function sortCostTableRows(rows, sort) {
+	const direction = sort.dir === "asc" ? 1 : -1;
+	return [...rows].sort((left, right) => {
+		const leftValue = displaySortValue(left, sort.key);
+		const rightValue = displaySortValue(right, sort.key);
+		const compared = typeof leftValue === "number" && typeof rightValue === "number" ? leftValue - rightValue : String(leftValue).localeCompare(String(rightValue), "zh-CN");
+		return compared === 0 ? left.id.localeCompare(right.id) : compared * direction;
+	});
+}
+function queryCostTable(entries, view, filter, sort) {
+	return sortCostTableRows(filterCostTableRows(flattenCostTableRows(entries, view), filter), sort);
+}
+function uniqueText(values) {
+	const unique = [...new Set(values.filter((value) => value !== ""))];
+	return unique.length === 1 ? unique[0] : "";
+}
+function uniqueRate(values) {
+	const unique = [...new Set(values.filter((value) => value !== null))];
+	return unique.length === 1 ? unique[0] : null;
+}
+function summarizeCostGroup(id, dimension, children) {
+	const totals = costTableTotals(children);
+	return {
+		id,
+		dimension,
+		date: uniqueText(children.map((row) => row.date)),
+		hour: uniqueText(children.map((row) => row.hour)),
+		hourLabel: uniqueText(children.map((row) => row.hourLabel)),
+		sessionId: uniqueText(children.map((row) => row.sessionId)),
+		origin: uniqueText(children.map((row) => row.origin)),
+		route: uniqueText(children.map((row) => row.route)),
+		periodName: uniqueText(children.map((row) => row.periodName)),
+		surcharge: uniqueText(children.map((row) => row.surcharge)),
+		...totals,
+		inputRate: uniqueRate(children.map((row) => row.inputRate)),
+		cacheReadRate: uniqueRate(children.map((row) => row.cacheReadRate)),
+		cacheWriteRate: uniqueRate(children.map((row) => row.cacheWriteRate)),
+		outputRate: uniqueRate(children.map((row) => row.outputRate))
+	};
+}
+/** Collapse filtered hourly rows into one date or model summary with expandable children. */
+function groupCostTableRows(rows, view) {
+	const buckets = /* @__PURE__ */ new Map();
+	for (const row of rows) {
+		const key = view === "model" ? row.route : row.date;
+		const list = buckets.get(key);
+		if (list === void 0) buckets.set(key, [row]);
+		else list.push(row);
+	}
+	return [...buckets.entries()].map(([key, children]) => {
+		const dimension = key === "" ? "-" : key;
+		const id = `${view}:${dimension}`;
+		return {
+			id,
+			summary: summarizeCostGroup(id, dimension, children),
+			children: children.map((child) => ({
+				...child,
+				dimension: view === "model" ? `${child.date} ${child.hourLabel}` : child.hourLabel
+			}))
+		};
+	});
+}
+function defaultChildCostTableSort(_view) {
+	return {
+		key: "dimension",
+		dir: "asc"
+	};
+}
+/** Filter hourly details, then group and sort summaries for the expandable table. */
+function queryCostTableGroups(entries, view, filter, sort, childFilter = {}, childSort = defaultChildCostTableSort(view), unitTokens = 1e6, symbol = "") {
+	const groups = groupCostTableRows(filterCostTableRows(flattenCostTableRows(entries, view), filter, unitTokens, symbol), view);
+	const order = new Map(groups.map((group) => [group.summary.id, group]));
+	return sortCostTableRows(groups.map((group) => group.summary), sort).flatMap((summary) => {
+		const group = order.get(summary.id);
+		if (group === void 0) return [];
+		const children = sortCostTableRows(filterCostTableRows(group.children, childFilter, unitTokens, symbol), childSort);
+		return [{
+			...group,
+			children
+		}];
+	});
+}
+function costTableColumnValues(rows, key, unitTokens = 1e6, symbol = "") {
+	return [...new Set(rows.map((row) => displayCellText(row, key, unitTokens, symbol)).filter((value) => value !== ""))].sort((left, right) => left.localeCompare(right, "zh-CN"));
+}
+function toggleCostTableSort(current, key) {
+	if (current.key === key) return {
+		key,
+		dir: current.dir === "asc" ? "desc" : "asc"
+	};
+	return {
+		key,
+		dir: NUMERIC_DISPLAY_COLUMNS.has(key) ? "desc" : "asc"
+	};
+}
+function defaultCostTableSort(view) {
+	return {
+		key: "dimension",
+		dir: view === "model" ? "asc" : "desc"
+	};
+}
+function isNumericCostTableColumn(key) {
+	return NUMERIC_DISPLAY_COLUMNS.has(key);
+}
+function costTableTotals(rows) {
+	const out = {
+		turns: 0,
+		steps: 0,
+		toolCalls: 0,
+		inputTokens: 0,
+		inputCost: 0,
+		cacheTokens: 0,
+		cacheCost: 0,
+		outputTokens: 0,
+		outputCost: 0,
+		cacheRate: 0,
+		cost: 0
+	};
+	for (const row of rows) {
+		out.turns += row.turns;
+		out.steps += row.steps;
+		out.toolCalls += row.toolCalls;
+		out.inputTokens += row.inputTokens;
+		out.inputCost += row.inputCost;
+		out.cacheTokens += row.cacheTokens;
+		out.cacheCost += row.cacheCost;
+		out.outputTokens += row.outputTokens;
+		out.outputCost += row.outputCost;
+		out.cost += row.cost;
+	}
+	const totalTokens = out.inputTokens + out.cacheTokens + out.outputTokens;
+	out.cacheRate = totalTokens > 0 ? out.cacheTokens / totalTokens : 0;
+	return out;
+}
+//#endregion
+//#region src/upstream-billing-probe.ts
+const REQUEST_TIMEOUT_MS = 1e4;
+const MAX_RESPONSE_BYTES = 65536;
+const MAX_SYNC_MULTIPLIER = 100;
+const BASELINE_EFFECTIVE_AT = 0;
+/** Build the Sub2API key-billing endpoint without duplicating `/v1`. */
+function billingProbeURL(baseURL) {
+	const url = new URL(baseURL);
+	const path = url.pathname.replace(/\/+$/, "");
+	url.pathname = `${path.endsWith("/v1") ? path : `${path}/v1`}/sub2api/billing`.replace(/\/{2,}/g, "/");
+	return url.toString();
+}
+function finiteNonNegative(value) {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+/** Validate the declared key-level base multiplier returned by a Sub2API upstream. */
+function parseBillingMultiplier(value) {
+	if (value === null || typeof value !== "object") throw new Error("invalid billing response");
+	const body = value;
+	if (body.object !== "sub2api.key_billing" || body.schema_version !== 1 || body.billing_scope !== "token") throw new Error("unsupported billing response schema");
+	if (!finiteNonNegative(body.group_rate_multiplier) || !finiteNonNegative(body.resolved_rate_multiplier) || typeof body.peak_rate_enabled !== "boolean" || !finiteNonNegative(body.effective_rate_multiplier)) throw new Error("incomplete billing response");
+	const expected = body.user_rate_multiplier === void 0 ? body.group_rate_multiplier : body.user_rate_multiplier;
+	if (!finiteNonNegative(expected) || Math.abs(body.resolved_rate_multiplier - expected) > Math.max(1, expected) * 1e-9) throw new Error("inconsistent resolved billing multiplier");
+	if (body.resolved_rate_multiplier <= 0 || body.resolved_rate_multiplier > MAX_SYNC_MULTIPLIER) throw new Error(`declared multiplier must be greater than 0 and at most ${MAX_SYNC_MULTIPLIER}`);
+	const observedAt = typeof body.observed_at === "string" ? Date.parse(body.observed_at) : NaN;
+	return {
+		multiplier: body.resolved_rate_multiplier,
+		observedAt: Number.isFinite(observedAt) ? observedAt : void 0
+	};
+}
+/** Append a newly observed multiplier without changing pricing before observation time. */
+function assignmentWithObservedMultiplier(assignment, multiplier, observedAt) {
+	const history = [...assignment.discountMultiplierHistory ?? []];
+	if (history.length === 0) history.push({
+		effectiveAt: BASELINE_EFFECTIVE_AT,
+		discountMultiplier: multiplierOrOne(assignment.discountMultiplier)
+	});
+	if ((history[history.length - 1]?.discountMultiplier ?? multiplierOrOne(assignment.discountMultiplier)) !== multiplier) history.push({
+		effectiveAt: Math.max(observedAt, (history[history.length - 1]?.effectiveAt ?? -1) + 1),
+		discountMultiplier: multiplier,
+		source: "probe"
+	});
+	return {
+		...assignment,
+		discountMultiplier: multiplier,
+		discountMultiplierHistory: history,
+		lastProbedAt: Math.max(observedAt, assignment.lastProbedAt ?? 0)
+	};
+}
+async function readBoundedJson(response) {
+	const reader = response.body?.getReader();
+	if (reader === void 0) return response.json();
+	const chunks = [];
+	let total = 0;
+	while (true) {
+		const next = await reader.read();
+		if (next.done) break;
+		total += next.value.byteLength;
+		if (total > MAX_RESPONSE_BYTES) {
+			await reader.cancel();
+			throw new Error("billing response exceeds 64 KiB");
+		}
+		chunks.push(next.value);
+	}
+	const bytes = new Uint8Array(total);
+	let offset = 0;
+	for (const chunk of chunks) {
+		bytes.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	return JSON.parse(new TextDecoder().decode(bytes));
+}
+async function probe(baseURL, apiKeyEnv, credentials) {
+	const credential = await credentials?.resolve(apiKeyEnv);
+	if (credential === void 0 || credential.value === "") return {
+		status: "failed",
+		error: `credential ${apiKeyEnv} is unavailable`
+	};
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+	try {
+		const response = await fetch(billingProbeURL(baseURL), {
+			method: "GET",
+			headers: {
+				accept: "application/json",
+				authorization: `Bearer ${credential.value}`
+			},
+			redirect: "error",
+			signal: controller.signal
+		});
+		if (response.status === 404 || response.status === 405) return {
+			status: "unsupported",
+			error: `HTTP ${response.status}`
+		};
+		if (!response.ok) return {
+			status: "failed",
+			error: `HTTP ${response.status}`
+		};
+		const parsed = parseBillingMultiplier(await readBoundedJson(response));
+		return {
+			status: "ok",
+			multiplier: parsed.multiplier,
+			observedAt: parsed.observedAt
+		};
+	} catch (error) {
+		return {
+			status: "failed",
+			error: error instanceof Error ? error.message : String(error)
+		};
+	} finally {
+		clearTimeout(timeout);
+	}
+}
+/** Install one process-local runner; settings persist multiplier history across restarts. */
+function installUpstreamBillingProbes(ctx, scope) {
+	const credentials = ctx.get("credentials");
+	const settings = ctx.get("settings");
+	const due = /* @__PURE__ */ new Map();
+	let disposed = false;
+	let timer;
+	let running = false;
+	const schedule = (delay = 1e3) => {
+		if (!disposed) {
+			if (timer !== void 0) clearTimeout(timer);
+			timer = setTimeout(() => {
+				run();
+			}, delay);
+		}
+	};
+	const run = async () => {
+		if (disposed || running) return;
+		running = true;
+		try {
+			const config = normalizePricing(scope.get());
+			const billing = config.billingProbe;
+			if (billing?.enabled !== true) return;
+			const providers = (settings?.get("llm-pi-ai"))?.providers ?? {};
+			const now = Date.now();
+			const targets = /* @__PURE__ */ new Map();
+			for (const route of Object.keys(config.models)) {
+				const provider = route.slice(0, route.indexOf("/"));
+				if (billing.providers !== void 0 && !billing.providers.includes(provider)) continue;
+				const source = providers[provider];
+				if (source?.baseURL === void 0 || source.apiKeyEnv === void 0 || source.apiKeyEnv === "") continue;
+				const identity = `${source.baseURL}\u0000${source.apiKeyEnv}`;
+				if ((due.get(identity) ?? 0) <= now) targets.set(identity, {
+					provider,
+					baseURL: source.baseURL,
+					apiKeyEnv: source.apiKeyEnv
+				});
+			}
+			const results = await mapWithConcurrency([...targets.values()], billing.concurrency ?? 2, async (target) => ({
+				target,
+				result: await probe(target.baseURL, target.apiKeyEnv, credentials)
+			}));
+			if (disposed) return;
+			const patched = {};
+			const latest = normalizePricing(scope.get());
+			for (const item of results) {
+				if (item === null) continue;
+				due.set(`${item.target.baseURL}\u0000${item.target.apiKeyEnv}`, Date.now() + (billing.intervalMinutes ?? 30) * 6e4);
+				if (item.result.status !== "ok" || item.result.multiplier === void 0) continue;
+				for (const [route, assignment] of Object.entries(latest.models)) if (route.startsWith(`${item.target.provider}/`)) patched[route] = assignmentWithObservedMultiplier(assignment, item.result.multiplier, item.result.observedAt ?? Date.now());
+			}
+			if (Object.keys(patched).length > 0) await scope.update({ models: patched });
+		} finally {
+			running = false;
+			schedule(6e4);
+		}
+	};
+	const unwatch = scope.watch(() => schedule(6e4));
+	schedule();
+	return () => {
+		disposed = true;
+		unwatch();
+		if (timer !== void 0) clearTimeout(timer);
 	};
 }
 //#endregion
@@ -2162,4 +2807,4 @@ var CostMeterService = class extends TypertRemoteService {
 	}
 };
 //#endregion
-export { billedOutputTokens as A, resolveReasoningExtra as B, shouldTapRequest as C, pricingFingerprint as D, logFingerprint as E, normalizePricing as F, validatePricing as H, normalizeUsage as I, resolveContextMultiplier as L, foldSession as M, formatContextSurcharge as N, DEFAULT_GROUP as O, formatTokenThreshold as P, resolveContextSurcharge as R, scanSseBuffer as S, SessionFoldCache as T, routeKey as V, sumHourlySlices as _, filterSessionRows as a, attachReasoningToChunk as b, localDateOfHour as c, queryHourlyOverview as d, querySessionRows as f, sortSessionRows as g, sharedContextSurcharge as h, filterHourlyEntries as i, contextTokensOf as j, DEFAULT_PRICING as k, mapWithConcurrency as l, sessionTotalTokens as m, CostMeterService as n, flattenHourlyEntries as o, sessionRoutes as p, collectSessionCosts as r, groupHourlyEntries as s, Config as t, mergeListedSessionCost as u, toggleSessionTableSort as v, tapFetchResponse as w, reasoningFromWireUsage as x, applyWireUsage as y, resolvePricing as z };
+export { applyWireUsage as $, localDateOfHour as A, queryDailyOverview as B, formatRatedCost as C, resolveContextSurcharge as Ct, groupDailyOverview as D, validatePricing as Dt, groupCostTableRows as E, routeKey as Et, metricTokens as F, sessionRoutes as G, querySessionRows as H, optionalCostTableColumns as I, sortCostTableRows as J, sessionTotalTokens as K, overviewCost as L, mapWithConcurrency as M, mergeListedSessionCost as N, groupHourlyEntries as O, metricCost as P, toggleSessionTableSort as Q, queryCostTable as R, formatMoneyAmount as S, resolveContextMultiplier as St, formatUsageCell as T, resolveReasoningExtra as Tt, resolveVisibleCostColumns as U, queryHourlyOverview as V, rowTotalTokens as W, sumHourlySlices as X, sortSessionRows as Y, toggleCostTableSort as Z, filterHourlyEntries as _, formatContextSurcharge as _t, billingProbeURL as a, tapFetchResponse as at, flattenHourlyEntries as b, normalizePricing as bt, activityText as c, SessionFoldCache as ct, costTableTotals as d, DEFAULT_GROUP as dt, attachReasoningToChunk as et, defaultChildCostTableSort as f, DEFAULT_PRICING as ft, filterCostTableRows as g, foldSession as gt, displayCellText as h, discountMultiplierAt as ht, assignmentWithObservedMultiplier as i, shouldTapRequest as it, localTodayDate as j, isNumericCostTableColumn as k, averageUnitPrice as l, logFingerprint as lt, defaultVisibleCostColumns as m, contextTokensOf as mt, CostMeterService as n, reasoningFromWireUsage as nt, installUpstreamBillingProbes as o, wrapLlmStream as ot, defaultCostTableSort as p, billedOutputTokens as pt, sharedContextSurcharge as q, collectSessionCosts as r, scanSseBuffer as rt, parseBillingMultiplier as s, wrapPrepareCall as st, Config as t, installUsageTap as tt, costTableColumnValues as u, pricingFingerprint as ut, filterSessionRows as v, formatTokenThreshold as vt, formatUnitTokensLabel as w, resolvePricing as wt, formatCacheRatedCost as x, normalizeUsage as xt, flattenCostTableRows as y, lastProbeAt as yt, queryCostTableGroups as z };

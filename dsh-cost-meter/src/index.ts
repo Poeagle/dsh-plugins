@@ -7,6 +7,8 @@ import {
   DEFAULT_GROUP,
   DEFAULT_PRICING,
   billedOutputTokens,
+  discountMultiplierAt,
+  lastProbeAt,
   contextTokensOf,
   foldSession,
   formatContextSurcharge,
@@ -26,28 +28,68 @@ import {
 import { SessionFoldCache, logFingerprint, pricingFingerprint } from './session-fold-cache.js'
 import { installUsageTap } from './usage-tap.js'
 
-export { DEFAULT_GROUP, DEFAULT_PRICING, billedOutputTokens, contextTokensOf, foldSession, formatContextSurcharge, formatTokenThreshold, normalizePricing, normalizeUsage, resolveContextMultiplier, resolveContextSurcharge, resolvePricing, resolveReasoningExtra, routeKey, validatePricing }
-export { applyWireUsage, attachReasoningToChunk, reasoningFromWireUsage, scanSseBuffer, shouldTapRequest, tapFetchResponse } from './usage-tap.js'
+export { DEFAULT_GROUP, DEFAULT_PRICING, billedOutputTokens, contextTokensOf, discountMultiplierAt, foldSession, formatContextSurcharge, formatTokenThreshold, lastProbeAt, normalizePricing, normalizeUsage, resolveContextMultiplier, resolveContextSurcharge, resolvePricing, resolveReasoningExtra, routeKey, validatePricing }
+export { assignmentWithObservedMultiplier, billingProbeURL, parseBillingMultiplier } from './upstream-billing-probe.js'
+export { applyWireUsage, attachReasoningToChunk, installUsageTap, reasoningFromWireUsage, scanSseBuffer, shouldTapRequest, tapFetchResponse, wrapLlmStream, wrapPrepareCall } from './usage-tap.js'
 export { SessionFoldCache, logFingerprint, pricingFingerprint }
 export {
+  activityText,
+  averageUnitPrice,
+  costTableColumnValues,
+  costTableTotals,
+  defaultChildCostTableSort,
+  defaultCostTableSort,
+  defaultVisibleCostColumns,
+  displayCellText,
+  filterCostTableRows,
   filterHourlyEntries,
   filterSessionRows,
+  flattenCostTableRows,
   flattenHourlyEntries,
+  formatCacheRatedCost,
+  formatMoneyAmount,
+  formatRatedCost,
+  formatUnitTokensLabel,
+  formatUsageCell,
+  groupCostTableRows,
+  groupDailyOverview,
   groupHourlyEntries,
+  isNumericCostTableColumn,
   localDateOfHour,
+  localTodayDate,
   mapWithConcurrency,
   mergeListedSessionCost,
+  metricCost,
+  metricTokens,
+  optionalCostTableColumns,
+  overviewCost,
+  queryCostTable,
+  queryCostTableGroups,
+  queryDailyOverview,
   queryHourlyOverview,
   querySessionRows,
+  resolveVisibleCostColumns,
+  rowTotalTokens,
   sessionRoutes,
   sharedContextSurcharge,
   sessionTotalTokens,
+  sortCostTableRows,
   sortSessionRows,
   sumHourlySlices,
+  toggleCostTableSort,
   toggleSessionTableSort,
 } from './session-table.js'
-export type { ContextSurcharge, CostDetail, CostFold, CostSubagent, HourlyDetail, ModelAssignment, PartialTokenRates, PricingConfig, PricingGroup, PricingPeriod, PricingPlan, TokenRates } from './pricing.js'
+export type { BillingProbeConfig, ContextSurcharge, CostDetail, CostFold, CostSubagent, HourlyDetail, ModelAssignment, MultiplierHistoryEntry, PartialTokenRates, PricingConfig, PricingGroup, PricingPeriod, PricingPlan, TokenRates } from './pricing.js'
 export type {
+  CostDisplayColumn,
+  CostRateKind,
+  CostTableColumn,
+  CostTableFilter,
+  CostTableGroup,
+  CostTableRow,
+  CostTableSort,
+  CostView,
+  DailyOverviewGroup,
   HourlyOverviewFilter,
   HourlyOverviewGroup,
   HourlySessionEntry,

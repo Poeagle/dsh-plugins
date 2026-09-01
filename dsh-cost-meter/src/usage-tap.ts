@@ -1,13 +1,20 @@
 /** Capture gateway `reasoning_tokens` without rewriting the upstream body. */
 
-import { AsyncLocalStorage } from 'node:async_hooks'
-
 export interface UsageTapSlot {
   reasoningTokens?: number
 }
 
 interface LlmStreamFace {
   stream(options: unknown): AsyncIterable<unknown>
+}
+
+interface PreparedLlmCallFace {
+  stream: (options: unknown) => AsyncIterable<unknown>
+  [key: string]: unknown
+}
+
+interface LlmServiceFace extends LlmStreamFace {
+  prepareCall?(config: unknown, signal?: unknown): Promise<PreparedLlmCallFace>
 }
 
 /**
@@ -122,15 +129,16 @@ export function tapFetchResponse(response: Response, slot: UsageTapSlot): Respon
 /**
  * Wrap `globalThis.fetch` so in-flight `llm.stream` calls can see gateway usage.
  * Responses outside an active tap slot, or to other URLs, pass through untouched.
- * @param slot AsyncLocalStorage holding the current stream's usage slot.
+ * @param slots Active stream slots. Async generators drop AsyncLocalStorage
+ *   across `await`, so the fetch tap reads this stack, not ALS alone.
  * @returns Disposer that restores the previous `fetch`.
  */
-export function installFetchTap(slot: AsyncLocalStorage<UsageTapSlot>): () => void {
+export function installFetchTap(slots: UsageTapSlot[]): () => void {
   const original = globalThis.fetch
   if (typeof original !== 'function') return () => {}
   const tapped: typeof fetch = async (input, init) => {
     const response = await original(input, init)
-    const store = slot.getStore()
+    const store = slots.at(-1)
     if (store === undefined || !shouldTapRequest(input)) return response
     return tapFetchResponse(response, store)
   }
@@ -140,30 +148,70 @@ export function installFetchTap(slot: AsyncLocalStorage<UsageTapSlot>): () => vo
   }
 }
 
+function popSlot(slots: UsageTapSlot[], store: UsageTapSlot): void {
+  const index = slots.lastIndexOf(store)
+  if (index >= 0) slots.splice(index, 1)
+}
+
 /**
  * Wrap `llm.stream` so each call has a tap slot and usage chunks carry reasoning.
+ * The slot stays on the stack until the iterator settles so `fetch` inside an
+ * async generator still sees it. AsyncLocalStorage does not survive that hop.
  * @param stream Original `llm.stream` bound to the service.
- * @param slot AsyncLocalStorage used by the fetch tap.
+ * @param slots Active stream slots read by the fetch tap.
  * @returns A replacement `stream` with the same call signature.
  */
 export function wrapLlmStream(
   stream: LlmStreamFace['stream'],
-  slot: AsyncLocalStorage<UsageTapSlot>,
+  slots: UsageTapSlot[],
 ): LlmStreamFace['stream'] {
   return (options: unknown) => {
     const store: UsageTapSlot = {}
-    const inner = slot.run(store, () => stream(options))
+    slots.push(store)
+    let released = false
+    const release = () => {
+      if (released) return
+      released = true
+      popSlot(slots, store)
+    }
+    let inner: AsyncIterable<unknown>
+    try {
+      inner = stream(options)
+    } catch (error) {
+      release()
+      throw error
+    }
     return {
       [Symbol.asyncIterator]() {
         const iterator = inner[Symbol.asyncIterator]()
         return {
-          next: () => slot.run(store, async () => {
-            const result = await iterator.next()
-            if (result.done) return result
-            return { done: false, value: attachReasoningToChunk(result.value, store.reasoningTokens) }
-          }),
-          return: (value?: unknown) => iterator.return?.(value) ?? Promise.resolve({ done: true as const, value }),
-          throw: (error?: unknown) => iterator.throw?.(error) ?? Promise.reject(error),
+          next: async () => {
+            try {
+              const result = await iterator.next()
+              if (result.done) {
+                release()
+                return result
+              }
+              return { done: false, value: attachReasoningToChunk(result.value, store.reasoningTokens) }
+            } catch (error) {
+              release()
+              throw error
+            }
+          },
+          return: async (value?: unknown) => {
+            try {
+              return await (iterator.return?.(value) ?? Promise.resolve({ done: true as const, value }))
+            } finally {
+              release()
+            }
+          },
+          throw: async (error?: unknown) => {
+            try {
+              return await (iterator.throw?.(error) ?? Promise.reject(error))
+            } finally {
+              release()
+            }
+          },
         }
       },
     }
@@ -171,25 +219,61 @@ export function wrapLlmStream(
 }
 
 /**
- * Install the fetch tap and wrap `ctx.llm.stream` when the LLM service is present.
- * @param ctx Host context. `llm` is optional so tests without it still load.
- * @returns Disposer that unwraps fetch and `llm.stream`.
+ * Wrap `llm.prepareCall` so the one-shot stream the agent loop actually
+ * iterates also carries the fetch-tap slot. `preparedCall.stream` bypasses
+ * `llm.stream`; wrapping only the latter leaves grok reasoning off the log.
+ * @param prepareCall Original `llm.prepareCall` bound to the service.
+ * @param slots Active stream slots read by the fetch tap.
+ * @returns A replacement `prepareCall` that taps the returned stream.
  */
-export function installUsageTap(ctx: { inject: (deps: string[], callback: (inner: { llm?: LlmStreamFace }) => void) => unknown }): () => void {
-  const slot = new AsyncLocalStorage<UsageTapSlot>()
-  const restoreFetch = installFetchTap(slot)
-  let restoreStream = () => {}
+export function wrapPrepareCall(
+  prepareCall: NonNullable<LlmServiceFace['prepareCall']>,
+  slots: UsageTapSlot[],
+): NonNullable<LlmServiceFace['prepareCall']> {
+  return async (config, signal) => {
+    const prepared = await prepareCall(config, signal)
+    if (prepared === null || typeof prepared !== 'object' || typeof prepared.stream !== 'function') {
+      return prepared
+    }
+    return { ...prepared, stream: wrapLlmStream(prepared.stream.bind(prepared), slots) }
+  }
+}
+
+/**
+ * Install the fetch tap and wrap `ctx.llm.stream` plus `ctx.llm.prepareCall`.
+ * The agent loop dispatches through `preparedCall.stream`; title and
+ * compaction still use `llm.stream`. Both must enter the same tap slot.
+ * @param ctx Host context. `llm` is optional so tests without it still load.
+ * @returns Disposer that unwraps fetch, `llm.stream`, and `llm.prepareCall`.
+ */
+export function installUsageTap(ctx: { inject: (deps: string[], callback: (inner: { llm?: LlmServiceFace }) => void) => unknown }): () => void {
+  const slots: UsageTapSlot[] = []
+  const restoreFetch = installFetchTap(slots)
+  let restoreLlm = () => {}
   ctx.inject(['llm'], inner => {
     const llm = inner.llm
-    if (llm === undefined || typeof llm.stream !== 'function') return
-    const original = llm.stream.bind(llm)
-    llm.stream = wrapLlmStream(original, slot)
-    restoreStream = () => {
-      llm.stream = original
+    if (llm === undefined) return
+    const restorers: Array<() => void> = []
+    if (typeof llm.stream === 'function') {
+      const original = llm.stream
+      llm.stream = wrapLlmStream(original.bind(llm), slots)
+      restorers.push(() => {
+        llm.stream = original
+      })
+    }
+    if (typeof llm.prepareCall === 'function') {
+      const original = llm.prepareCall
+      llm.prepareCall = wrapPrepareCall(original.bind(llm), slots)
+      restorers.push(() => {
+        llm.prepareCall = original
+      })
+    }
+    restoreLlm = () => {
+      for (const restore of restorers) restore()
     }
   })
   return () => {
-    restoreStream()
+    restoreLlm()
     restoreFetch()
   }
 }

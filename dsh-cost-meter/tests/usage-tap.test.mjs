@@ -3,10 +3,12 @@ import test from 'node:test'
 import {
   applyWireUsage,
   attachReasoningToChunk,
+  installUsageTap,
   reasoningFromWireUsage,
   scanSseBuffer,
   shouldTapRequest,
   tapFetchResponse,
+  wrapPrepareCall,
 } from '../lib/index.js'
 
 const wanzhaoUsage = {
@@ -63,4 +65,70 @@ test('tapFetchResponse keeps body bytes and captures reasoning before they are r
   const received = new Uint8Array(await tapped.arrayBuffer())
   assert.deepEqual([...received], [...bytes])
   assert.equal(slot.reasoningTokens, 379)
+})
+
+test('wrapPrepareCall taps the one-shot stream the agent loop iterates', async () => {
+  const slots = []
+  const wrapped = wrapPrepareCall(async () => ({
+    extra: true,
+    stream: async function* () {
+      const store = slots.at(-1)
+      assert.ok(store)
+      store.reasoningTokens = 379
+      yield { type: 'usage', usage: { inputTokens: 130, outputTokens: 1 } }
+    },
+  }), slots)
+  const prepared = await wrapped({})
+  assert.equal(prepared.extra, true)
+  const chunks = []
+  for await (const chunk of prepared.stream({})) chunks.push(chunk)
+  assert.equal(chunks[0].usage.reasoningTokens, 379)
+  assert.equal(slots.length, 0)
+})
+
+test('installUsageTap wraps prepareCall as well as stream', () => {
+  const llm = {
+    stream: async function* () { yield { type: 'usage', usage: { outputTokens: 1 } } },
+    prepareCall: async () => ({
+      stream: async function* () { yield { type: 'usage', usage: { outputTokens: 1 } } },
+    }),
+  }
+  const originalStream = llm.stream
+  const originalPrepare = llm.prepareCall
+  const restore = installUsageTap({ inject(_deps, callback) { callback({ llm }) } })
+  assert.notEqual(llm.stream, originalStream)
+  assert.notEqual(llm.prepareCall, originalPrepare)
+  restore()
+  assert.equal(llm.stream, originalStream)
+  assert.equal(llm.prepareCall, originalPrepare)
+})
+
+test('preparedCall.stream copies wire reasoning onto the usage chunk', async () => {
+  const frame = `data: ${JSON.stringify({ usage: wanzhaoUsage })}\n\n`
+  const bytes = new TextEncoder().encode(frame)
+  const previousFetch = globalThis.fetch
+  globalThis.fetch = async () => new Response(bytes, {
+    status: 200,
+    headers: { 'content-type': 'text/event-stream' },
+  })
+  const llm = {
+    stream: async function* () { yield { type: 'usage', usage: { outputTokens: 0 } } },
+    prepareCall: async () => ({
+      stream: async function* () {
+        const response = await fetch('https://sub.wanzhao.top/v1/chat/completions')
+        await response.arrayBuffer()
+        yield { type: 'usage', usage: { inputTokens: 130, outputTokens: 1 } }
+      },
+    }),
+  }
+  const restore = installUsageTap({ inject(_deps, callback) { callback({ llm }) } })
+  try {
+    const prepared = await llm.prepareCall({})
+    const chunks = []
+    for await (const chunk of prepared.stream({})) chunks.push(chunk)
+    assert.equal(chunks[0].usage.reasoningTokens, 379)
+  } finally {
+    restore()
+    globalThis.fetch = previousFetch
+  }
 })

@@ -44,7 +44,13 @@ window.__ModuleLoader__.load({
 			unitTokens: 1e6,
 			timezone: "Asia/Shanghai",
 			groups: [DEFAULT_GROUP],
-			models: {}
+			models: {},
+			billingProbe: {
+				enabled: false,
+				intervalMinutes: 30,
+				timeoutMs: 1e4,
+				concurrency: 2
+			}
 		};
 		const TIME_PATTERN = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
 		const DEFAULT_GROUP_ID = "default";
@@ -58,6 +64,17 @@ window.__ModuleLoader__.load({
 		/** One when the multiplier is omitted, empty, or non-finite. */
 		function multiplierOrOne(value) {
 			return value !== void 0 && Number.isFinite(value) ? value : 1;
+		}
+		/** Latest automatic-probe timestamp on one model assignment, or null when none. */
+		function lastProbeAt(assignment) {
+			if (assignment?.lastProbedAt !== void 0 && Number.isFinite(assignment.lastProbedAt) && assignment.lastProbedAt > 0) return assignment.lastProbedAt;
+			const history = assignment?.discountMultiplierHistory ?? [];
+			for (let index = history.length - 1; index >= 0; index -= 1) {
+				const entry = history[index];
+				if (entry.source === "manual") continue;
+				if (entry.effectiveAt > 0 && (entry.source === "probe" || entry.source === void 0)) return entry.effectiveAt;
+			}
+			return null;
 		}
 		/** Compact a token threshold for UI labels, e.g. 200000 → `200K`. */
 		function formatTokenThreshold(tokens) {
@@ -177,6 +194,8 @@ window.__ModuleLoader__.load({
 		function assignmentFromPlan(plan, groupId) {
 			const assignment = { groupId };
 			if (plan.discountMultiplier !== void 0) assignment.discountMultiplier = plan.discountMultiplier;
+			if (plan.discountMultiplierHistory !== void 0) assignment.discountMultiplierHistory = [...plan.discountMultiplierHistory].sort((left, right) => left.effectiveAt - right.effectiveAt);
+			if (plan.lastProbedAt !== void 0) assignment.lastProbedAt = plan.lastProbedAt;
 			if (plan.modelMultiplier !== void 0) assignment.modelMultiplier = plan.modelMultiplier;
 			if (plan.reasoningExtra !== void 0) assignment.reasoningExtra = plan.reasoningExtra;
 			return assignment;
@@ -190,6 +209,14 @@ window.__ModuleLoader__.load({
 			const currency = typeof input.currency === "string" && input.currency.trim() !== "" ? input.currency : DEFAULT_PRICING.currency;
 			const unitTokens = Number.isSafeInteger(input.unitTokens) && (input.unitTokens ?? 0) >= 1 ? input.unitTokens : DEFAULT_PRICING.unitTokens;
 			const timezone = typeof input.timezone === "string" && input.timezone.trim() !== "" ? input.timezone : DEFAULT_PRICING.timezone;
+			const rawProbe = input.billingProbe;
+			const billingProbe = rawProbe !== null && typeof rawProbe === "object" ? {
+				enabled: rawProbe.enabled === true,
+				intervalMinutes: rawProbe.intervalMinutes ?? 30,
+				timeoutMs: rawProbe.timeoutMs ?? 1e4,
+				concurrency: rawProbe.concurrency ?? 2,
+				providers: Array.isArray(rawProbe.providers) ? [...rawProbe.providers] : void 0
+			} : DEFAULT_PRICING.billingProbe;
 			if (Array.isArray(input.groups) && input.groups.length > 0) {
 				const groups = input.groups.map((group) => ({
 					...group,
@@ -212,7 +239,8 @@ window.__ModuleLoader__.load({
 					unitTokens,
 					timezone,
 					groups,
-					models
+					models,
+					billingProbe
 				};
 			}
 			const fallbackRates = DEFAULT_GROUP;
@@ -246,7 +274,8 @@ window.__ModuleLoader__.load({
 				unitTokens,
 				timezone,
 				groups,
-				models
+				models,
+				billingProbe
 			};
 		}
 		function assertGroup(group, path) {
@@ -268,6 +297,14 @@ window.__ModuleLoader__.load({
 			} catch {
 				throw new TypeError(`timezone "${config.timezone}" is not an IANA time zone`);
 			}
+			const probe = config.billingProbe;
+			if (probe !== void 0) {
+				if (typeof probe.enabled !== "boolean") throw new TypeError("billingProbe.enabled must be boolean");
+				if (probe.intervalMinutes !== void 0 && (!Number.isSafeInteger(probe.intervalMinutes) || probe.intervalMinutes < 5 || probe.intervalMinutes > 1440)) throw new TypeError("billingProbe.intervalMinutes must be an integer from 5 to 1440");
+				if (probe.timeoutMs !== void 0 && (!Number.isSafeInteger(probe.timeoutMs) || probe.timeoutMs < 1e3 || probe.timeoutMs > 6e4)) throw new TypeError("billingProbe.timeoutMs must be an integer from 1000 to 60000");
+				if (probe.concurrency !== void 0 && (!Number.isSafeInteger(probe.concurrency) || probe.concurrency < 1 || probe.concurrency > 8)) throw new TypeError("billingProbe.concurrency must be an integer from 1 to 8");
+				if (probe.providers !== void 0 && (!Array.isArray(probe.providers) || probe.providers.some((provider) => typeof provider !== "string" || provider.trim() === ""))) throw new TypeError("billingProbe.providers must contain non-empty strings");
+			}
 			if (!Array.isArray(config.groups) || config.groups.length === 0) throw new TypeError("groups must contain at least one pricing group");
 			const ids = /* @__PURE__ */ new Set();
 			for (const [index, group] of config.groups.entries()) {
@@ -280,11 +317,21 @@ window.__ModuleLoader__.load({
 				if (key.trim() === "" || !key.includes("/")) throw new TypeError(`model key "${key}" must be provider/model`);
 				if (assignment.groupId === void 0 || assignment.groupId.trim() === "" || !ids.has(assignment.groupId)) throw new TypeError(`models.${key}.groupId "${assignment.groupId}" does not match a pricing group`);
 				if (assignment.discountMultiplier !== void 0) assertNonNegative(assignment.discountMultiplier, `models.${key}.discountMultiplier`);
+				let previousEffectiveAt = -1;
+				for (const [index, entry] of (assignment.discountMultiplierHistory ?? []).entries()) {
+					if (!Number.isSafeInteger(entry.effectiveAt) || entry.effectiveAt < 0 || entry.effectiveAt <= previousEffectiveAt) throw new TypeError(`models.${key}.discountMultiplierHistory[${index}].effectiveAt must be strictly increasing epoch milliseconds`);
+					assertNonNegative(entry.discountMultiplier, `models.${key}.discountMultiplierHistory[${index}].discountMultiplier`);
+					if (entry.source !== void 0 && entry.source !== "probe" && entry.source !== "manual") throw new TypeError(`models.${key}.discountMultiplierHistory[${index}].source must be probe or manual`);
+					previousEffectiveAt = entry.effectiveAt;
+				}
+				if (assignment.discountMultiplierHistory !== void 0 && !Array.isArray(assignment.discountMultiplierHistory)) throw new TypeError(`models.${key}.discountMultiplierHistory must be an array`);
+				if (assignment.lastProbedAt !== void 0 && (!Number.isSafeInteger(assignment.lastProbedAt) || assignment.lastProbedAt < 0)) throw new TypeError(`models.${key}.lastProbedAt must be a non-negative epoch millisecond`);
 				if (assignment.modelMultiplier !== void 0) assertNonNegative(assignment.modelMultiplier, `models.${key}.modelMultiplier`);
 			}
 		}
 		//#endregion
 		//#region src/session-table.ts
+		/** Pure session-overview query helpers shared by the host tests and the dock UI. */
 		/** Combine one listed session with its independently folded cost. */
 		function mergeListedSessionCost(item, cost) {
 			return {
@@ -297,20 +344,6 @@ window.__ModuleLoader__.load({
 		function routeLabel(provider, model) {
 			if (provider && model) return `${provider}/${model}`;
 			return model ?? provider ?? null;
-		}
-		/** Distinct provider/model routes observed on one session fold. */
-		function sessionRoutes(row) {
-			const routes = /* @__PURE__ */ new Set();
-			if (row.cost.route) routes.add(row.cost.route);
-			for (const hourly of row.cost.hourly ?? []) {
-				const key = routeLabel(hourly.provider, hourly.model);
-				if (key) routes.add(key);
-			}
-			for (const detail of row.cost.details ?? []) {
-				const key = routeLabel(detail.provider, detail.model);
-				if (key) routes.add(key);
-			}
-			return [...routes];
 		}
 		/** Map items with a bounded number of in-flight promises, preserving input order. */
 		async function mapWithConcurrency(items, concurrency, mapper) {
@@ -384,7 +417,8 @@ window.__ModuleLoader__.load({
 				groupId: value.groupId ?? null,
 				groupName: value.groupName ?? null,
 				contextMultiplier: value.contextMultiplier,
-				contextAfterTokens: value.contextAfterTokens ?? null
+				contextAfterTokens: value.contextAfterTokens ?? null,
+				rates: value.rates ?? null
 			};
 		}
 		/** Flatten each session's own hourly buckets; parent rows do not include child sessions. */
@@ -458,24 +492,291 @@ window.__ModuleLoader__.load({
 		function queryHourlyOverview(rows, filter) {
 			return groupHourlyEntries(filterHourlyEntries(flattenHourlyEntries(rows), filter));
 		}
-		/**
-		* Collapse one or more hourly slices to a single surcharge label.
-		* Mixed multipliers, including a mix of charged and uncharged requests,
-		* return null so the UI does not claim the whole group was doubled.
-		*/
-		function sharedContextSurcharge(rows) {
-			const first = rows[0];
-			if (first === void 0) return null;
-			const multiplier = first.contextMultiplier ?? 1;
-			const afterTokens = first.contextAfterTokens ?? null;
-			for (const row of rows) {
-				if ((row.contextMultiplier ?? 1) !== multiplier) return null;
-				if ((row.contextAfterTokens ?? null) !== afterTokens) return null;
-			}
+		/** Local calendar date of an epoch millisecond, or the current time when omitted. */
+		function localTodayDate(now = Date.now()) {
+			return localDateOfHour(new Date(now).toISOString());
+		}
+		/** Sum independently folded hourly cost, optionally restricted to one local date. */
+		function overviewCost(rows, date = "") {
+			return sumHourlySlices(queryHourlyOverview(rows, {
+				date,
+				hour: "",
+				sessionId: "",
+				origin: "",
+				route: ""
+			}).flatMap((group) => group.sessions.map((item) => item.entry))).cost;
+		}
+		const NUMERIC_DISPLAY_COLUMNS = /* @__PURE__ */ new Set([
+			"activity",
+			"input",
+			"cache",
+			"output",
+			"usage"
+		]);
+		function surchargeText(entry) {
+			return formatContextSurcharge(entry.contextAfterTokens, entry.contextMultiplier) ?? "";
+		}
+		function cellText(row, key) {
+			const value = row[key];
+			if (value === null || value === void 0) return "";
+			return String(value);
+		}
+		function rowTotalTokens(row) {
+			return row.inputTokens + row.cacheTokens + row.outputTokens;
+		}
+		function metricTokens(row, key) {
+			if (key === "input") return row.inputTokens;
+			if (key === "cache") return row.cacheTokens;
+			if (key === "output") return row.outputTokens;
+			return rowTotalTokens(row);
+		}
+		function metricCost(row, key) {
+			if (key === "input") return row.inputCost;
+			if (key === "cache") return row.cacheCost;
+			if (key === "output") return row.outputCost;
+			return row.cost;
+		}
+		function averageUnitPrice(cost, tokens, unitTokens) {
+			if (!(tokens > 0) || !Number.isFinite(cost) || !Number.isFinite(unitTokens) || unitTokens <= 0) return null;
+			return cost / tokens * unitTokens;
+		}
+		function formatUsageCell(tokens, cost, unitTokens, _symbol) {
+			const tokenText = String(tokens);
+			const costText = formatMoneyAmount(cost);
+			const avg = averageUnitPrice(cost, tokens, unitTokens);
+			return avg === null ? `${tokenText}(${costText})` : `${tokenText}(${costText}/${formatMoneyAmount(avg)})`;
+		}
+		function activityText(row) {
+			return `${row.turns} 轮 / ${row.steps} 步 / ${row.toolCalls} 工具`;
+		}
+		function displayCellText(row, key, unitTokens = 1e6, symbol = "") {
+			if (key === "activity") return activityText(row);
+			if (key === "input" || key === "cache" || key === "output" || key === "usage") return formatUsageCell(metricTokens(row, key), metricCost(row, key), unitTokens, symbol);
+			return cellText(row, key);
+		}
+		function displaySortValue(row, key) {
+			if (key === "activity") return row.turns;
+			if (key === "input") return row.inputCost;
+			if (key === "cache") return row.cacheCost;
+			if (key === "output") return row.outputCost;
+			if (key === "usage") return row.cost;
+			return cellText(row, key);
+		}
+		/** One table row per independent hourly bucket. Time view labels by date+hour; model view labels by route. */
+		function flattenCostTableRows(entries, view) {
+			return entries.map((item, index) => {
+				const route = hourlyRoute(item.entry) ?? "-";
+				const date = localDateOfHour(item.entry.hour);
+				return {
+					id: `${item.sessionId}:${item.entry.hour}:${route}:${item.entry.contextMultiplier ?? 1}:${index}`,
+					dimension: view === "model" ? route : `${date} ${item.entry.hourLabel}`,
+					date,
+					hour: item.entry.hour,
+					hourLabel: item.entry.hourLabel,
+					sessionId: item.sessionId,
+					origin: item.origin ?? "",
+					route,
+					periodName: item.entry.periodName ?? "",
+					surcharge: surchargeText(item.entry),
+					turns: item.entry.turns,
+					steps: item.entry.steps,
+					toolCalls: item.entry.toolCalls,
+					inputTokens: item.entry.inputTokens,
+					inputCost: item.entry.inputCost,
+					cacheTokens: item.entry.cacheReadTokens + item.entry.cacheWriteTokens,
+					cacheCost: item.entry.cacheReadCost + item.entry.cacheWriteCost,
+					outputTokens: item.entry.outputTokens,
+					outputCost: item.entry.outputCost,
+					cacheRate: item.entry.cacheRate,
+					cost: item.entry.cost,
+					inputRate: item.entry.rates?.input ?? null,
+					cacheReadRate: item.entry.rates?.cacheRead ?? null,
+					cacheWriteRate: item.entry.rates?.cacheWrite ?? null,
+					outputRate: item.entry.rates?.output ?? null
+				};
+			});
+		}
+		function formatMoneyAmount(value) {
+			if (!Number.isFinite(value)) return "0.00";
+			const abs = Math.abs(value);
+			if (abs > 0 && abs < .01) return value.toFixed(4);
+			const two = value.toFixed(2);
+			if (Math.abs(value - Number(two)) < 1e-9) return two;
+			return value.toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
+		}
+		const PARENT_OPTIONAL_COLUMNS = [
+			"route",
+			"activity",
+			"input",
+			"cache",
+			"output"
+		];
+		const CHILD_OPTIONAL_COLUMNS = [
+			"sessionId",
+			"origin",
+			"route",
+			"surcharge",
+			"periodName",
+			"activity",
+			"input",
+			"cache",
+			"output"
+		];
+		function optionalCostTableColumns(level = "parent") {
+			return level === "child" ? CHILD_OPTIONAL_COLUMNS : PARENT_OPTIONAL_COLUMNS;
+		}
+		function defaultVisibleCostColumns(view, level = "parent") {
+			return (level === "child" ? CHILD_OPTIONAL_COLUMNS : PARENT_OPTIONAL_COLUMNS).filter((key) => (level === "parent" && view === "model" ? key !== "route" : true) && (level === "child" && view === "model" ? key !== "route" : true));
+		}
+		function resolveVisibleCostColumns(view, selected, level = "parent") {
+			const allowed = new Set(optionalCostTableColumns(level));
+			return [
+				"dimension",
+				...selected.filter((key) => allowed.has(key) && (view !== "model" || key !== "route")),
+				"usage"
+			];
+		}
+		function filterCostTableRows(rows, filter, unitTokens = 1e6, symbol = "") {
+			return rows.filter((row) => {
+				for (const [key, raw] of Object.entries(filter)) {
+					if (raw === void 0) continue;
+					const needle = raw.trim().toLowerCase();
+					if (needle === "") continue;
+					if (!displayCellText(row, key, unitTokens, symbol).toLowerCase().includes(needle)) return false;
+				}
+				return true;
+			});
+		}
+		function sortCostTableRows(rows, sort) {
+			const direction = sort.dir === "asc" ? 1 : -1;
+			return [...rows].sort((left, right) => {
+				const leftValue = displaySortValue(left, sort.key);
+				const rightValue = displaySortValue(right, sort.key);
+				const compared = typeof leftValue === "number" && typeof rightValue === "number" ? leftValue - rightValue : String(leftValue).localeCompare(String(rightValue), "zh-CN");
+				return compared === 0 ? left.id.localeCompare(right.id) : compared * direction;
+			});
+		}
+		function queryCostTable(entries, view, filter, sort) {
+			return sortCostTableRows(filterCostTableRows(flattenCostTableRows(entries, view), filter), sort);
+		}
+		function uniqueText(values) {
+			const unique = [...new Set(values.filter((value) => value !== ""))];
+			return unique.length === 1 ? unique[0] : "";
+		}
+		function uniqueRate(values) {
+			const unique = [...new Set(values.filter((value) => value !== null))];
+			return unique.length === 1 ? unique[0] : null;
+		}
+		function summarizeCostGroup(id, dimension, children) {
+			const totals = costTableTotals(children);
 			return {
-				afterTokens,
-				multiplier
+				id,
+				dimension,
+				date: uniqueText(children.map((row) => row.date)),
+				hour: uniqueText(children.map((row) => row.hour)),
+				hourLabel: uniqueText(children.map((row) => row.hourLabel)),
+				sessionId: uniqueText(children.map((row) => row.sessionId)),
+				origin: uniqueText(children.map((row) => row.origin)),
+				route: uniqueText(children.map((row) => row.route)),
+				periodName: uniqueText(children.map((row) => row.periodName)),
+				surcharge: uniqueText(children.map((row) => row.surcharge)),
+				...totals,
+				inputRate: uniqueRate(children.map((row) => row.inputRate)),
+				cacheReadRate: uniqueRate(children.map((row) => row.cacheReadRate)),
+				cacheWriteRate: uniqueRate(children.map((row) => row.cacheWriteRate)),
+				outputRate: uniqueRate(children.map((row) => row.outputRate))
 			};
+		}
+		/** Collapse filtered hourly rows into one date or model summary with expandable children. */
+		function groupCostTableRows(rows, view) {
+			const buckets = /* @__PURE__ */ new Map();
+			for (const row of rows) {
+				const key = view === "model" ? row.route : row.date;
+				const list = buckets.get(key);
+				if (list === void 0) buckets.set(key, [row]);
+				else list.push(row);
+			}
+			return [...buckets.entries()].map(([key, children]) => {
+				const dimension = key === "" ? "-" : key;
+				const id = `${view}:${dimension}`;
+				return {
+					id,
+					summary: summarizeCostGroup(id, dimension, children),
+					children: children.map((child) => ({
+						...child,
+						dimension: view === "model" ? `${child.date} ${child.hourLabel}` : child.hourLabel
+					}))
+				};
+			});
+		}
+		function defaultChildCostTableSort(_view) {
+			return {
+				key: "dimension",
+				dir: "asc"
+			};
+		}
+		/** Filter hourly details, then group and sort summaries for the expandable table. */
+		function queryCostTableGroups(entries, view, filter, sort, childFilter = {}, childSort = defaultChildCostTableSort(view), unitTokens = 1e6, symbol = "") {
+			const groups = groupCostTableRows(filterCostTableRows(flattenCostTableRows(entries, view), filter, unitTokens, symbol), view);
+			const order = new Map(groups.map((group) => [group.summary.id, group]));
+			return sortCostTableRows(groups.map((group) => group.summary), sort).flatMap((summary) => {
+				const group = order.get(summary.id);
+				if (group === void 0) return [];
+				const children = sortCostTableRows(filterCostTableRows(group.children, childFilter, unitTokens, symbol), childSort);
+				return [{
+					...group,
+					children
+				}];
+			});
+		}
+		function costTableColumnValues(rows, key, unitTokens = 1e6, symbol = "") {
+			return [...new Set(rows.map((row) => displayCellText(row, key, unitTokens, symbol)).filter((value) => value !== ""))].sort((left, right) => left.localeCompare(right, "zh-CN"));
+		}
+		function toggleCostTableSort(current, key) {
+			if (current.key === key) return {
+				key,
+				dir: current.dir === "asc" ? "desc" : "asc"
+			};
+			return {
+				key,
+				dir: NUMERIC_DISPLAY_COLUMNS.has(key) ? "desc" : "asc"
+			};
+		}
+		function defaultCostTableSort(view) {
+			return {
+				key: "dimension",
+				dir: view === "model" ? "asc" : "desc"
+			};
+		}
+		function costTableTotals(rows) {
+			const out = {
+				turns: 0,
+				steps: 0,
+				toolCalls: 0,
+				inputTokens: 0,
+				inputCost: 0,
+				cacheTokens: 0,
+				cacheCost: 0,
+				outputTokens: 0,
+				outputCost: 0,
+				cacheRate: 0,
+				cost: 0
+			};
+			for (const row of rows) {
+				out.turns += row.turns;
+				out.steps += row.steps;
+				out.toolCalls += row.toolCalls;
+				out.inputTokens += row.inputTokens;
+				out.inputCost += row.inputCost;
+				out.cacheTokens += row.cacheTokens;
+				out.cacheCost += row.cacheCost;
+				out.outputTokens += row.outputTokens;
+				out.outputCost += row.outputCost;
+				out.cost += row.cost;
+			}
+			const totalTokens = out.inputTokens + out.cacheTokens + out.outputTokens;
+			out.cacheRate = totalTokens > 0 ? out.cacheTokens / totalTokens : 0;
+			return out;
 		}
 		//#endregion
 		//#region src/client.ts
@@ -650,14 +951,6 @@ window.__ModuleLoader__.load({
 			background: "var(--dsw-alias-label-primary)",
 			color: "var(--dsw-alias-bg-layer-3)"
 		};
-		const surchargeLabel = (afterTokens, multiplier) => formatContextSurcharge(afterTokens, multiplier) ?? "-";
-		const surchargeOf = (rows) => {
-			const shared = sharedContextSurcharge(rows);
-			return shared === null ? "-" : surchargeLabel(shared.afterTokens, shared.multiplier);
-		};
-		function sourceLabelOf(source) {
-			return source === "group-period" ? "分组时段价" : "分组基准价";
-		}
 		function newGroupId(groups) {
 			const used = new Set(groups.map((group) => group.id));
 			let index = 1;
@@ -685,6 +978,108 @@ window.__ModuleLoader__.load({
 				color: "var(--dsw-alias-label-tertiary)"
 			} }, label, child);
 		}
+		const CURRENCIES = [
+			"CNY",
+			"USD",
+			"EUR",
+			"JPY"
+		];
+		const TIMEZONES = [
+			"Asia/Shanghai",
+			"Asia/Hong_Kong",
+			"Asia/Tokyo",
+			"Asia/Singapore",
+			"UTC",
+			"America/New_York",
+			"America/Los_Angeles",
+			"Europe/London",
+			"Europe/Paris"
+		];
+		const UNIT_TOKEN_OPTIONS = [1e3, 1e6];
+		const INTERVAL_OPTIONS = [
+			5,
+			15,
+			30,
+			60,
+			120,
+			360,
+			1440
+		];
+		const CONCURRENCY_OPTIONS = [
+			1,
+			2,
+			4,
+			8
+		];
+		const CACHE_MULT_OPTIONS = [
+			0,
+			.02,
+			.1,
+			.25,
+			.5,
+			1
+		];
+		const PERIOD_MULT_OPTIONS = [
+			.5,
+			.8,
+			1,
+			1.5,
+			2
+		];
+		const MODEL_MULT_OPTIONS = [
+			.5,
+			.8,
+			1,
+			1.2,
+			1.5,
+			2
+		];
+		const SURCHARGE_AFTER_OPTIONS = [
+			32e3,
+			64e3,
+			128e3,
+			2e5,
+			256e3,
+			1e6
+		];
+		const SURCHARGE_MULT_OPTIONS = [
+			1.5,
+			2,
+			3
+		];
+		function withCurrent(options, value) {
+			if (value === void 0 || !Number.isFinite(value) || options.includes(value)) return [...options];
+			return [...options, value].sort((left, right) => left - right);
+		}
+		function Select(props) {
+			return react.default.createElement("select", {
+				style: inputStyle,
+				value: props.value,
+				onChange: (event) => props.onChange(event.target.value)
+			}, ...props.options.map((option) => react.default.createElement("option", {
+				key: option.value,
+				value: option.value
+			}, option.label)));
+		}
+		function NumberSelect(props) {
+			const format = props.format ?? ((value) => String(value));
+			return react.default.createElement(Select, {
+				value: String(props.value),
+				options: withCurrent(props.options, props.value).map((value) => ({
+					value: String(value),
+					label: format(value)
+				})),
+				onChange: (next) => props.onChange(Number(next))
+			});
+		}
+		function formatProbeTime(time) {
+			const date = new Date(time);
+			const pad = (value) => String(value).padStart(2, "0");
+			return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+		}
+		function formatUnitTokens(value) {
+			return value === 1e6 ? "每 1M tokens" : value === 1e3 ? "每 1K tokens" : `每 ${value.toLocaleString("zh-CN")} tokens`;
+		}
 		function PeriodEditor(props) {
 			const set = (key, value) => props.onChange({
 				...props.period,
@@ -709,10 +1104,11 @@ window.__ModuleLoader__.load({
 				type: "time",
 				value: props.period.end,
 				onChange: (event) => set("end", event.target.value)
-			})), field("倍率", react.default.createElement(NumberInput, {
+			})), field("倍率", react.default.createElement(NumberSelect, {
 				value: props.period.multiplier,
-				placeholder: "1",
-				onChange: (value) => set("multiplier", value ?? 1)
+				options: PERIOD_MULT_OPTIONS,
+				format: (value) => `×${value}`,
+				onChange: (value) => set("multiplier", value)
 			})), react.default.createElement("button", {
 				type: "button",
 				style: buttonStyle,
@@ -773,11 +1169,13 @@ window.__ModuleLoader__.load({
 				gap: 5,
 				fontSize: 11,
 				color: "var(--dsw-alias-label-tertiary)"
-			} }, "超过 Token 数", react.default.createElement(NumberInput, {
+			} }, "超过 Token 数", react.default.createElement(NumberSelect, {
 				value: tier.afterTokens,
+				options: SURCHARGE_AFTER_OPTIONS,
+				format: formatTokenThreshold,
 				onChange: (value) => set(index, {
 					...tier,
-					afterTokens: value ?? 0
+					afterTokens: value
 				})
 			})), react.default.createElement("label", { style: {
 				display: "flex",
@@ -785,11 +1183,13 @@ window.__ModuleLoader__.load({
 				gap: 5,
 				fontSize: 11,
 				color: "var(--dsw-alias-label-tertiary)"
-			} }, "整单倍率", react.default.createElement(NumberInput, {
+			} }, "整单倍率", react.default.createElement(NumberSelect, {
 				value: tier.multiplier,
+				options: SURCHARGE_MULT_OPTIONS,
+				format: (value) => `×${value}`,
 				onChange: (value) => set(index, {
 					...tier,
-					multiplier: value ?? 0
+					multiplier: value
 				})
 			})), react.default.createElement("button", {
 				type: "button",
@@ -829,6 +1229,7 @@ window.__ModuleLoader__.load({
 		}
 		function GroupModelRow(props) {
 			const set = (next) => props.onChange(next);
+			const probedAt = lastProbeAt(props.assignment);
 			return react.default.createElement("div", { style: {
 				borderTop: "1px solid var(--dsw-alias-border-l2)",
 				padding: "10px 0",
@@ -859,16 +1260,18 @@ window.__ModuleLoader__.load({
 				gridTemplateColumns: "minmax(110px, 1fr) minmax(110px, 1fr) auto",
 				gap: 8,
 				alignItems: "end"
-			} }, field("优惠倍率", react.default.createElement(NumberInput, {
-				value: props.assignment.discountMultiplier,
-				placeholder: "1",
+			} }, field("优惠倍率", react.default.createElement(NumberSelect, {
+				value: props.assignment.discountMultiplier ?? 1,
+				options: MODEL_MULT_OPTIONS,
+				format: (value) => `×${value}`,
 				onChange: (value) => set({
 					...props.assignment,
 					discountMultiplier: value
 				})
-			})), field("模型倍率", react.default.createElement(NumberInput, {
-				value: props.assignment.modelMultiplier,
-				placeholder: "1",
+			})), field("模型倍率", react.default.createElement(NumberSelect, {
+				value: props.assignment.modelMultiplier ?? 1,
+				options: MODEL_MULT_OPTIONS,
+				format: (value) => `×${value}`,
 				onChange: (value) => set({
 					...props.assignment,
 					modelMultiplier: value
@@ -889,7 +1292,10 @@ window.__ModuleLoader__.load({
 					else delete next.reasoningExtra;
 					set(next);
 				}
-			}), "推理另计")));
+			}), "推理另计")), probedAt === null ? null : react.default.createElement("div", { style: {
+				fontSize: 11,
+				color: "var(--dsw-alias-label-tertiary)"
+			} }, `自动探测 ${formatProbeTime(probedAt)}`));
 		}
 		function GroupModelPicker(props) {
 			const [open, setOpen] = react.default.useState(false);
@@ -1108,12 +1514,16 @@ window.__ModuleLoader__.load({
 				display: "grid",
 				gridTemplateColumns: "repeat(2, minmax(140px, 1fr))",
 				gap: 8
-			} }, field("缓存输入倍率", react.default.createElement(NumberInput, {
+			} }, field("缓存读倍率", react.default.createElement(NumberSelect, {
 				value: props.group.cacheReadMultiplier,
-				onChange: (value) => set("cacheReadMultiplier", value ?? 0)
-			})), field("缓存写入倍率", react.default.createElement(NumberInput, {
+				options: CACHE_MULT_OPTIONS,
+				format: (value) => `×${value}`,
+				onChange: (value) => set("cacheReadMultiplier", value)
+			})), field("缓存写倍率", react.default.createElement(NumberSelect, {
 				value: props.group.cacheWriteMultiplier,
-				onChange: (value) => set("cacheWriteMultiplier", value ?? 0)
+				options: CACHE_MULT_OPTIONS,
+				format: (value) => `×${value}`,
+				onChange: (value) => set("cacheWriteMultiplier", value)
 			}))), react.default.createElement("p", { style: {
 				margin: 0,
 				fontSize: 11,
@@ -1179,7 +1589,6 @@ window.__ModuleLoader__.load({
 		function PricingSettingsCard(props) {
 			const settings = props.usePricing((snapshot) => snapshot);
 			const catalog = props.useCatalog((snapshot) => snapshot);
-			const [open, setOpen] = react.default.useState(false);
 			const [draft, setDraft] = react.default.useState(() => cloneConfig(settings.value));
 			const [seedRevision, setSeedRevision] = react.default.useState(settings.revision);
 			const [saving, setSaving] = react.default.useState(false);
@@ -1197,9 +1606,18 @@ window.__ModuleLoader__.load({
 				seedRevision
 			]);
 			react.default.useEffect(() => {
-				if (open) props.refreshCatalog();
-			}, [open, props.refreshCatalog]);
-			if (settings.status === "unavailable") return null;
+				props.refreshCatalog();
+			}, [props.refreshCatalog]);
+			if (settings.status === "unavailable") return react.default.createElement("p", { style: {
+				margin: 0,
+				fontSize: 13,
+				color: "var(--dsw-alias-label-tertiary)"
+			} }, "费用设置暂不可用。");
+			if (settings.status === "loading" && settings.value === void 0) return react.default.createElement("p", { style: {
+				margin: 0,
+				fontSize: 13,
+				color: "var(--dsw-alias-label-tertiary)"
+			} }, "正在加载费用设置…");
 			const baseline = cloneConfig(settings.value);
 			const dirty = JSON.stringify(draft) !== JSON.stringify(baseline);
 			let invalid = null;
@@ -1217,6 +1635,8 @@ window.__ModuleLoader__.load({
 					models
 				});
 			};
+			const catalogProviders = [...new Set(catalogRoutes(catalog).map((route) => route.providerId))].sort();
+			const selectedProviders = new Set(draft.billingProbe?.providers ?? []);
 			const save = async () => {
 				if (invalid || !dirty) return;
 				setSaving(true);
@@ -1228,84 +1648,130 @@ window.__ModuleLoader__.load({
 					setTimeout(() => setSaved(false), 2e3);
 				} else setFailure(error);
 			};
-			return react.default.createElement("li", { style: {
-				listStyle: "none",
-				border: "1px solid var(--dsw-alias-border-l2)",
-				borderRadius: 8,
-				background: "var(--dsw-alias-bg-layer-3)"
-			} }, react.default.createElement("button", {
-				type: "button",
-				onClick: () => setOpen(!open),
-				"aria-expanded": open,
-				style: {
-					width: "100%",
-					border: 0,
-					background: "transparent",
-					color: "inherit",
-					textAlign: "left",
-					padding: "14px 16px",
-					display: "flex",
-					alignItems: "center",
-					gap: 12,
-					cursor: "pointer"
-				}
-			}, react.default.createElement("span", { style: {
-				flex: 1,
+			const timezoneOptions = TIMEZONES.includes(draft.timezone) ? TIMEZONES : [draft.timezone, ...TIMEZONES];
+			const currencyOptions = CURRENCIES.includes(draft.currency) ? CURRENCIES : [draft.currency, ...CURRENCIES];
+			return react.default.createElement("div", { style: {
 				display: "flex",
 				flexDirection: "column",
-				gap: 4
-			} }, react.default.createElement("strong", { style: {
-				fontSize: 15,
-				fontWeight: 600
-			} }, "API 费用统计"), react.default.createElement("span", { style: {
-				fontSize: 13,
-				color: "var(--dsw-alias-label-tertiary)"
-			} }, "按基准费用分组统一管理多个模型：最终单价 = 分组基准（含缓存/时段/上下文倍率）× 优惠倍率 × 模型倍率。")), dirty ? react.default.createElement("span", { style: {
-				fontSize: 11,
-				color: "var(--dsw-alias-label-secondary)"
-			} }, "未保存") : null, react.default.createElement("span", {
-				"aria-hidden": true,
-				style: { transform: open ? "rotate(180deg)" : void 0 }
-			}, "⌄")), open ? react.default.createElement("div", { style: {
-				margin: "0 16px",
-				padding: "14px 0 10px",
-				borderTop: "1px solid var(--dsw-alias-border-l2)",
-				display: "flex",
-				flexDirection: "column",
-				gap: 16
+				gap: 16,
+				padding: "4px 0 16px"
 			} }, react.default.createElement("section", { style: {
 				display: "flex",
 				flexDirection: "column",
 				gap: 10
-			} }, react.default.createElement("h3", { style: {
+			} }, react.default.createElement("p", { style: {
 				margin: 0,
-				fontSize: 13,
-				fontWeight: 600
-			} }, "全局"), react.default.createElement("div", { style: {
+				fontSize: 12,
+				color: "var(--dsw-alias-label-tertiary)"
+			} }, "最终单价 = 分组基准（含缓存 / 时段 / 上下文倍率）× 优惠倍率 × 模型倍率。"), react.default.createElement("div", { style: {
 				display: "grid",
 				gridTemplateColumns: "120px 160px 1fr",
 				gap: 8
-			} }, field("币种", react.default.createElement("input", {
-				style: inputStyle,
+			} }, field("币种", react.default.createElement(Select, {
 				value: draft.currency,
-				onChange: (event) => setDraft({
-					...draft,
-					currency: event.target.value.toUpperCase()
-				})
-			})), field("每多少 Token", react.default.createElement(NumberInput, {
-				value: draft.unitTokens,
+				options: currencyOptions.map((value) => ({
+					value,
+					label: value
+				})),
 				onChange: (value) => setDraft({
 					...draft,
-					unitTokens: value ?? 0
+					currency: value
 				})
-			})), field("计价时区", react.default.createElement("input", {
-				style: inputStyle,
+			})), field("计价单位", react.default.createElement(NumberSelect, {
+				value: draft.unitTokens,
+				options: UNIT_TOKEN_OPTIONS,
+				format: formatUnitTokens,
+				onChange: (value) => setDraft({
+					...draft,
+					unitTokens: value
+				})
+			})), field("计价时区", react.default.createElement(Select, {
 				value: draft.timezone,
+				options: timezoneOptions.map((value) => ({
+					value,
+					label: value
+				})),
+				onChange: (value) => setDraft({
+					...draft,
+					timezone: value
+				})
+			}))), react.default.createElement("label", { style: {
+				display: "flex",
+				alignItems: "center",
+				gap: 8,
+				fontSize: 12
+			} }, react.default.createElement("input", {
+				type: "checkbox",
+				checked: draft.billingProbe?.enabled === true,
 				onChange: (event) => setDraft({
 					...draft,
-					timezone: event.target.value
+					billingProbe: {
+						...draft.billingProbe ?? {},
+						enabled: event.target.checked
+					}
 				})
-			})))), react.default.createElement("section", { style: {
+			}), "自动探测上游倍率"), draft.billingProbe?.enabled === true ? react.default.createElement("div", { style: {
+				display: "grid",
+				gridTemplateColumns: "160px 120px",
+				gap: 8
+			} }, field("探测周期", react.default.createElement(NumberSelect, {
+				value: draft.billingProbe.intervalMinutes ?? 30,
+				options: INTERVAL_OPTIONS,
+				format: (value) => value >= 60 ? `${value / 60} 小时` : `${value} 分钟`,
+				onChange: (value) => setDraft({
+					...draft,
+					billingProbe: {
+						...draft.billingProbe,
+						intervalMinutes: value
+					}
+				})
+			})), field("并发数", react.default.createElement(NumberSelect, {
+				value: draft.billingProbe.concurrency ?? 2,
+				options: CONCURRENCY_OPTIONS,
+				onChange: (value) => setDraft({
+					...draft,
+					billingProbe: {
+						...draft.billingProbe,
+						concurrency: value
+					}
+				})
+			}))) : null, draft.billingProbe?.enabled === true ? react.default.createElement("div", { style: {
+				display: "flex",
+				flexDirection: "column",
+				gap: 6
+			} }, react.default.createElement("span", { style: {
+				fontSize: 11,
+				color: "var(--dsw-alias-label-tertiary)"
+			} }, catalogProviders.length === 0 ? "不限制供应商（目录为空时探测全部已配置模型）" : "探测这些供应商，不选则全部探测"), catalogProviders.length === 0 ? null : react.default.createElement("div", { style: {
+				display: "flex",
+				flexWrap: "wrap",
+				gap: 8
+			} }, ...catalogProviders.map((provider) => react.default.createElement("label", {
+				key: provider,
+				style: {
+					display: "flex",
+					alignItems: "center",
+					gap: 6,
+					fontSize: 12
+				}
+			}, react.default.createElement("input", {
+				type: "checkbox",
+				checked: selectedProviders.size === 0 || selectedProviders.has(provider),
+				onChange: (event) => {
+					const next = new Set(selectedProviders);
+					if (selectedProviders.size === 0) for (const id of catalogProviders) next.add(id);
+					if (event.target.checked) next.add(provider);
+					else next.delete(provider);
+					const providers = next.size === catalogProviders.length ? void 0 : [...next];
+					setDraft({
+						...draft,
+						billingProbe: {
+							...draft.billingProbe,
+							providers
+						}
+					});
+				}
+			}), provider)))) : null), react.default.createElement("section", { style: {
 				display: "flex",
 				flexDirection: "column",
 				gap: 10
@@ -1374,476 +1840,473 @@ window.__ModuleLoader__.load({
 				style: primaryButtonStyle,
 				disabled: !dirty || saving || invalid !== null,
 				onClick: save
-			}, saving ? "保存中…" : saved ? "✓ 保存成功" : "保存"))) : null);
+			}, saving ? "保存中…" : saved ? "✓ 保存成功" : "保存")));
 		}
-		const EMPTY_HOURLY_FILTER = {
-			date: "",
-			hour: "",
-			sessionId: "",
-			origin: "",
-			route: ""
+		const FILTER_INPUT = {
+			...inputStyle,
+			height: 22,
+			width: "100%",
+			minWidth: 56,
+			fontSize: 11,
+			padding: "0 6px",
+			boxSizing: "border-box",
+			fontWeight: 400
 		};
-		function HourlyTable(props) {
-			const routeOf = (row) => `${row.provider ?? ""}/${row.model ?? ""}`;
-			const surchargeKeyOf = (row) => `${row.contextMultiplier ?? 1}|${row.contextAfterTokens ?? ""}`;
-			const flatten = (rows) => rows.flatMap((row) => [...(row.hourly ?? []).map((entry) => ({
-				sessionId: row.sessionId,
-				entry
-			})), ...flatten(row.children)]);
-			const childRows = flatten(props.subagents ?? []);
-			const sumRows = (rows) => {
-				const first = rows[0];
-				if (first === void 0) return null;
-				const sum = (field) => rows.reduce((total, row) => total + row[field], 0);
-				const inputTokens = sum("inputTokens");
-				const cacheReadTokens = sum("cacheReadTokens");
-				const cacheWriteTokens = sum("cacheWriteTokens");
-				const outputTokens = sum("outputTokens");
-				return {
-					...first,
-					turns: sum("turns"),
-					steps: sum("steps"),
-					toolCalls: sum("toolCalls"),
-					inputTokens,
-					cacheReadTokens,
-					cacheWriteTokens,
-					outputTokens,
-					inputCost: sum("inputCost"),
-					cacheReadCost: sum("cacheReadCost"),
-					cacheWriteCost: sum("cacheWriteCost"),
-					outputCost: sum("outputCost"),
-					cost: sum("cost"),
-					cacheRate: (cacheReadTokens + cacheWriteTokens) / Math.max(1, inputTokens + cacheReadTokens + cacheWriteTokens + outputTokens),
-					provider: null,
-					model: null,
-					pricingSource: null,
-					periodName: null
-				};
-			};
-			const dataCells = (row) => [
-				react.default.createElement("td", { style: props.cellBase }, String(row.turns)),
-				react.default.createElement("td", { style: props.cellBase }, String(row.steps)),
-				react.default.createElement("td", { style: props.cellBase }, String(row.toolCalls)),
-				react.default.createElement("td", { style: props.cellBase }, row.inputTokens.toLocaleString("zh-CN")),
-				react.default.createElement("td", { style: props.cellBase }, `${props.symbol}${money(row.inputCost)}`),
-				react.default.createElement("td", { style: props.cellBase }, (row.cacheReadTokens + row.cacheWriteTokens).toLocaleString("zh-CN")),
-				react.default.createElement("td", { style: props.cellBase }, `${props.symbol}${money(row.cacheReadCost + row.cacheWriteCost)}`),
-				react.default.createElement("td", { style: props.cellBase }, row.outputTokens.toLocaleString("zh-CN")),
-				react.default.createElement("td", { style: props.cellBase }, `${props.symbol}${money(row.outputCost)}`),
-				react.default.createElement("td", { style: props.cellBase }, `${(row.cacheRate * 100).toFixed(1)}%`),
-				react.default.createElement("td", { style: {
-					...props.cellBase,
-					fontWeight: 600
-				} }, `${props.symbol}${money(row.cost)}`)
-			];
-			const hours = [.../* @__PURE__ */ new Set([...props.hourly.map((row) => row.hour), ...childRows.map((row) => row.entry.hour)])].sort();
-			const totals = sumRows([...props.hourly, ...childRows.map((row) => row.entry)]);
-			return react.default.createElement("table", { style: {
-				width: "100%",
-				borderCollapse: "collapse",
-				whiteSpace: "nowrap",
-				marginTop: 8
-			} }, react.default.createElement("thead", null, react.default.createElement("tr", null, react.default.createElement("th", { style: props.headerLeft }, "时间段"), react.default.createElement("th", { style: props.headerStyle }, "轮次"), react.default.createElement("th", { style: props.headerStyle }, "步骤"), react.default.createElement("th", { style: props.headerStyle }, "工具调用"), react.default.createElement("th", { style: props.headerStyle }, "输入 tokens"), react.default.createElement("th", { style: props.headerStyle }, "输入价格"), react.default.createElement("th", { style: props.headerStyle }, "缓存 tokens"), react.default.createElement("th", { style: props.headerStyle }, "缓存价格"), react.default.createElement("th", { style: props.headerStyle }, "输出 tokens"), react.default.createElement("th", { style: props.headerStyle }, "输出价格"), react.default.createElement("th", { style: props.headerStyle }, "缓存率"), react.default.createElement("th", { style: props.headerStyle }, "总价"), react.default.createElement("th", { style: props.headerStyle }, "上下文翻倍"), react.default.createElement("th", { style: props.headerStyle }, "时段名称"), react.default.createElement("th", { style: props.headerStyle }, "模型"))), react.default.createElement("tbody", null, ...hours.flatMap((hour) => {
-				const rootRows = props.hourly.filter((row) => row.hour === hour);
-				const hourChildren = childRows.filter((row) => row.entry.hour === hour);
-				const hourRows = [...rootRows, ...hourChildren.map((row) => row.entry)];
-				const total = sumRows(hourRows);
-				if (total === null) return [];
-				const timeKey = `${props.sessionId}:time:${hour}`;
-				const timeExpanded = props.expandedHours.has(timeKey);
-				const routes = [...new Set(hourRows.map(routeOf))];
-				const timeRow = react.default.createElement("tr", {
-					key: timeKey,
-					style: {
-						borderBottom: "1px solid var(--dsw-alias-border-l2, #eee)",
-						fontWeight: 600
-					}
-				}, react.default.createElement("td", { style: props.cellLeft }, react.default.createElement("button", {
-					type: "button",
-					"aria-expanded": timeExpanded,
-					onClick: () => props.toggleHour(timeKey),
-					style: {
-						border: 0,
-						background: "transparent",
-						cursor: "pointer",
-						padding: "0 6px 0 0",
-						fontSize: 13,
-						color: "inherit"
-					}
-				}, timeExpanded ? "−" : "+"), total.hourLabel), ...dataCells(total), react.default.createElement("td", { style: props.cellBase }, surchargeOf(hourRows)), react.default.createElement("td", { style: props.cellBase }, "-"), react.default.createElement("td", { style: props.cellBase }, `${routes.length} 个模型`));
-				if (!timeExpanded) return [timeRow];
-				return [timeRow, ...routes.flatMap((route) => {
-					const entries = hourRows.filter((row) => routeOf(row) === route);
-					const children = hourChildren.filter((row) => routeOf(row.entry) === route);
-					return [...new Set(entries.map(surchargeKeyOf))].sort().flatMap((surchargeKey) => {
-						const charged = entries.filter((row) => surchargeKeyOf(row) === surchargeKey);
-						const modelTotal = sumRows(charged);
-						if (modelTotal === null) return [];
-						const sample = charged[0];
-						const modelKey = `${props.sessionId}:model:${hour}:${route}:${surchargeKey}`;
-						const modelExpanded = props.expandedHours.has(modelKey);
-						const chargedChildren = children.filter((row) => surchargeKeyOf(row.entry) === surchargeKey);
-						const modelRow = react.default.createElement("tr", {
-							key: modelKey,
-							style: {
-								borderBottom: "1px solid var(--dsw-alias-border-l2, #eee)",
-								background: "var(--dsw-alias-bg-layer-2, #fafafa)"
-							}
-						}, react.default.createElement("td", { style: {
-							...props.cellLeft,
-							paddingLeft: 28
-						} }, chargedChildren.length > 0 ? react.default.createElement("button", {
-							type: "button",
-							"aria-expanded": modelExpanded,
-							onClick: () => props.toggleHour(modelKey),
-							style: {
-								border: 0,
-								background: "transparent",
-								cursor: "pointer",
-								padding: "0 6px 0 0",
-								fontSize: 13,
-								color: "inherit"
-							}
-						}, modelExpanded ? "−" : "+") : react.default.createElement("span", { style: {
-							display: "inline-block",
-							width: 19
-						} }), `↳ ${route}`), ...dataCells(modelTotal), react.default.createElement("td", { style: props.cellBase }, surchargeOf(charged)), react.default.createElement("td", { style: props.cellBase }, sample?.periodName ?? "-"), react.default.createElement("td", { style: props.cellBase }, route));
-						if (!modelExpanded) return [modelRow];
-						return [modelRow, ...chargedChildren.map(({ sessionId, entry }) => react.default.createElement("tr", {
-							key: `${props.sessionId}:child:${hour}:${route}:${surchargeKey}:${sessionId}`,
-							style: {
-								borderBottom: "1px solid var(--dsw-alias-border-l2, #eee)",
-								color: "var(--dsw-alias-label-secondary)"
-							}
-						}, react.default.createElement("td", { style: {
-							...props.cellLeft,
-							paddingLeft: 52
-						} }, `↳ 子代理 ${sessionId.slice(0, 8)}`), ...dataCells(entry), react.default.createElement("td", { style: props.cellBase }, surchargeLabel(entry.contextAfterTokens, entry.contextMultiplier)), react.default.createElement("td", { style: props.cellBase }, entry.periodName ?? "-"), react.default.createElement("td", { style: props.cellBase }, `${entry.provider ?? "?"}/${entry.model ?? "?"}`)))];
-					});
-				})];
-			}), totals ? react.default.createElement("tr", { style: {
-				fontWeight: 600,
-				borderTop: "2px solid var(--dsw-alias-border-l1, #bbb)"
-			} }, react.default.createElement("td", { style: {
-				...props.cellLeft,
-				fontWeight: 600
-			} }, "合计"), ...dataCells(totals), react.default.createElement("td", { style: props.cellBase }), react.default.createElement("td", { style: props.cellBase }), react.default.createElement("td", { style: props.cellBase })) : react.default.createElement("tr", null, react.default.createElement("td", {
-				style: {
-					...props.cellLeft,
-					color: "var(--dsw-alias-label-tertiary)"
-				},
-				colSpan: 15
-			}, "该会话暂无按时段明细"))));
+		const TABLE_BORDER = "1px solid var(--dsw-alias-border-l2)";
+		const TABLE_CELL = {
+			fontSize: 12,
+			padding: "6px 8px",
+			textAlign: "right",
+			whiteSpace: "nowrap",
+			border: TABLE_BORDER,
+			verticalAlign: "middle"
+		};
+		const TABLE_CELL_LEFT = {
+			...TABLE_CELL,
+			textAlign: "left"
+		};
+		const TABLE_HEAD = {
+			...TABLE_CELL,
+			fontWeight: 600,
+			background: "var(--dsw-alias-bg-layer-3, #f5f5f5)",
+			position: "sticky",
+			top: 0,
+			zIndex: 2,
+			verticalAlign: "top"
+		};
+		const TABLE_HEAD_LEFT = {
+			...TABLE_HEAD,
+			textAlign: "left"
+		};
+		const COLUMN_BY_KEY = new Map([
+			{
+				key: "dimension",
+				label: "分组",
+				left: true
+			},
+			{
+				key: "sessionId",
+				label: "会话",
+				left: true
+			},
+			{
+				key: "origin",
+				label: "来源",
+				left: true
+			},
+			{
+				key: "route",
+				label: "模型",
+				left: true
+			},
+			{
+				key: "surcharge",
+				label: "翻倍"
+			},
+			{
+				key: "periodName",
+				label: "计价时段",
+				left: true
+			},
+			{
+				key: "activity",
+				label: "用量"
+			},
+			{
+				key: "input",
+				label: "输入",
+				compact: true
+			},
+			{
+				key: "cache",
+				label: "缓存",
+				compact: true
+			},
+			{
+				key: "output",
+				label: "输出",
+				compact: true
+			},
+			{
+				key: "usage",
+				label: "合计",
+				compact: true
+			}
+		].map((column) => [column.key, column]));
+		function columnLabel(key, view, level) {
+			if (key === "dimension") {
+				if (level === "child") return view === "model" ? "时段" : "时段";
+				return view === "model" ? "模型" : "日期";
+			}
+			return COLUMN_BY_KEY.get(key)?.label ?? key;
 		}
-		function CostDock(props) {
-			const [state, setState] = react.default.useState(null);
-			const [tooltip, setTooltip] = react.default.useState(false);
-			const [showModal, setShowModal] = react.default.useState(false);
-			const [sessionRows, setSessionRows] = react.default.useState([]);
-			const [sessionLoadError, setSessionLoadError] = react.default.useState(null);
-			const [sessionLoading, setSessionLoading] = react.default.useState(false);
-			const [expandedHours, setExpandedHours] = react.default.useState(() => /* @__PURE__ */ new Set());
-			const [showAllSessions, setShowAllSessions] = react.default.useState(false);
-			const [hourlyFilter, setHourlyFilter] = react.default.useState(EMPTY_HOURLY_FILTER);
-			const tooltipTimerRef = react.default.useRef(null);
-			react.default.useEffect(() => {
-				const load = () => {
-					if (typeof props.sessionId !== "string") return;
-					props.costMeter.sessionCost(props.sessionId).then((response) => {
-						if (response.ok && response.value && typeof response.value === "object") setState(response.value);
-					}).catch(() => {});
-				};
-				load();
-				return props.interval(load, 2e3);
-			}, [props.sessionId]);
-			react.default.useEffect(() => () => {
-				if (tooltipTimerRef.current) clearTimeout(tooltipTimerRef.current);
-			}, []);
-			const loadSessionCosts = (reuse) => {
-				if (!reuse) {
-					setSessionLoading(true);
-					setSessionLoadError(null);
-				}
-				loadAllSessionCosts(props.costMeter, props.sessions).then((rows) => {
-					setSessionRows(rows);
-					setSessionLoadError(null);
-				}).catch((error) => {
-					if (!reuse || sessionRows.length === 0) setSessionLoadError(`会话费用加载失败：${remoteErrorText(error)}`);
-				}).finally(() => {
-					setSessionLoading(false);
-				});
+		function formatCostCell(row, key, symbol, unitTokens) {
+			if (key === "sessionId" && row.sessionId.length > 12) return `${row.sessionId.slice(0, 8)}…`;
+			const text = displayCellText(row, key, unitTokens, symbol);
+			return text === "" ? "-" : text;
+		}
+		function asHourlyEntry(sessionId, origin, parentSession, entry) {
+			return {
+				sessionId,
+				origin,
+				parentSession,
+				entry
 			};
-			const openModal = () => {
-				setShowModal(true);
-				setShowAllSessions(false);
-				setSessionLoadError(null);
-				setTooltip(false);
+		}
+		function flattenFoldEntries(sessionId, fold, origin = null, parentSession = null) {
+			if (fold === null) return [];
+			const own = (fold.hourly ?? []).flatMap((entry) => entry.hour ? [asHourlyEntry(sessionId, origin, parentSession, entry)] : []);
+			const children = (fold.subagents ?? []).flatMap((child) => flattenFoldEntries(child.sessionId, child, "subagent", sessionId));
+			return [...own, ...children];
+		}
+		function CostTable(props) {
+			const [view, setView] = react.default.useState("time");
+			const [sort, setSort] = react.default.useState(() => defaultCostTableSort("time"));
+			const [filter, setFilter] = react.default.useState({});
+			const [childSort, setChildSort] = react.default.useState(() => defaultChildCostTableSort("time"));
+			const [childFilter, setChildFilter] = react.default.useState({});
+			const [selected, setSelected] = react.default.useState(() => defaultVisibleCostColumns("time"));
+			const [childSelected, setChildSelected] = react.default.useState(() => defaultVisibleCostColumns("time", "child"));
+			const [columnMenu, setColumnMenu] = react.default.useState(null);
+			const [filterMenu, setFilterMenu] = react.default.useState(null);
+			const [expanded, setExpanded] = react.default.useState(() => /* @__PURE__ */ new Set());
+			const setViewMode = (next) => {
+				setView(next);
+				setSort(defaultCostTableSort(next));
+				setChildSort(defaultChildCostTableSort(next));
+				setSelected(defaultVisibleCostColumns(next));
+				setChildSelected(defaultVisibleCostColumns(next, "child"));
+				setColumnMenu(null);
+				setExpanded(/* @__PURE__ */ new Set());
 			};
-			const openAllSessions = () => {
-				setShowAllSessions(true);
-				loadSessionCosts(sessionRows.length > 0);
-			};
-			if (!state || !(state.cost > 0)) return null;
-			const symbol = currencySymbol(state.currency);
-			const parts = [
-				`API费用 ≈${symbol}${money(state.cost)}`,
-				`输入 ${symbol}${money(state.inputCost)}`,
-				`缓存读 ${symbol}${money(state.cacheReadCost)}`,
-				`缓存写 ${symbol}${money(state.cacheWriteCost)}`,
-				`输出 ${symbol}${money(state.outputCost)}`
-			];
-			const showTooltip = () => {
-				if (tooltipTimerRef.current) clearTimeout(tooltipTimerRef.current);
-				tooltipTimerRef.current = setTimeout(() => setTooltip(true), 300);
-			};
-			const hideTooltip = () => {
-				if (tooltipTimerRef.current) clearTimeout(tooltipTimerRef.current);
-				tooltipTimerRef.current = setTimeout(() => setTooltip(false), 200);
-			};
-			const route = state.route ?? "未知模型";
-			const pricingInfo = `${state.groupName ?? "默认分组"}${state.pricingPeriod ? ` · ${state.pricingPeriod}` : ""} · ${sourceLabelOf(state.pricingSource)}`;
-			const cellBase = {
-				fontSize: 12,
-				padding: "4px 8px",
-				textAlign: "right",
-				whiteSpace: "nowrap"
-			};
-			const cellLeft = {
-				...cellBase,
-				textAlign: "left"
-			};
-			const headerStyle = {
-				...cellBase,
-				fontWeight: 600,
-				background: "var(--dsw-alias-bg-layer-3, #f5f5f5)",
-				borderBottom: "1px solid var(--dsw-alias-border-l2, #ddd)",
-				position: "sticky",
-				top: 0,
-				zIndex: 1
-			};
-			const headerLeft = {
-				...headerStyle,
-				textAlign: "left"
-			};
-			const toggleExpanded = (store, id) => store((previous) => {
-				const next = new Set(previous);
+			const parentColumns = resolveVisibleCostColumns(view, selected, "parent").flatMap((key) => {
+				const column = COLUMN_BY_KEY.get(key);
+				return column === void 0 ? [] : [column];
+			});
+			const childColumns = resolveVisibleCostColumns(view, childSelected, "child").flatMap((key) => {
+				const column = COLUMN_BY_KEY.get(key);
+				return column === void 0 ? [] : [column];
+			});
+			const allRows = queryCostTable(props.entries, view, {}, defaultCostTableSort(view));
+			const groups = queryCostTableGroups(props.entries, view, filter, sort, childFilter, childSort, props.unitTokens, props.symbol);
+			const childRows = groups.flatMap((group) => group.children);
+			const detailCount = childRows.length;
+			const totals = costTableTotals(childRows);
+			const patchFilter = (setter) => (key, value) => setter((current) => {
+				const next = { ...current };
+				if (value === "") delete next[key];
+				else next[key] = value;
+				return next;
+			});
+			const setFilterValue = patchFilter(setFilter);
+			const setChildFilterValue = patchFilter(setChildFilter);
+			const toggleGroup = (id) => setExpanded((current) => {
+				const next = new Set(current);
 				if (next.has(id)) next.delete(id);
 				else next.add(id);
 				return next;
 			});
-			const toggleHour = (id) => toggleExpanded(setExpandedHours, id);
-			const compactId = (value) => value ? value.length > 12 ? `${value.slice(0, 8)}…` : value : "-";
-			const hourGroups = queryHourlyOverview(sessionRows, hourlyFilter);
-			const dateOptions = [...new Set(sessionRows.flatMap((row) => (row.cost.hourly ?? []).map((entry) => entry.hour ? localDateOfHour(entry.hour) : "")).filter(Boolean))].sort();
-			const hourOptions = [...new Set((hourlyFilter.date === "" ? sessionRows.flatMap((row) => row.cost.hourly ?? []) : sessionRows.flatMap((row) => row.cost.hourly ?? []).filter((entry) => entry.hour !== void 0 && localDateOfHour(entry.hour) === hourlyFilter.date)).map((entry) => entry.hourLabel ?? entry.hour).filter((value) => Boolean(value)))].sort();
-			const originOptions = [...new Set(sessionRows.map((row) => row.origin).filter((value) => Boolean(value)))].sort();
-			const routeOptions = [...new Set(sessionRows.flatMap((row) => sessionRoutes(row)))].sort();
-			const overviewTotals = sumHourlySlices(hourGroups.flatMap((group) => group.sessions.map((item) => item.entry)));
-			const hourlyDataCells = (row) => [
-				react.default.createElement("td", { style: cellBase }, String(row.turns)),
-				react.default.createElement("td", { style: cellBase }, String(row.steps)),
-				react.default.createElement("td", { style: cellBase }, String(row.toolCalls)),
-				react.default.createElement("td", { style: cellBase }, row.inputTokens.toLocaleString("zh-CN")),
-				react.default.createElement("td", { style: cellBase }, `${symbol}${money(row.inputCost)}`),
-				react.default.createElement("td", { style: cellBase }, (row.cacheReadTokens + row.cacheWriteTokens).toLocaleString("zh-CN")),
-				react.default.createElement("td", { style: cellBase }, `${symbol}${money(row.cacheReadCost + row.cacheWriteCost)}`),
-				react.default.createElement("td", { style: cellBase }, row.outputTokens.toLocaleString("zh-CN")),
-				react.default.createElement("td", { style: cellBase }, `${symbol}${money(row.outputCost)}`),
-				react.default.createElement("td", { style: cellBase }, `${(row.cacheRate * 100).toFixed(1)}%`),
-				react.default.createElement("td", { style: {
-					...cellBase,
-					fontWeight: 600
-				} }, `${symbol}${money(row.cost)}`)
-			];
-			const filterInput = (value, placeholder, onChange) => react.default.createElement("input", {
-				style: {
-					...inputStyle,
-					height: 28,
-					fontSize: 11
-				},
-				value,
-				placeholder,
-				onChange: (event) => onChange(event.target.value)
-			});
-			const filterSelect = (value, options, onChange) => react.default.createElement("select", {
-				style: {
-					...inputStyle,
-					height: 28,
-					fontSize: 11
-				},
-				value,
-				onChange: (event) => onChange(event.target.value)
-			}, react.default.createElement("option", { value: "" }, "全部"), ...options.map((option) => react.default.createElement("option", {
-				key: option,
-				value: option
-			}, option)));
-			return react.default.createElement(react.default.Fragment, null, react.default.createElement("div", {
-				style: {
+			const headerButton = (column, current, onSort, level) => {
+				const active = current.key === column.key;
+				const mark = !active ? "" : current.dir === "asc" ? " ↑" : " ↓";
+				return react.default.createElement("button", {
+					type: "button",
+					"aria-sort": active ? current.dir === "asc" ? "ascending" : "descending" : "none",
+					onClick: () => onSort((prev) => toggleCostTableSort(prev, column.key)),
+					style: {
+						border: 0,
+						background: "transparent",
+						padding: 0,
+						cursor: "pointer",
+						font: "inherit",
+						fontWeight: 600,
+						color: "inherit",
+						whiteSpace: "nowrap"
+					}
+				}, `${columnLabel(column.key, view, level)}${mark}`);
+			};
+			const filterControl = (column, current, onChange, rows, level) => {
+				const options = costTableColumnValues(rows, column.key, props.unitTokens, props.symbol);
+				const value = current[column.key] ?? "";
+				const open = filterMenu?.level === level && filterMenu.key === column.key;
+				const control = column.compact !== true && options.length > 0 && options.length <= 16 ? react.default.createElement("select", {
+					style: FILTER_INPUT,
+					value,
+					onChange: (event) => onChange(column.key, event.target.value)
+				}, react.default.createElement("option", { value: "" }, "全部"), ...options.map((option) => react.default.createElement("option", {
+					key: option,
+					value: option
+				}, option))) : react.default.createElement("input", {
+					style: FILTER_INPUT,
+					value,
+					placeholder: "筛选",
+					onChange: (event) => onChange(column.key, event.target.value)
+				});
+				return react.default.createElement("div", { style: {
 					position: "relative",
-					overflow: "visible",
-					padding: "2px calc(var(--dsh-composer-side-clearance) + 16px) 0",
-					cursor: "pointer"
-				},
-				onMouseEnter: showTooltip,
-				onMouseLeave: hideTooltip,
-				onClick: openModal
+					display: "inline-flex"
+				} }, react.default.createElement("button", {
+					type: "button",
+					title: `筛选${columnLabel(column.key, view, level)}`,
+					"aria-label": `筛选${columnLabel(column.key, view, level)}`,
+					"aria-expanded": open,
+					onClick: () => setFilterMenu(open ? null : {
+						level,
+						key: column.key
+					}),
+					style: {
+						border: 0,
+						background: "transparent",
+						padding: 1,
+						cursor: "pointer",
+						fontSize: 16,
+						lineHeight: 1,
+						color: value === "" ? "var(--dsw-alias-label-tertiary)" : "var(--dsw-alias-label-primary)"
+					}
+				}, "⌕"), open ? react.default.createElement("div", { style: {
+					position: "absolute",
+					right: 0,
+					top: "100%",
+					zIndex: 6,
+					minWidth: 140,
+					padding: 4,
+					background: "var(--dsw-alias-bg-layer-1, #fff)",
+					border: TABLE_BORDER,
+					borderRadius: 6,
+					boxShadow: "0 6px 18px rgba(0,0,0,0.12)"
+				} }, control) : null);
+			};
+			const headerCell = (column, current, onSort, currentFilter, onFilter, rows, level) => react.default.createElement("th", {
+				key: `${level}-${column.key}`,
+				scope: "col",
+				style: column.left ? TABLE_HEAD_LEFT : TABLE_HEAD
 			}, react.default.createElement("div", { style: {
-				textAlign: "center",
-				boxSizing: "border-box",
-				color: "var(--dsw-alias-label-tertiary)",
-				whiteSpace: "nowrap",
-				textOverflow: "ellipsis",
-				overflow: "hidden",
+				display: "flex",
+				alignItems: "center",
+				justifyContent: column.left ? "flex-start" : "flex-end",
+				gap: 4,
+				minWidth: column.compact ? 180 : 72
+			} }, headerButton(column, current, onSort, level), filterControl(column, currentFilter, onFilter, rows, level)));
+			const dataCells = (row, columns, first, child = false) => columns.map((column, index) => react.default.createElement("td", {
+				key: column.key,
+				style: {
+					...column.left ? TABLE_CELL_LEFT : column.key === "usage" ? {
+						...TABLE_CELL,
+						fontWeight: 600
+					} : TABLE_CELL,
+					...child ? {
+						background: "var(--dsw-alias-bg-layer-2, #fafafa)",
+						color: "var(--dsw-alias-label-secondary)"
+					} : { fontWeight: 600 },
+					whiteSpace: column.compact ? "pre-line" : "nowrap",
+					lineHeight: column.compact ? 1.35 : void 0
+				},
+				title: column.key === "sessionId" ? row.sessionId : formatCostCell(row, column.key, props.symbol, props.unitTokens)
+			}, index === 0 ? first : formatCostCell(row, column.key, props.symbol, props.unitTokens)));
+			const viewChip = (id, label) => react.default.createElement("button", {
+				type: "button",
+				onClick: () => setViewMode(id),
+				"aria-pressed": view === id,
+				style: {
+					...buttonStyle,
+					padding: "4px 10px",
+					background: view === id ? "var(--dsw-alias-label-primary)" : "transparent",
+					color: view === id ? "var(--dsw-alias-bg-layer-3)" : "var(--dsw-alias-label-secondary)"
+				}
+			}, label);
+			const columnPicker = (level) => {
+				const keys = optionalCostTableColumns(level).filter((key) => view !== "model" || key !== "route");
+				const chosen = level === "parent" ? selected : childSelected;
+				const setChosen = level === "parent" ? setSelected : setChildSelected;
+				return react.default.createElement("div", { style: { position: "relative" } }, react.default.createElement("button", {
+					type: "button",
+					style: buttonStyle,
+					"aria-expanded": columnMenu === level,
+					onClick: () => setColumnMenu((open) => open === level ? null : level)
+				}, level === "parent" ? "汇总列" : "明细列"), columnMenu === level ? react.default.createElement("div", { style: {
+					position: "absolute",
+					right: 0,
+					top: "100%",
+					marginTop: 4,
+					zIndex: 5,
+					minWidth: 180,
+					padding: 8,
+					background: "var(--dsw-alias-bg-layer-1, #fff)",
+					border: TABLE_BORDER,
+					borderRadius: 8,
+					boxShadow: "0 8px 24px rgba(0,0,0,0.12)",
+					display: "flex",
+					flexDirection: "column",
+					gap: 6
+				} }, ...keys.map((key) => react.default.createElement("label", {
+					key,
+					style: {
+						display: "flex",
+						alignItems: "center",
+						gap: 6,
+						fontSize: 12
+					}
+				}, react.default.createElement("input", {
+					type: "checkbox",
+					checked: chosen.includes(key),
+					onChange: (event) => setChosen((current) => event.target.checked ? [...current, key] : current.filter((item) => item !== key))
+				}), columnLabel(key, view, level)))) : null);
+			};
+			const hasFilter = Object.keys(filter).length > 0 || Object.keys(childFilter).length > 0;
+			if (props.entries.length === 0) return react.default.createElement("p", { style: {
+				margin: 0,
 				fontSize: 12,
-				lineHeight: "20px"
-			} }, ...parts.map((part, index) => react.default.createElement(react.default.Fragment, { key: part }, index ? react.default.createElement("span", { style: {
-				margin: "0 10px",
-				color: "var(--dsw-alias-separator-primary)"
-			} }, "|") : null, part))), tooltip ? react.default.createElement("div", { style: {
-				position: "absolute",
-				bottom: "calc(100% + 8px)",
-				left: "50%",
-				transform: "translateX(-50%)",
-				background: "var(--dsw-alias-bg-layer-2, #1a1a2e)",
-				border: "1px solid var(--dsw-alias-border-l2, #333)",
-				borderRadius: 8,
-				padding: "10px 14px",
-				fontSize: 12,
-				lineHeight: "1.6",
-				zIndex: 1e3,
+				color: "var(--dsw-alias-label-tertiary)"
+			} }, props.empty);
+			const childTable = (rows) => react.default.createElement("table", { style: {
+				width: "100%",
+				minWidth: 720,
+				borderCollapse: "collapse",
+				whiteSpace: "nowrap"
+			} }, react.default.createElement("thead", null, react.default.createElement("tr", null, ...childColumns.map((column) => headerCell(column, childSort, setChildSort, childFilter, setChildFilterValue, childRows, "child")))), react.default.createElement("tbody", null, rows.length === 0 ? react.default.createElement("tr", null, react.default.createElement("td", {
+				style: {
+					...TABLE_CELL_LEFT,
+					color: "var(--dsw-alias-label-tertiary)"
+				},
+				colSpan: childColumns.length
+			}, "没有符合筛选的明细")) : null, ...rows.map((child) => react.default.createElement("tr", { key: child.id }, ...dataCells(child, childColumns, formatCostCell(child, "dimension", props.symbol, props.unitTokens), true)))));
+			return react.default.createElement("div", { style: {
 				display: "flex",
 				flexDirection: "column",
-				gap: 4,
-				pointerEvents: "none"
+				gap: 10,
+				minHeight: 0,
+				flex: 1
 			} }, react.default.createElement("div", { style: {
-				fontWeight: 600,
-				fontSize: 13,
-				marginBottom: 4
-			} }, "API 费用明细"), ...state.details && state.details.length > 0 ? state.details.flatMap((detail, di) => {
-				const rateSymbol = (rate) => `${symbol}${rate}`;
-				const ds = detail;
-				const extras = [
-					ds.groupName,
-					sourceLabelOf(ds.source),
-					ds.periodName,
-					ds.discountMultiplier !== void 0 && ds.discountMultiplier !== 1 ? `优惠 ×${ds.discountMultiplier}` : null,
-					ds.modelMultiplier !== void 0 && ds.modelMultiplier !== 1 ? `模型 ×${ds.modelMultiplier}` : null,
-					formatContextSurcharge(ds.contextAfterTokens, ds.contextMultiplier)
-				].filter((value) => Boolean(value));
-				return [
-					di > 0 ? react.default.createElement("div", {
-						key: `sep-${di}`,
-						style: {
-							borderTop: "1px solid var(--dsw-alias-border-l2, #333)",
-							margin: "2px 0"
-						}
-					}) : null,
-					react.default.createElement("div", {
-						key: `hdr-${di}`,
-						style: {
-							fontWeight: 600,
-							fontSize: 12,
-							marginTop: di > 0 ? 2 : 0
-						}
-					}, `${ds.provider ?? "?"}/${ds.model ?? "?"}${extras.length > 0 ? ` · ${extras.join(" · ")}` : ""}`),
-					react.default.createElement("div", {
-						key: `rates-${di}`,
-						style: {
-							display: "grid",
-							gridTemplateColumns: "auto auto auto auto",
-							gap: "0 14px",
-							fontSize: 11,
-							color: "var(--dsw-alias-label-tertiary)"
-						}
-					}, react.default.createElement("span", {}, `输入 ${rateSymbol(ds.rates.input)}/M`), react.default.createElement("span", {}, `缓存读 ${rateSymbol(ds.rates.cacheRead)}/M`), react.default.createElement("span", {}, `缓存写 ${rateSymbol(ds.rates.cacheWrite)}/M`), react.default.createElement("span", {}, `输出 ${rateSymbol(ds.rates.output)}/M`)),
-					react.default.createElement("div", {
-						key: `grid-${di}`,
-						style: {
-							display: "grid",
-							gridTemplateColumns: "auto 1fr auto",
-							gap: "1px 16px"
-						}
-					}, react.default.createElement("span", { style: { color: "var(--dsw-alias-label-primary)" } }, "输入"), react.default.createElement("span", { style: {
-						textAlign: "right",
-						fontWeight: 500
-					} }, `${symbol}${money(ds.inputCost)}`), react.default.createElement("span", { style: {
-						color: "var(--dsw-alias-label-tertiary)",
-						fontSize: 11
-					} }, `${ds.inputTokens.toLocaleString("zh-CN")} tokens`), react.default.createElement("span", { style: { color: "var(--dsw-alias-label-primary)" } }, "缓存读"), react.default.createElement("span", { style: {
-						textAlign: "right",
-						fontWeight: 500
-					} }, `${symbol}${money(ds.cacheReadCost)}`), react.default.createElement("span", { style: {
-						color: "var(--dsw-alias-label-tertiary)",
-						fontSize: 11
-					} }, `${ds.cacheReadTokens.toLocaleString("zh-CN")} tokens`), react.default.createElement("span", { style: { color: "var(--dsw-alias-label-primary)" } }, "缓存写"), react.default.createElement("span", { style: {
-						textAlign: "right",
-						fontWeight: 500
-					} }, `${symbol}${money(ds.cacheWriteCost)}`), react.default.createElement("span", { style: {
-						color: "var(--dsw-alias-label-tertiary)",
-						fontSize: 11
-					} }, `${ds.cacheWriteTokens.toLocaleString("zh-CN")} tokens`), react.default.createElement("span", { style: { color: "var(--dsw-alias-label-primary)" } }, "输出"), react.default.createElement("span", { style: {
-						textAlign: "right",
-						fontWeight: 500
-					} }, `${symbol}${money(ds.outputCost)}`), react.default.createElement("span", { style: {
-						color: "var(--dsw-alias-label-tertiary)",
-						fontSize: 11
-					} }, `${ds.outputTokens.toLocaleString("zh-CN")} tokens`), react.default.createElement("span", { style: { fontWeight: 600 } }, "小计"), react.default.createElement("span", { style: {
-						textAlign: "right",
-						fontWeight: 600
-					} }, `${symbol}${money(ds.cost)}`), react.default.createElement("span", {}))
-				];
-			}) : [react.default.createElement("div", {
-				key: "ctx",
+				display: "flex",
+				alignItems: "center",
+				justifyContent: "space-between",
+				gap: 8,
+				flexWrap: "wrap"
+			} }, react.default.createElement("div", {
+				role: "tablist",
 				style: {
-					fontWeight: 500,
-					fontSize: 12,
-					marginBottom: 2
+					display: "flex",
+					gap: 6
 				}
-			}, `${route} · ${pricingInfo}`), react.default.createElement("div", {
-				key: "flat",
+			}, viewChip("time", "按日期"), viewChip("model", "按模型")), react.default.createElement("div", { style: {
+				display: "flex",
+				gap: 6,
+				alignItems: "center"
+			} }, hasFilter ? react.default.createElement("button", {
+				type: "button",
+				style: buttonStyle,
+				onClick: () => {
+					setFilter({});
+					setChildFilter({});
+				}
+			}, "清除筛选") : null, columnPicker("parent"), columnPicker("child"))), react.default.createElement("div", { style: {
+				overflow: "auto",
+				fontSize: 12,
+				border: TABLE_BORDER,
+				borderRadius: 8,
+				minHeight: 0,
+				flex: 1
+			} }, react.default.createElement("table", { style: {
+				width: "100%",
+				minWidth: 960,
+				borderCollapse: "collapse"
+			} }, react.default.createElement("thead", null, react.default.createElement("tr", null, ...parentColumns.map((column) => headerCell(column, sort, setSort, filter, setFilterValue, allRows, "parent")))), react.default.createElement("tbody", null, groups.length === 0 ? react.default.createElement("tr", null, react.default.createElement("td", {
 				style: {
-					display: "grid",
-					gridTemplateColumns: "auto 1fr auto",
-					gap: "1px 16px"
-				}
-			}, react.default.createElement("span", { style: { color: "var(--dsw-alias-label-primary)" } }, "输入"), react.default.createElement("span", { style: {
-				textAlign: "right",
-				fontWeight: 500
-			} }, `${symbol}${money(state.inputCost)}`), react.default.createElement("span", { style: {
-				color: "var(--dsw-alias-label-tertiary)",
-				fontSize: 11
-			} }, `${state.inputTokens.toLocaleString("zh-CN")} tokens`), react.default.createElement("span", { style: { color: "var(--dsw-alias-label-primary)" } }, "缓存读"), react.default.createElement("span", { style: {
-				textAlign: "right",
-				fontWeight: 500
-			} }, `${symbol}${money(state.cacheReadCost)}`), react.default.createElement("span", { style: {
-				color: "var(--dsw-alias-label-tertiary)",
-				fontSize: 11
-			} }, `${state.cacheReadTokens.toLocaleString("zh-CN")} tokens`), react.default.createElement("span", { style: { color: "var(--dsw-alias-label-primary)" } }, "缓存写"), react.default.createElement("span", { style: {
-				textAlign: "right",
-				fontWeight: 500
-			} }, `${symbol}${money(state.cacheWriteCost)}`), react.default.createElement("span", { style: {
-				color: "var(--dsw-alias-label-tertiary)",
-				fontSize: 11
-			} }, `${state.cacheWriteTokens.toLocaleString("zh-CN")} tokens`), react.default.createElement("span", { style: { color: "var(--dsw-alias-label-primary)" } }, "输出"), react.default.createElement("span", { style: {
-				textAlign: "right",
-				fontWeight: 500
-			} }, `${symbol}${money(state.outputCost)}`), react.default.createElement("span", { style: {
-				color: "var(--dsw-alias-label-tertiary)",
-				fontSize: 11
-			} }, `${state.outputTokens.toLocaleString("zh-CN")} tokens`))], react.default.createElement("div", {
-				key: "total",
-				style: {
-					borderTop: "1px solid var(--dsw-alias-border-l2, #333)",
-					paddingTop: 4,
-					marginTop: 4,
-					display: "grid",
-					gridTemplateColumns: "auto 1fr",
-					gap: "1px 16px"
-				}
-			}, react.default.createElement("span", { style: { fontWeight: 600 } }, "合计"), react.default.createElement("span", { style: {
-				textAlign: "right",
-				fontWeight: 600
-			} }, `${symbol}${money(state.cost)}`))) : null), showModal && state ? react.default.createElement("div", {
+					...TABLE_CELL_LEFT,
+					color: "var(--dsw-alias-label-tertiary)"
+				},
+				colSpan: parentColumns.length
+			}, "没有符合筛选的明细")) : null, ...groups.flatMap((group) => {
+				const open = expanded.has(group.id);
+				const summaryFirst = react.default.createElement("div", { style: {
+					display: "flex",
+					alignItems: "center",
+					gap: 6
+				} }, react.default.createElement("button", {
+					type: "button",
+					"aria-expanded": open,
+					"aria-label": open ? `收起${group.summary.dimension}` : `展开${group.summary.dimension}`,
+					onClick: () => toggleGroup(group.id),
+					style: {
+						width: 18,
+						height: 18,
+						padding: 0,
+						border: TABLE_BORDER,
+						borderRadius: 3,
+						background: "var(--dsw-alias-bg-layer-1, #fff)",
+						cursor: "pointer",
+						font: "inherit",
+						fontSize: 12,
+						lineHeight: "16px"
+					}
+				}, open ? "−" : "+"), formatCostCell(group.summary, "dimension", props.symbol, props.unitTokens));
+				const childBlock = open ? react.default.createElement("tr", { key: `${group.id}-children` }, react.default.createElement("td", {
+					colSpan: parentColumns.length,
+					style: {
+						...TABLE_CELL_LEFT,
+						padding: 0,
+						background: "var(--dsw-alias-bg-layer-2, #fafafa)"
+					}
+				}, react.default.createElement("div", { style: { padding: "8px 12px 12px 36px" } }, childTable(group.children)))) : null;
+				return [react.default.createElement("tr", { key: group.id }, ...dataCells(group.summary, parentColumns, summaryFirst, false)), ...childBlock === null ? [] : [childBlock]];
+			}), groups.length > 0 ? react.default.createElement("tr", { style: { fontWeight: 600 } }, ...parentColumns.map((column, index) => react.default.createElement("td", {
+				key: column.key,
+				style: index === 0 ? {
+					...TABLE_CELL_LEFT,
+					fontWeight: 600
+				} : column.key === "usage" ? {
+					...TABLE_CELL,
+					fontWeight: 600
+				} : TABLE_CELL
+			}, index === 0 ? `合计 ${groups.length} 组 / ${detailCount} 条` : formatCostCell({
+				...rowZero,
+				...totals
+			}, column.key, props.symbol, props.unitTokens)))) : null))));
+		}
+		const rowZero = {
+			id: "",
+			dimension: "",
+			date: "",
+			hour: "",
+			hourLabel: "",
+			sessionId: "",
+			origin: "",
+			route: "",
+			periodName: "",
+			surcharge: "",
+			turns: 0,
+			steps: 0,
+			toolCalls: 0,
+			inputTokens: 0,
+			inputCost: 0,
+			cacheTokens: 0,
+			cacheCost: 0,
+			outputTokens: 0,
+			outputCost: 0,
+			cacheRate: 0,
+			cost: 0,
+			inputRate: null,
+			cacheReadRate: null,
+			cacheWriteRate: null,
+			outputRate: null
+		};
+		const CHIP_STYLE = {
+			display: "inline-flex",
+			alignItems: "baseline",
+			gap: 6,
+			height: 32,
+			padding: "0 12px",
+			border: "1px solid var(--dsw-alias-border-l2)",
+			borderRadius: 18,
+			background: "transparent",
+			color: "var(--dsw-alias-label-primary)",
+			font: "inherit",
+			fontSize: 13,
+			lineHeight: "20px",
+			cursor: "pointer"
+		};
+		function CostModal(props) {
+			return react.default.createElement("div", {
 				style: {
 					position: "fixed",
 					inset: 0,
@@ -1854,21 +2317,21 @@ window.__ModuleLoader__.load({
 					justifyContent: "center",
 					padding: 20
 				},
-				onClick: () => setShowModal(false)
+				onClick: props.onClose
 			}, react.default.createElement("div", {
 				style: {
 					background: "var(--dsw-alias-bg-layer-1, #fff)",
 					borderRadius: 12,
 					padding: 24,
-					maxWidth: "94vw",
-					maxHeight: "86vh",
-					overflow: "auto",
+					width: "min(1680px, 98vw)",
+					maxHeight: "90vh",
+					overflow: "hidden",
 					boxShadow: "0 8px 32px rgba(0,0,0,0.3)",
 					display: "flex",
 					flexDirection: "column",
 					gap: 16
 				},
-				onClick: (e) => e.stopPropagation()
+				onClick: (event) => event.stopPropagation()
 			}, react.default.createElement("div", { style: {
 				display: "flex",
 				justifyContent: "space-between",
@@ -1878,19 +2341,8 @@ window.__ModuleLoader__.load({
 				margin: 0,
 				fontSize: 18,
 				fontWeight: 600
-			} }, "API 费用统计明细"), react.default.createElement("div", { style: {
-				display: "flex",
-				alignItems: "center",
-				gap: 8
-			} }, showAllSessions ? react.default.createElement("button", {
+			} }, props.title), react.default.createElement("button", {
 				type: "button",
-				style: buttonStyle,
-				onClick: () => setShowAllSessions(false)
-			}, "返回本会话") : react.default.createElement("button", {
-				type: "button",
-				style: buttonStyle,
-				onClick: openAllSessions
-			}, "查看全部会话"), react.default.createElement("button", {
 				style: {
 					background: "none",
 					border: "none",
@@ -1900,160 +2352,120 @@ window.__ModuleLoader__.load({
 					padding: "4px 8px",
 					borderRadius: 4
 				},
-				onClick: () => setShowModal(false)
-			}, "✕"))), showAllSessions ? react.default.createElement("section", { style: {
+				onClick: props.onClose,
+				"aria-label": "关闭"
+			}, "✕")), react.default.createElement("div", { style: {
+				minHeight: 0,
+				flex: 1,
+				overflow: "hidden",
 				display: "flex",
-				flexDirection: "column",
-				gap: 10
-			} }, react.default.createElement("h3", { style: {
-				margin: 0,
-				fontSize: 13,
-				fontWeight: 600
-			} }, "全部会话按时段"), react.default.createElement("div", { style: {
-				display: "grid",
-				gridTemplateColumns: "repeat(5, minmax(110px, 1fr))",
-				gap: 8
-			} }, react.default.createElement("label", { style: {
-				display: "flex",
-				flexDirection: "column",
-				gap: 4,
+				flexDirection: "column"
+			} }, props.children)));
+		}
+		function CostHeader(props) {
+			const [state, setState] = react.default.useState(null);
+			const [sessionRows, setSessionRows] = react.default.useState([]);
+			const [sessionLoadError, setSessionLoadError] = react.default.useState(null);
+			const [sessionLoading, setSessionLoading] = react.default.useState(false);
+			const [modal, setModal] = react.default.useState(null);
+			react.default.useEffect(() => {
+				const load = () => {
+					if (typeof props.sessionId !== "string") return;
+					props.costMeter.sessionCost(props.sessionId).then((response) => {
+						if (response.ok && response.value && typeof response.value === "object") setState(response.value);
+					}).catch(() => {});
+				};
+				load();
+				return props.interval(load, 2e3);
+			}, [props.sessionId]);
+			react.default.useEffect(() => {
+				const load = () => {
+					setSessionLoading(true);
+					loadAllSessionCosts(props.costMeter, props.sessions).then((rows) => {
+						setSessionRows(rows);
+						setSessionLoadError(null);
+					}).catch((error) => {
+						setSessionLoadError(`会话费用加载失败：${remoteErrorText(error)}`);
+					}).finally(() => {
+						setSessionLoading(false);
+					});
+				};
+				load();
+				return props.interval(load, 5e3);
+			}, []);
+			const symbol = currencySymbol(state?.currency ?? sessionRows[0]?.cost.currency ?? "CNY");
+			const unitTokens = state?.unitTokens ?? sessionRows[0]?.cost.unitTokens ?? 1e6;
+			const today = localTodayDate();
+			const todayCost = overviewCost(sessionRows, today);
+			const historyCost = overviewCost(sessionRows);
+			const allEntries = flattenHourlyEntries(sessionRows);
+			const todayEntries = allEntries.filter((item) => localDateOfHour(item.entry.hour) === today);
+			const chip = (label, value, view) => react.default.createElement("button", {
+				type: "button",
+				style: CHIP_STYLE,
+				onClick: () => setModal(view),
+				title: label
+			}, react.default.createElement("span", { style: {
 				fontSize: 11,
 				color: "var(--dsw-alias-label-tertiary)"
-			} }, "日期", filterSelect(hourlyFilter.date, dateOptions, (value) => setHourlyFilter((current) => ({
-				...current,
-				date: value,
-				hour: ""
-			})))), react.default.createElement("label", { style: {
-				display: "flex",
-				flexDirection: "column",
-				gap: 4,
-				fontSize: 11,
-				color: "var(--dsw-alias-label-tertiary)"
-			} }, "时段", filterSelect(hourlyFilter.hour, hourOptions, (value) => setHourlyFilter((current) => ({
-				...current,
-				hour: value
-			})))), react.default.createElement("label", { style: {
-				display: "flex",
-				flexDirection: "column",
-				gap: 4,
-				fontSize: 11,
-				color: "var(--dsw-alias-label-tertiary)"
-			} }, "会话 ID", filterInput(hourlyFilter.sessionId, "包含…", (value) => setHourlyFilter((current) => ({
-				...current,
-				sessionId: value
-			})))), react.default.createElement("label", { style: {
-				display: "flex",
-				flexDirection: "column",
-				gap: 4,
-				fontSize: 11,
-				color: "var(--dsw-alias-label-tertiary)"
-			} }, "来源", filterSelect(hourlyFilter.origin, originOptions, (value) => setHourlyFilter((current) => ({
-				...current,
-				origin: value
-			})))), react.default.createElement("label", { style: {
-				display: "flex",
-				flexDirection: "column",
-				gap: 4,
-				fontSize: 11,
-				color: "var(--dsw-alias-label-tertiary)"
-			} }, "模型/路由", filterSelect(hourlyFilter.route, routeOptions, (value) => setHourlyFilter((current) => ({
-				...current,
-				route: value
-			}))))), sessionLoading ? react.default.createElement("p", { style: {
+			} }, label), react.default.createElement("span", { style: { fontWeight: 600 } }, `${symbol}${money(value)}`));
+			const loading = sessionLoading && sessionRows.length === 0 ? react.default.createElement("p", { style: {
 				margin: 0,
 				fontSize: 12,
 				color: "var(--dsw-alias-label-tertiary)"
-			} }, "正在加载会话费用…") : null, sessionLoadError ? react.default.createElement("p", {
+			} }, "正在加载…") : null;
+			const error = sessionLoadError ? react.default.createElement("p", {
 				role: "alert",
 				style: {
 					margin: 0,
 					fontSize: 12,
 					color: "var(--dsw-alias-label-error)"
 				}
-			}, sessionLoadError) : null, !sessionLoading && !sessionLoadError && hourGroups.length === 0 ? react.default.createElement("p", { style: {
-				margin: 0,
-				fontSize: 12,
-				color: "var(--dsw-alias-label-tertiary)"
-			} }, "暂无匹配的时段费用") : null, react.default.createElement("div", { style: {
-				overflowX: "auto",
-				fontSize: 12
-			} }, react.default.createElement("table", { style: {
-				width: "100%",
-				borderCollapse: "collapse",
-				whiteSpace: "nowrap"
-			} }, react.default.createElement("thead", null, react.default.createElement("tr", null, react.default.createElement("th", { style: headerLeft }, "时间段"), react.default.createElement("th", { style: headerStyle }, "轮次"), react.default.createElement("th", { style: headerStyle }, "步骤"), react.default.createElement("th", { style: headerStyle }, "工具调用"), react.default.createElement("th", { style: headerStyle }, "输入 tokens"), react.default.createElement("th", { style: headerStyle }, "输入价格"), react.default.createElement("th", { style: headerStyle }, "缓存 tokens"), react.default.createElement("th", { style: headerStyle }, "缓存价格"), react.default.createElement("th", { style: headerStyle }, "输出 tokens"), react.default.createElement("th", { style: headerStyle }, "输出价格"), react.default.createElement("th", { style: headerStyle }, "缓存率"), react.default.createElement("th", { style: headerStyle }, "总价"), react.default.createElement("th", { style: headerStyle }, "上下文翻倍"), react.default.createElement("th", { style: headerStyle }, "时段名称"), react.default.createElement("th", { style: headerStyle }, "模型"))), react.default.createElement("tbody", null, ...hourGroups.flatMap((group) => {
-				const timeKey = `all:time:${group.hour}`;
-				const expanded = expandedHours.has(timeKey);
-				const routes = [...new Set(group.sessions.map((item) => `${item.entry.provider ?? ""}/${item.entry.model ?? ""}`).filter((value) => value !== "/"))];
-				const timeRow = react.default.createElement("tr", {
-					key: timeKey,
-					style: {
-						borderBottom: "1px solid var(--dsw-alias-border-l2, #eee)",
-						fontWeight: 600
-					}
-				}, react.default.createElement("td", { style: cellLeft }, react.default.createElement("button", {
-					type: "button",
-					"aria-expanded": expanded,
-					onClick: () => toggleHour(timeKey),
-					style: {
-						border: 0,
-						background: "transparent",
-						cursor: "pointer",
-						padding: "0 6px 0 0",
-						fontSize: 13,
-						color: "inherit"
-					}
-				}, expanded ? "−" : "+"), `${localDateOfHour(group.hour)} ${group.hourLabel}`), ...hourlyDataCells(group.totals), react.default.createElement("td", { style: cellBase }, surchargeOf(group.sessions.map((item) => item.entry))), react.default.createElement("td", { style: cellBase }, `${group.sessions.length} 个会话`), react.default.createElement("td", { style: cellBase }, routes.length === 0 ? "-" : `${routes.length} 个模型`));
-				if (!expanded) return [timeRow];
-				return [timeRow, ...group.sessions.map((item) => react.default.createElement("tr", {
-					key: `${timeKey}:${item.sessionId}:${item.entry.provider ?? ""}/${item.entry.model ?? ""}`,
-					style: {
-						borderBottom: "1px solid var(--dsw-alias-border-l2, #eee)",
-						background: "var(--dsw-alias-bg-layer-2, #fafafa)"
-					}
-				}, react.default.createElement("td", {
-					style: {
-						...cellLeft,
-						paddingLeft: 28
-					},
-					title: item.sessionId
-				}, `↳ ${compactId(item.sessionId)}${item.origin ? ` · ${item.origin}` : ""}`), ...hourlyDataCells(item.entry), react.default.createElement("td", { style: cellBase }, surchargeLabel(item.entry.contextAfterTokens, item.entry.contextMultiplier)), react.default.createElement("td", { style: cellBase }, item.entry.periodName ?? "-"), react.default.createElement("td", { style: cellBase }, item.entry.provider && item.entry.model ? `${item.entry.provider}/${item.entry.model}` : "-")))];
-			}), hourGroups.length > 0 ? react.default.createElement("tr", { style: {
-				fontWeight: 600,
-				borderTop: "2px solid var(--dsw-alias-border-l1, #bbb)"
-			} }, react.default.createElement("td", { style: {
-				...cellLeft,
-				fontWeight: 600
-			} }, "合计"), ...hourlyDataCells(overviewTotals), react.default.createElement("td", { style: cellBase }), react.default.createElement("td", { style: cellBase }, `${hourGroups.reduce((total, group) => total + group.sessions.length, 0)} 条明细`), react.default.createElement("td", { style: cellBase }, `${(overviewTotals.inputTokens + overviewTotals.cacheReadTokens + overviewTotals.cacheWriteTokens + overviewTotals.outputTokens).toLocaleString("zh-CN")} tokens`)) : null)))) : react.default.createElement("section", { style: {
+			}, sessionLoadError) : null;
+			return react.default.createElement(react.default.Fragment, null, react.default.createElement("div", { style: {
 				display: "flex",
-				flexDirection: "column",
-				gap: 10
-			} }, react.default.createElement("h3", { style: {
-				margin: 0,
-				fontSize: 13,
-				fontWeight: 600
-			} }, "当前会话"), react.default.createElement("p", { style: {
-				margin: 0,
-				fontSize: 12,
-				color: "var(--dsw-alias-label-tertiary)"
-			} }, (() => {
-				const labels = [...new Set([...state.details ?? [], ...state.hourly ?? []].map((row) => formatContextSurcharge(row.contextAfterTokens, row.contextMultiplier)).filter((value) => Boolean(value)))];
-				return labels.length === 0 ? "本会话没有触发上下文翻倍。" : `本会话命中：${labels.join("、")}`;
-			})()), react.default.createElement("div", { style: {
-				overflowX: "auto",
-				fontSize: 12
-			} }, react.default.createElement(HourlyTable, {
-				sessionId: props.sessionId,
-				hourly: state.hourly ?? [],
-				subagents: state.subagents ?? [],
-				expandedHours,
-				toggleHour,
-				symbol,
-				cellBase,
-				cellLeft,
-				headerStyle,
-				headerLeft
-			}))))) : null);
+				alignItems: "center",
+				gap: 8
+			} }, chip("本会话", state?.cost ?? 0, "session"), chip("今日", todayCost, "today"), chip("累计", historyCost, "history")), modal === "session" ? react.default.createElement(CostModal, {
+				title: "本会话费用",
+				onClose: () => setModal(null),
+				children: react.default.createElement(CostTable, {
+					entries: flattenFoldEntries(props.sessionId, state),
+					symbol,
+					unitTokens,
+					empty: "本会话还没有可统计的用量。"
+				})
+			}) : null, modal === "today" ? react.default.createElement(CostModal, {
+				title: `今日费用 · ${today}`,
+				onClose: () => setModal(null),
+				children: react.default.createElement("div", { style: {
+					display: "flex",
+					flexDirection: "column",
+					gap: 8,
+					minHeight: 0,
+					flex: 1
+				} }, loading, error, react.default.createElement(CostTable, {
+					entries: todayEntries,
+					symbol,
+					unitTokens,
+					empty: "今天还没有费用。"
+				}))
+			}) : null, modal === "history" ? react.default.createElement(CostModal, {
+				title: "累计费用",
+				onClose: () => setModal(null),
+				children: react.default.createElement("div", { style: {
+					display: "flex",
+					flexDirection: "column",
+					gap: 8,
+					minHeight: 0,
+					flex: 1
+				} }, loading, error, react.default.createElement(CostTable, {
+					entries: allEntries,
+					symbol,
+					unitTokens,
+					empty: "还没有历史费用。"
+				}))
+			}) : null);
 		}
 		async function apply(ctx) {
 			const remote = ctx.get("remote");
@@ -2116,21 +2528,21 @@ window.__ModuleLoader__.load({
 			ctx.effect(() => remoteEvents.$on?.("llm/adapters-updated", () => {
 				catalog.load();
 			}) ?? (() => {}), "cost-meter catalog updates");
-			slots.inject("conversation.composer.dock", () => slots.register({
-				name: "conversation.composer.dock",
+			slots.inject("conversation.session.header.utilities", () => slots.register({
+				name: "conversation.session.header.utilities",
 				id: "cost-meter",
-				order: 100
-			}, (props) => react.default.createElement(CostDock, {
+				order: 40
+			}, (props) => react.default.createElement(CostHeader, {
 				...props,
 				costMeter,
 				sessions: connection.api.sessions,
 				interval: (callback, delay) => ctx.interval(callback, delay)
 			})));
-			slots.inject("settings.plugin.item", () => slots.register({
-				name: "settings.plugin.item",
-				key: "cost-meter",
+			slots.inject("settings.section", () => slots.register({
+				name: "settings.section",
 				id: "cost-meter",
-				order: 30,
+				order: 25,
+				label: "API 费用",
 				inject: () => ({
 					hooks: {
 						pricing,

@@ -1,6 +1,6 @@
 # dsh-cost-meter
 
-Configurable session API cost estimator for DeepSeek Harness. The conversation composer shows cumulative input, cache-read, cache-write, and output cost; the Plugins settings page edits pricing groups and per-model multipliers.
+Configurable session API cost estimator for DeepSeek Harness. The conversation header shows this session, today, and all-time totals; each chip opens a centered detail modal. Settings live as their own left-nav page.
 
 ## Install
 
@@ -69,9 +69,9 @@ A previous `default` / per-model absolute-rate document is accepted on read and 
 
 ## Accounting
 
-The Host taps `fetch` for `/chat/completions` and `/responses` during `llm.stream`. It copies `completion_tokens_details.reasoning_tokens` onto the official usage chunk before the harness writes the session log. Upstream status, headers, and body bytes are unchanged; the adapter is not patched.
+The Host taps `fetch` for `/chat/completions` and `/responses` during `llm.stream` and during `preparedCall.stream` from `llm.prepareCall`. The agent loop dispatches the latter; wrapping only `llm.stream` leaves grok reasoning off the session log. It copies `completion_tokens_details.reasoning_tokens` onto the official usage chunk before the harness writes the session log. Upstream status, headers, and body bytes are unchanged; the adapter is not patched.
 
-The Host folds the session log in sequence order. Each `request/header` selects the actual provider/model for later usage in that request epoch. `assistant/chunk` and `assistant/message` usage reports use last-writer-wins for the same turn/step, matching the Harness token projection and preventing duplicate accounting. After the resolved group rates and model multipliers, a matching `contextSurcharge` multiplies that request's entire cost. A parent session's total includes every descendant session whose durable header identifies it as a subagent; each child log is folded once, so nested delegation is included without replaying a child through multiple parents. The composer modal first shows the current session. An explicit control then loads every durable session through `sessionCosts()` when the host exports it; if that endpoint is unavailable, the overview falls back to `session.list` plus concurrent per-session `sessionCost()` calls. The all-session view groups those independent hourly buckets by local date and hour, so expanding a period lists every matching session without inheriting a parent session's merged subagent totals.
+The Host folds the session log in sequence order. Each `request/header` selects the actual provider/model for later usage in that request epoch. `assistant/chunk` and `assistant/message` usage reports use last-writer-wins for the same turn/step, matching the Harness token projection and preventing duplicate accounting. After the resolved group rates and model multipliers, a matching `contextSurcharge` multiplies that request's entire cost. A parent session's total includes every descendant session whose durable header identifies it as a subagent; each child log is folded once, so nested delegation is included without replaying a child through multiple parents. The session header shows three chips: this session (own fold plus descendant subagents), today, and all-time. Clicking a chip opens a centered table. Date view collapses one local date into a summary row; model view collapses one `provider/model`. Parent rows keep only group-level columns. Expanding a summary opens a nested detail table whose columns sort and filter independently. Input, cache, output, and a usage total each share one cell: token count, cost, and average unit price. Today and history load every durable session through `sessionCosts()` when the host exports it; if that endpoint is unavailable, the overview falls back to `session.list` plus concurrent per-session `sessionCost()` calls. Those views do not inherit a parent session's merged subagent totals.
 
 The Host keeps an in-process cache of each session's own fold, keyed by a pricing fingerprint and a log fingerprint. A later all-session load reuses an unchanged historical session without rereading or refolding it, refolds a live or rewritten log, and drops deleted ids. A pricing edit invalidates every cached fold so retained history is revalued. The cache does not survive a host restart and does not persist a parent session's merged subagent total.
 
@@ -104,12 +104,14 @@ npm test
 | `src/session-fold-cache.ts` | In-process own-fold cache keyed by pricing and log fingerprints |
 | `src/index.ts` | Host settings namespace, session fold, and Remote service |
 | `src/typert.host.ts` | Host wire manifest |
-| `src/client.ts` | Composer cost line, current-session modal, all-session overview, and Plugins settings card |
+| `src/client.ts` | Session-header cost chips, session/today/history modals, and the Settings left-nav page |
 | `cordis.patch.yml` | Host bundle row |
 
 ## Known Limitations and Deferred Work
 
 - The result is an estimate from provider usage fields and configured prices, not a provider invoice.
+- Automatic upstream billing discovery is opt-in. It reads the Sub2API-compatible `/v1/sub2api/billing` endpoint using each `llm-pi-ai` provider's configured Base URL and credential reference, and stores `resolved_rate_multiplier` as an effective-time history per model together with `lastProbedAt`. The settings page shows that probe time under the model multipliers. It never stores the probe-time `effective_rate_multiplier`; configured pricing periods remain responsible for peak windows.
+- Each usage event is valued with the multiplier history entry whose `effectiveAt` is at or before the event timestamp. A newly observed value can only apply from the observation time onward; the plugin cannot infer the upstream's earlier change time.
 - Price edits revalue retained history because no per-request pricing snapshot is appended to the session log.
 - Models absent from the current catalog remain visible only when they already belong to a group; new dormant routes cannot be added by hand from the picker.
 - The own-fold cache is process-local. A historical session rewritten on disk while it is not live stays cached until the next pricing change or host restart.

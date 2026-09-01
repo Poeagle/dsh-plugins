@@ -1,7 +1,35 @@
-import { F as normalizePricing, H as validatePricing, t as Config } from "./src-BuB4G30_.js";
+import { Dt as validatePricing, bt as normalizePricing, o as installUpstreamBillingProbes, t as Config } from "./src-DSOzHANW.js";
 //#region src/settings.ts
 const SETTINGS_NS = "cost-meter";
 const ROUTE_PATH = "/cost-meter/pricing";
+function mergeHistory(current, incoming) {
+	const models = { ...incoming.models };
+	for (const [key, next] of Object.entries(models)) {
+		const previous = current.models[key];
+		if (previous === void 0) continue;
+		const history = previous.discountMultiplierHistory;
+		if (history !== void 0 && next.discountMultiplierHistory === void 0) next.discountMultiplierHistory = history;
+		if (previous.lastProbedAt !== void 0 && next.lastProbedAt === void 0) next.lastProbedAt = previous.lastProbedAt;
+		if (next.discountMultiplier !== void 0 && next.discountMultiplier !== previous.discountMultiplier && next.discountMultiplierHistory === history) {
+			const effectiveAt = Date.now();
+			const last = [...history ?? []];
+			if (last.length === 0) last.push({
+				effectiveAt: 0,
+				discountMultiplier: previous.discountMultiplier ?? 1
+			});
+			if (last[last.length - 1]?.discountMultiplier !== next.discountMultiplier) last.push({
+				effectiveAt: Math.max(effectiveAt, last[last.length - 1].effectiveAt + 1),
+				discountMultiplier: next.discountMultiplier,
+				source: "manual"
+			});
+			next.discountMultiplierHistory = last;
+		}
+	}
+	return {
+		...incoming,
+		models
+	};
+}
 /** Same-origin loopback fence for the pricing route (mirrors dsh's /api trust model). */
 function isTrustedRequest(req) {
 	const host = req.headers?.host;
@@ -37,6 +65,7 @@ function apply(ctx, config) {
 		base: config,
 		validate: (value) => validatePricing(normalizePricing(value))
 	});
+	ctx.effect(() => installUpstreamBillingProbes(ctx, scope), "cost-meter upstream billing probes");
 	ctx.inject(["webServer"], (webCtx) => {
 		webCtx.webServer.register({
 			name: "cost-meter-pricing",
@@ -88,8 +117,9 @@ function apply(ctx, config) {
 						chunks.push(chunk);
 					}
 					const body = normalizePricing(JSON.parse(Buffer.concat(chunks).toString("utf8")));
-					validatePricing(body);
-					await settings.replace(SETTINGS_NS, body);
+					const merged = mergeHistory(normalizePricing(scope.get()), body);
+					validatePricing(merged);
+					await settings.replace(SETTINGS_NS, merged);
 					send(200, {
 						ok: true,
 						value: body

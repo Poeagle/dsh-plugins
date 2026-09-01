@@ -3,9 +3,12 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { Config } from './index.js'
 import { normalizePricing, validatePricing, type PricingConfig } from './pricing.js'
+import { installUpstreamBillingProbes } from './upstream-billing-probe.js'
 
 interface SettingsScopeFace<T> {
   get(): T
+  watch(callback: (next: T, prev: T) => void | Promise<void>): () => void
+  update(patch: object): Promise<void>
 }
 
 interface SettingsFace {
@@ -24,6 +27,25 @@ interface WebServerFace {
 
 const SETTINGS_NS = 'cost-meter'
 const ROUTE_PATH = '/cost-meter/pricing'
+
+function mergeHistory(current: PricingConfig, incoming: PricingConfig): PricingConfig {
+  const models = { ...incoming.models }
+  for (const [key, next] of Object.entries(models)) {
+    const previous = current.models[key]
+    if (previous === undefined) continue
+    const history = previous.discountMultiplierHistory
+    if (history !== undefined && next.discountMultiplierHistory === undefined) next.discountMultiplierHistory = history
+    if (previous.lastProbedAt !== undefined && next.lastProbedAt === undefined) next.lastProbedAt = previous.lastProbedAt
+    if (next.discountMultiplier !== undefined && next.discountMultiplier !== previous.discountMultiplier && next.discountMultiplierHistory === history) {
+      const effectiveAt = Date.now()
+      const last = [...(history ?? [])]
+      if (last.length === 0) last.push({ effectiveAt: 0, discountMultiplier: previous.discountMultiplier ?? 1 })
+      if (last[last.length - 1]?.discountMultiplier !== next.discountMultiplier) last.push({ effectiveAt: Math.max(effectiveAt, last[last.length - 1]!.effectiveAt + 1), discountMultiplier: next.discountMultiplier, source: 'manual' })
+      next.discountMultiplierHistory = last
+    }
+  }
+  return { ...incoming, models }
+}
 
 /** Same-origin loopback fence for the pricing route (mirrors dsh's /api trust model). */
 function isTrustedRequest(req: any): boolean {
@@ -64,6 +86,7 @@ export function apply(ctx: Context, config: PricingConfig): void {
     base: config,
     validate: (value) => validatePricing(normalizePricing(value)),
   })
+  ctx.effect(() => installUpstreamBillingProbes(ctx, scope), 'cost-meter upstream billing probes')
   ctx.inject(['webServer'], (webCtx) => {
     const webServer = (webCtx as Context & { webServer: WebServerFace }).webServer
     webServer.register({
@@ -104,8 +127,9 @@ export function apply(ctx: Context, config: PricingConfig): void {
             chunks.push(chunk)
           }
           const body = normalizePricing(JSON.parse(Buffer.concat(chunks).toString('utf8')))
-          validatePricing(body)
-          await settings.replace(SETTINGS_NS, body)
+          const merged = mergeHistory(normalizePricing(scope.get()), body)
+          validatePricing(merged)
+          await settings.replace(SETTINGS_NS, merged)
           send(200, { ok: true, value: body })
         } catch (error) {
           send(400, { ok: false, error: String(error instanceof Error ? error.message : error) })

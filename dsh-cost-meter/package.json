@@ -1,6 +1,6 @@
 {
   "name": "dsh-cost-meter",
-  "version": "0.4.0",
+  "version": "0.5.1",
   "description": "Configurable API cost meter with pricing groups, cache multipliers, and per-model discount/model multipliers.",
   "license": "MIT",
   "type": "module",
@@ -56,7 +56,7 @@
         "@deepseek-ai/dsh-client-connection",
         "@deepseek-ai/dsh-client-runtime",
         "@deepseek-ai/dsh-client-ui-settings",
-        "@deepseek-ai/dsh-client-ui-settings-plugins",
+        "@deepseek-ai/dsh-client-ui-conversation",
         "@deepseek-ai/dsh-api-remotes"
       ]
     }

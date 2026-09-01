@@ -50,10 +50,23 @@ export interface PricingGroup {
  * Final price = group rates (after period) × discountMultiplier × modelMultiplier,
  * then the request-wide context surcharge.
  */
+export interface MultiplierHistoryEntry {
+  /** Inclusive Unix epoch milliseconds from which this multiplier applies. */
+  effectiveAt: number
+  /** Upstream key-level base multiplier, excluding peak-period adjustments. */
+  discountMultiplier: number
+  /** `probe` is an upstream billing observation; `manual` is a settings save. */
+  source?: 'probe' | 'manual'
+}
+
 export interface ModelAssignment {
   groupId: string
   /** 优惠倍率. Omitted or empty treats as 1. */
   discountMultiplier?: number
+  /** Effective-time history maintained by automatic upstream billing probes. */
+  discountMultiplierHistory?: MultiplierHistoryEntry[]
+  /** Last successful upstream probe, even when the multiplier did not change. */
+  lastProbedAt?: number
   /** 模型倍率. Omitted or empty treats as 1. */
   modelMultiplier?: number
   /**
@@ -76,12 +89,21 @@ export interface PricingPlan {
   reasoningExtra?: boolean
 }
 
+export interface BillingProbeConfig {
+  enabled: boolean
+  intervalMinutes?: number
+  timeoutMs?: number
+  concurrency?: number
+  providers?: string[]
+}
+
 export interface PricingConfig {
   currency: string
   unitTokens: number
   timezone: string
   groups: PricingGroup[]
   models: Record<string, ModelAssignment>
+  billingProbe?: BillingProbeConfig
 }
 
 export interface ResolvedPricing {
@@ -112,6 +134,7 @@ export const DEFAULT_PRICING: PricingConfig = {
   timezone: 'Asia/Shanghai',
   groups: [DEFAULT_GROUP],
   models: {},
+  billingProbe: { enabled: false, intervalMinutes: 30, timeoutMs: 10_000, concurrency: 2 },
 }
 
 const TIME_PATTERN = /^(?:[01]\d|2[0-3]):[0-5]\d$/
@@ -170,6 +193,32 @@ export function assignmentOf(config: PricingConfig, provider: string | null, mod
   return key === null ? undefined : config.models[key]
 }
 
+/** Latest automatic-probe timestamp on one model assignment, or null when none. */
+export function lastProbeAt(assignment: ModelAssignment | undefined): number | null {
+  if (assignment?.lastProbedAt !== undefined && Number.isFinite(assignment.lastProbedAt) && assignment.lastProbedAt > 0) {
+    return assignment.lastProbedAt
+  }
+  const history = assignment?.discountMultiplierHistory ?? []
+  for (let index = history.length - 1; index >= 0; index -= 1) {
+    const entry = history[index]!
+    if (entry.source === 'manual') continue
+    if (entry.effectiveAt > 0 && (entry.source === 'probe' || entry.source === undefined)) return entry.effectiveAt
+  }
+  return null
+}
+
+/** Resolve the latest observed discount whose effective time is not after the request. */
+export function discountMultiplierAt(assignment: ModelAssignment | undefined, time: number): number {
+  const history = assignment?.discountMultiplierHistory ?? []
+  if (history.length === 0) return multiplierOrOne(assignment?.discountMultiplier)
+  let multiplier = history[0]!.discountMultiplier
+  for (const entry of history) {
+    if (entry.effectiveAt > time) break
+    multiplier = entry.discountMultiplier
+  }
+  return multiplier
+}
+
 function groupRates(group: PricingGroup, periodMultiplier: number, discountMultiplier: number, modelMultiplier: number): TokenRates {
   const scale = periodMultiplier * discountMultiplier * modelMultiplier
   return {
@@ -187,7 +236,7 @@ export function resolvePricing(config: PricingConfig, provider: string | null, m
   const group = findGroup(config, assignment?.groupId)
   const period = activePeriod(group.periods, minute)
   const periodMultiplier = multiplierOrOne(period?.multiplier)
-  const discountMultiplier = multiplierOrOne(assignment?.discountMultiplier)
+  const discountMultiplier = discountMultiplierAt(assignment, time)
   const modelMultiplier = multiplierOrOne(assignment?.modelMultiplier)
   return {
     rates: groupRates(group, periodMultiplier, discountMultiplier, modelMultiplier),
@@ -362,6 +411,8 @@ interface LegacyPeriod {
 interface LegacyPlan {
   groupId?: string
   discountMultiplier?: number
+  discountMultiplierHistory?: MultiplierHistoryEntry[]
+  lastProbedAt?: number
   modelMultiplier?: number
   rates?: PartialTokenRates
   periods?: LegacyPeriod[]
@@ -380,6 +431,7 @@ interface LegacyConfig {
     contextSurcharges?: ContextSurcharge[]
   }
   models?: Record<string, LegacyPlan>
+  billingProbe?: BillingProbeConfig
 }
 
 function slugify(value: string): string {
@@ -467,6 +519,11 @@ function sameGroup(left: PricingGroup, right: PricingGroup): boolean {
 function assignmentFromPlan(plan: LegacyPlan, groupId: string): ModelAssignment {
   const assignment: ModelAssignment = { groupId }
   if (plan.discountMultiplier !== undefined) assignment.discountMultiplier = plan.discountMultiplier
+  if (plan.discountMultiplierHistory !== undefined) {
+    assignment.discountMultiplierHistory = [...plan.discountMultiplierHistory]
+      .sort((left, right) => left.effectiveAt - right.effectiveAt)
+  }
+  if (plan.lastProbedAt !== undefined) assignment.lastProbedAt = plan.lastProbedAt
   if (plan.modelMultiplier !== undefined) assignment.modelMultiplier = plan.modelMultiplier
   if (plan.reasoningExtra !== undefined) assignment.reasoningExtra = plan.reasoningExtra
   return assignment
@@ -481,6 +538,14 @@ export function normalizePricing(raw: unknown): PricingConfig {
   const currency = typeof input.currency === 'string' && input.currency.trim() !== '' ? input.currency : DEFAULT_PRICING.currency
   const unitTokens = Number.isSafeInteger(input.unitTokens) && (input.unitTokens ?? 0) >= 1 ? input.unitTokens! : DEFAULT_PRICING.unitTokens
   const timezone = typeof input.timezone === 'string' && input.timezone.trim() !== '' ? input.timezone : DEFAULT_PRICING.timezone
+  const rawProbe = input.billingProbe
+  const billingProbe = rawProbe !== null && typeof rawProbe === 'object' ? {
+    enabled: (rawProbe as BillingProbeConfig).enabled === true,
+    intervalMinutes: (rawProbe as BillingProbeConfig).intervalMinutes ?? 30,
+    timeoutMs: (rawProbe as BillingProbeConfig).timeoutMs ?? 10_000,
+    concurrency: (rawProbe as BillingProbeConfig).concurrency ?? 2,
+    providers: Array.isArray((rawProbe as BillingProbeConfig).providers) ? [...(rawProbe as BillingProbeConfig).providers!] : undefined,
+  } : DEFAULT_PRICING.billingProbe
   const hasGroups = Array.isArray(input.groups) && input.groups.length > 0
   if (hasGroups) {
     const groups = input.groups!.map(group => ({
@@ -499,7 +564,7 @@ export function normalizePricing(raw: unknown): PricingConfig {
       if (plan === undefined) continue
       models[key] = assignmentFromPlan(plan, plan.groupId ?? DEFAULT_GROUP_ID)
     }
-    return { currency, unitTokens, timezone, groups, models }
+    return { currency, unitTokens, timezone, groups, models, billingProbe }
   }
   const fallbackRates = DEFAULT_GROUP
   const defaultRates = tokenRatesOf(input.default?.rates, {
@@ -535,7 +600,7 @@ export function normalizePricing(raw: unknown): PricingConfig {
     groups.push(candidate)
     models[key] = assignmentFromPlan(plan, candidate.id)
   }
-  return { currency, unitTokens, timezone, groups, models }
+  return { currency, unitTokens, timezone, groups, models, billingProbe }
 }
 
 function assertGroup(group: PricingGroup, path: string): void {
@@ -558,6 +623,14 @@ export function validatePricing(config: PricingConfig): void {
   } catch {
     throw new TypeError(`timezone "${config.timezone}" is not an IANA time zone`)
   }
+  const probe = config.billingProbe
+  if (probe !== undefined) {
+    if (typeof probe.enabled !== 'boolean') throw new TypeError('billingProbe.enabled must be boolean')
+    if (probe.intervalMinutes !== undefined && (!Number.isSafeInteger(probe.intervalMinutes) || probe.intervalMinutes < 5 || probe.intervalMinutes > 1440)) throw new TypeError('billingProbe.intervalMinutes must be an integer from 5 to 1440')
+    if (probe.timeoutMs !== undefined && (!Number.isSafeInteger(probe.timeoutMs) || probe.timeoutMs < 1000 || probe.timeoutMs > 60000)) throw new TypeError('billingProbe.timeoutMs must be an integer from 1000 to 60000')
+    if (probe.concurrency !== undefined && (!Number.isSafeInteger(probe.concurrency) || probe.concurrency < 1 || probe.concurrency > 8)) throw new TypeError('billingProbe.concurrency must be an integer from 1 to 8')
+    if (probe.providers !== undefined && (!Array.isArray(probe.providers) || probe.providers.some(provider => typeof provider !== 'string' || provider.trim() === ''))) throw new TypeError('billingProbe.providers must contain non-empty strings')
+  }
   if (!Array.isArray(config.groups) || config.groups.length === 0) throw new TypeError('groups must contain at least one pricing group')
   const ids = new Set<string>()
   for (const [index, group] of config.groups.entries()) {
@@ -572,6 +645,23 @@ export function validatePricing(config: PricingConfig): void {
       throw new TypeError(`models.${key}.groupId "${assignment.groupId}" does not match a pricing group`)
     }
     if (assignment.discountMultiplier !== undefined) assertNonNegative(assignment.discountMultiplier, `models.${key}.discountMultiplier`)
+    let previousEffectiveAt = -1
+    for (const [index, entry] of (assignment.discountMultiplierHistory ?? []).entries()) {
+      if (!Number.isSafeInteger(entry.effectiveAt) || entry.effectiveAt < 0 || entry.effectiveAt <= previousEffectiveAt) {
+        throw new TypeError(`models.${key}.discountMultiplierHistory[${index}].effectiveAt must be strictly increasing epoch milliseconds`)
+      }
+      assertNonNegative(entry.discountMultiplier, `models.${key}.discountMultiplierHistory[${index}].discountMultiplier`)
+      if (entry.source !== undefined && entry.source !== 'probe' && entry.source !== 'manual') {
+        throw new TypeError(`models.${key}.discountMultiplierHistory[${index}].source must be probe or manual`)
+      }
+      previousEffectiveAt = entry.effectiveAt
+    }
+    if (assignment.discountMultiplierHistory !== undefined && !Array.isArray(assignment.discountMultiplierHistory)) {
+      throw new TypeError(`models.${key}.discountMultiplierHistory must be an array`)
+    }
+    if (assignment.lastProbedAt !== undefined && (!Number.isSafeInteger(assignment.lastProbedAt) || assignment.lastProbedAt < 0)) {
+      throw new TypeError(`models.${key}.lastProbedAt must be a non-negative epoch millisecond`)
+    }
     if (assignment.modelMultiplier !== undefined) assertNonNegative(assignment.modelMultiplier, `models.${key}.modelMultiplier`)
   }
 }
@@ -639,6 +729,7 @@ export interface HourlyDetail {
   groupName: string | null
   contextMultiplier: number
   contextAfterTokens: number | null
+  rates?: TokenRates | null
 }
 
 /** One descendant subagent's own cost and recursive descendants. */
@@ -798,6 +889,7 @@ interface HourBucket {
   groupName: string
   contextMultiplier: number
   contextAfterTokens: number | null
+  rates: TokenRates
   inputTokens: number
   cacheReadTokens: number
   cacheWriteTokens: number
@@ -873,6 +965,7 @@ export function foldSession(events: readonly CostEvent[], config: PricingConfig 
         groupName: pricing.groupName,
         contextMultiplier: multiplier,
         contextAfterTokens: afterTokens,
+        rates: { ...pricing.rates },
         inputTokens: 0,
         cacheReadTokens: 0,
         cacheWriteTokens: 0,
@@ -1034,6 +1127,7 @@ export function foldSession(events: readonly CostEvent[], config: PricingConfig 
       groupName: bucket.groupName,
       contextMultiplier: bucket.contextMultiplier,
       contextAfterTokens: bucket.contextAfterTokens,
+      rates: bucket.rates,
     }]
   }).sort((a, b) => a.hour.localeCompare(b.hour) || (a.provider ?? '').localeCompare(b.provider ?? '') || (a.model ?? '').localeCompare(b.model ?? '') || a.contextMultiplier - b.contextMultiplier)
   return out

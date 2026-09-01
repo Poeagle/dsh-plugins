@@ -4,20 +4,35 @@ import {
   DEFAULT_PRICING,
   SessionFoldCache,
   collectSessionCosts,
+  costTableColumnValues,
+  costTableTotals,
+  defaultCostTableSort,
+  defaultVisibleCostColumns,
   filterHourlyEntries,
   filterSessionRows,
+  flattenCostTableRows,
   flattenHourlyEntries,
   foldSession,
+  formatUsageCell,
+  groupCostTableRows,
+  groupDailyOverview,
   localDateOfHour,
+  localTodayDate,
   logFingerprint,
   mapWithConcurrency,
   mergeListedSessionCost,
+  overviewCost,
   pricingFingerprint,
+  queryCostTable,
+  queryCostTableGroups,
+  queryDailyOverview,
   queryHourlyOverview,
   querySessionRows,
+  resolveVisibleCostColumns,
   sharedContextSurcharge,
   sortSessionRows,
   sumHourlySlices,
+  toggleCostTableSort,
 } from '../lib/index.js'
 
 const peak = Date.parse('2026-01-01T02:00:00Z')
@@ -563,4 +578,103 @@ test('mapWithConcurrency treats empty lists and invalid limits as no-op or seria
   assert.deepEqual(await mapWithConcurrency([], 8, async value => value), [])
   const serial = await mapWithConcurrency(['a', 'b'], 0, async value => value.toUpperCase())
   assert.deepEqual(serial, ['A', 'B'])
+})
+
+test('daily overview groups independent hourly buckets by local date', () => {
+  const morning = localHour(2026, 8, 23, 9)
+  const noon = localHour(2026, 8, 23, 12)
+  const yesterday = localHour(2026, 8, 22, 21)
+  const rows = [
+    {
+      sessionId: 'a', parentSession: null, origin: 'user',
+      cost: { cost: 3, inputTokens: 10, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 2, hourly: [
+        { ...morning, provider: 'wz', model: 'gpt', inputTokens: 10, outputTokens: 2, inputCost: 1, outputCost: 2, cost: 3, cacheReadTokens: 0, cacheWriteTokens: 0, cacheReadCost: 0, cacheWriteCost: 0, turns: 1, steps: 1, toolCalls: 0, cacheRate: 0, periodName: null },
+        { ...noon, provider: 'wz', model: 'gpt', inputTokens: 8, outputTokens: 3, inputCost: 0.8, outputCost: 1.2, cost: 2, cacheReadTokens: 0, cacheWriteTokens: 0, cacheReadCost: 0, cacheWriteCost: 0, turns: 1, steps: 1, toolCalls: 0, cacheRate: 0, periodName: null },
+      ] },
+    },
+    {
+      sessionId: 'b', parentSession: null, origin: 'user',
+      cost: { cost: 5, inputTokens: 20, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 6, hourly: [
+        { ...yesterday, provider: 'grok', model: 'grok-4.6', inputTokens: 20, outputTokens: 6, inputCost: 2, outputCost: 3, cost: 5, cacheReadTokens: 0, cacheWriteTokens: 0, cacheReadCost: 0, cacheWriteCost: 0, turns: 1, steps: 1, toolCalls: 0, cacheRate: 0, periodName: null },
+      ] },
+    },
+  ]
+  const days = queryDailyOverview(rows, { date: '', hour: '', sessionId: '', origin: '', route: '' })
+  assert.equal(days.length, 2)
+  assert.equal(days[0].date, localDateOfHour(yesterday.hour))
+  assert.equal(days[0].totals.cost, 5)
+  assert.equal(days[0].hours.length, 1)
+  assert.equal(days[1].date, localDateOfHour(morning.hour))
+  assert.equal(days[1].totals.cost, 5)
+  assert.equal(days[1].hours.length, 2)
+  assert.equal(overviewCost(rows), 10)
+  assert.equal(overviewCost(rows, localDateOfHour(morning.hour)), 5)
+  assert.equal(groupDailyOverview([]).length, 0)
+  assert.equal(localTodayDate(new Date(morning.hour).getTime()), localDateOfHour(morning.hour))
+})
+
+test('cost table switches dimension, filters columns, and sorts numeric fields', () => {
+  const morning = localHour(2026, 8, 23, 9)
+  const noon = localHour(2026, 8, 23, 12)
+  const entries = flattenHourlyEntries([
+    {
+      sessionId: 'sess-a', parentSession: null, origin: 'user',
+      cost: { cost: 5, inputTokens: 10, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 2, hourly: [
+        { ...morning, provider: 'wz', model: 'gpt', inputTokens: 10, outputTokens: 2, inputCost: 1, outputCost: 2, cost: 3, cacheReadTokens: 0, cacheWriteTokens: 0, cacheReadCost: 0, cacheWriteCost: 0, turns: 1, steps: 1, toolCalls: 0, cacheRate: 0, periodName: '低峰', contextMultiplier: 1, contextAfterTokens: null, rates: { input: 0.24, cacheRead: 0.024, cacheWrite: 0.024, output: 0.72 } },
+        { ...noon, provider: 'grok', model: 'grok-4.6', inputTokens: 8, outputTokens: 3, inputCost: 0.8, outputCost: 1.2, cost: 2, cacheReadTokens: 0, cacheWriteTokens: 0, cacheReadCost: 0, cacheWriteCost: 0, turns: 2, steps: 2, toolCalls: 1, cacheRate: 0, periodName: null, contextMultiplier: 2, contextAfterTokens: 200_000, rates: { input: 0.24, cacheRead: 0.06, cacheWrite: 0.06, output: 0.72 } },
+      ] },
+    },
+  ])
+  const timeRows = flattenCostTableRows(entries, 'time')
+  assert.equal(timeRows.length, 2)
+  assert.equal(timeRows[0].dimension.includes(localDateOfHour(morning.hour)), true)
+  assert.equal(timeRows[1].route, 'grok/grok-4.6')
+  const modelRows = flattenCostTableRows(entries, 'model')
+  assert.equal(modelRows[0].dimension, 'wz/gpt')
+  const filtered = queryCostTable(entries, 'time', { route: 'grok' }, defaultCostTableSort('time'))
+  assert.equal(filtered.length, 1)
+  assert.equal(filtered[0].cost, 2)
+  assert.equal(filtered[0].surcharge.includes('×2'), true)
+  const sorted = queryCostTable(entries, 'time', {}, { key: 'usage', dir: 'desc' })
+  assert.equal(sorted[0].cost, 3)
+  assert.equal(sorted[1].cost, 2)
+  assert.deepEqual(toggleCostTableSort({ key: 'usage', dir: 'desc' }, 'usage'), { key: 'usage', dir: 'asc' })
+  assert.deepEqual(toggleCostTableSort({ key: 'usage', dir: 'asc' }, 'route'), { key: 'route', dir: 'asc' })
+  assert.deepEqual(costTableColumnValues(timeRows, 'route'), ['grok/grok-4.6', 'wz/gpt'])
+  const totals = costTableTotals(timeRows)
+  assert.equal(totals.cost, 5)
+  assert.equal(totals.turns, 3)
+  assert.equal(timeRows[0].inputRate, 0.24)
+  assert.equal(formatUsageCell(1_000_000, 0.24, 1_000_000, '¥'), '1000000(0.24/0.24)')
+  assert.deepEqual(resolveVisibleCostColumns('time', defaultVisibleCostColumns('time'))[0], 'dimension')
+  assert.equal(resolveVisibleCostColumns('time', ['date', 'hourLabel', 'route']).includes('date'), false)
+  assert.equal(resolveVisibleCostColumns('time', ['date', 'hourLabel', 'route']).includes('route'), true)
+  assert.equal(resolveVisibleCostColumns('model', ['route', 'date'], 'parent').includes('route'), false)
+  assert.equal(resolveVisibleCostColumns('time', []).at(-1), 'usage')
+  assert.equal(resolveVisibleCostColumns('time', [], 'child').includes('sessionId'), false)
+  assert.equal(resolveVisibleCostColumns('time', ['sessionId'], 'child').includes('sessionId'), true)
+  const dateGroups = queryCostTableGroups(entries, 'time', {}, defaultCostTableSort('time'))
+  assert.equal(dateGroups.length, 1)
+  assert.equal(dateGroups[0].summary.dimension, localDateOfHour(morning.hour))
+  assert.equal(dateGroups[0].summary.cost, 5)
+  assert.equal(dateGroups[0].children.length, 2)
+  assert.equal(dateGroups[0].children[0].dimension.includes(':'), true)
+  const extra = flattenHourlyEntries([{
+    sessionId: 'sess-b', parentSession: null, origin: 'user',
+    cost: { cost: 4, inputTokens: 6, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 1, hourly: [
+      { ...morning, provider: 'wz', model: 'gpt', inputTokens: 6, outputTokens: 1, inputCost: 0.6, outputCost: 0.4, cost: 1, cacheReadTokens: 0, cacheWriteTokens: 0, cacheReadCost: 0, cacheWriteCost: 0, turns: 1, steps: 1, toolCalls: 0, cacheRate: 0, periodName: '低峰', contextMultiplier: 1, contextAfterTokens: null, rates: { input: 0.24, cacheRead: 0.024, cacheWrite: 0.024, output: 0.72 } },
+    ] },
+  }])
+  const modelGroups = groupCostTableRows(flattenCostTableRows([...entries, ...extra], 'model'), 'model')
+  const gpt = modelGroups.find(group => group.summary.dimension === 'wz/gpt')
+  assert.equal(gpt?.children.length, 2)
+  assert.equal(gpt?.summary.cost, 4)
+  const filteredGroups = queryCostTableGroups([...entries, ...extra], 'model', { route: 'grok' }, defaultCostTableSort('model'))
+  assert.equal(filteredGroups.length, 1)
+  assert.equal(filteredGroups[0].summary.dimension, 'grok/grok-4.6')
+  const childFiltered = queryCostTableGroups(entries, 'time', {}, defaultCostTableSort('time'), { sessionId: 'sess-a' }, { key: 'usage', dir: 'asc' })
+  assert.equal(childFiltered[0].children.length, 2)
+  assert.equal(childFiltered[0].children[0].cost, 2)
+  const childSortedDesc = queryCostTableGroups(entries, 'time', {}, defaultCostTableSort('time'), {}, { key: 'input', dir: 'desc' })
+  assert.equal(childSortedDesc[0].children[0].inputTokens, 10)
 })
