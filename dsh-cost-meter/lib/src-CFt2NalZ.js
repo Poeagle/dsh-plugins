@@ -867,6 +867,40 @@ function lastProbeAt(assignment) {
 	}
 	return null;
 }
+/** Dated discount-multiplier changes, newest last. Baseline `effectiveAt: 0` is omitted. */
+function multiplierHistoryRows(assignment) {
+	return (assignment?.discountMultiplierHistory ?? []).filter((entry) => Number.isFinite(entry.effectiveAt) && entry.effectiveAt > 0);
+}
+/** Latest probe or dated multiplier change, or null when none. */
+function lastUpdatedAt(assignment) {
+	const times = [lastProbeAt(assignment), multiplierHistoryRows(assignment).at(-1)?.effectiveAt].filter((value) => value !== void 0 && value !== null && value > 0);
+	return times.length === 0 ? null : Math.max(...times);
+}
+/** Keep previous history and append a manual change when the discount multiplier moved. */
+function assignmentWithManualMultiplier(previous, next, now) {
+	const history = next.discountMultiplierHistory ?? previous.discountMultiplierHistory;
+	const lastProbedAt = next.lastProbedAt ?? previous.lastProbedAt;
+	if (next.discountMultiplier === void 0 || next.discountMultiplier === previous.discountMultiplier) return {
+		...next,
+		...history !== void 0 ? { discountMultiplierHistory: history } : {},
+		...lastProbedAt !== void 0 ? { lastProbedAt } : {}
+	};
+	const last = [...history ?? []];
+	if (last.length === 0) last.push({
+		effectiveAt: 0,
+		discountMultiplier: previous.discountMultiplier ?? 1
+	});
+	if (last[last.length - 1]?.discountMultiplier !== next.discountMultiplier) last.push({
+		effectiveAt: Math.max(now, (last[last.length - 1]?.effectiveAt ?? -1) + 1),
+		discountMultiplier: next.discountMultiplier,
+		source: "manual"
+	});
+	return {
+		...next,
+		discountMultiplierHistory: last,
+		...lastProbedAt !== void 0 ? { lastProbedAt } : {}
+	};
+}
 /** Resolve the latest observed discount whose effective time is not after the request. */
 function discountMultiplierAt(assignment, time) {
 	const history = assignment?.discountMultiplierHistory ?? [];
@@ -1520,10 +1554,10 @@ function foldSession(events, config = DEFAULT_PRICING) {
 /** In-process cache of each session's own fold, keyed by pricing and log fingerprints. */
 function stableValue(value) {
 	if (Array.isArray(value)) return value.map(stableValue);
-	if (value !== null && typeof value === "object") return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stableValue(value[key])]));
+	if (value !== null && typeof value === "object") return Object.fromEntries(Object.keys(value).sort().filter((key) => key !== "lastProbedAt").map((key) => [key, stableValue(value[key])]));
 	return value;
 }
-/** Deterministic fingerprint of the live pricing used to value a fold. */
+/** Deterministic fingerprint of the live pricing used to value a fold. Probe timestamps do not change billed rates. */
 function pricingFingerprint(config) {
 	return JSON.stringify(stableValue(config));
 }
@@ -1625,280 +1659,6 @@ var SessionFoldCache = class {
 		for (const id of this.entries.keys()) if (!keep.has(id)) this.entries.delete(id);
 	}
 };
-//#endregion
-//#region src/usage-tap.ts
-/**
-* Read `reasoning_tokens` from an OpenAI-compat usage object.
-* Wanzhao grok keeps this disjoint from `completion_tokens`.
-* @param usage Wire `usage` object, or undefined when the chunk has none.
-* @returns A positive reasoning count, or 0 when the field is absent.
-*/
-function reasoningFromWireUsage(usage) {
-	if (usage === null || typeof usage !== "object") return 0;
-	const raw = usage;
-	const completionDetails = object(raw.completion_tokens_details);
-	const outputDetails = object(raw.output_tokens_details);
-	for (const value of [
-		raw.reasoning_tokens,
-		completionDetails.reasoning_tokens,
-		outputDetails.reasoning_tokens
-	]) if (typeof value === "number" && Number.isFinite(value) && value > 0) return value;
-	return 0;
-}
-/**
-* Record reasoning from one wire usage object onto the in-flight tap slot.
-* @param slot Request-local slot created around one `llm.stream` call.
-* @param usage Wire `usage` object.
-*/
-function applyWireUsage(slot, usage) {
-	const reasoning = reasoningFromWireUsage(usage);
-	if (reasoning > 0) slot.reasoningTokens = reasoning;
-}
-/**
-* Scan an SSE buffer for `data:` frames that carry `usage`.
-* Incomplete trailing JSON is ignored until more bytes arrive.
-* @param buffer Decoded SSE text received so far.
-* @param slot Request-local slot to update.
-*/
-function scanSseBuffer(buffer, slot) {
-	for (const line of buffer.split("\n")) {
-		const trimmed = line.trim();
-		if (!trimmed.startsWith("data:")) continue;
-		const data = trimmed.slice(5).trim();
-		if (data === "" || data === "[DONE]") continue;
-		try {
-			const payload = JSON.parse(data);
-			if (payload.usage !== void 0) applyWireUsage(slot, payload.usage);
-		} catch {}
-	}
-}
-/**
-* Attach captured reasoning onto a harness usage chunk if the adapter omitted it.
-* @param chunk One value yielded by `llm.stream`.
-* @param reasoningTokens Captured gateway reasoning count.
-* @returns The original chunk, or a shallow copy with `usage.reasoningTokens`.
-*/
-function attachReasoningToChunk(chunk, reasoningTokens) {
-	if (reasoningTokens === void 0 || reasoningTokens <= 0) return chunk;
-	if (chunk === null || typeof chunk !== "object") return chunk;
-	const typed = chunk;
-	if (typed.type !== "usage" || typed.usage === null || typeof typed.usage !== "object") return chunk;
-	const usage = typed.usage;
-	if (typeof usage.reasoningTokens === "number" && usage.reasoningTokens > 0) return chunk;
-	return {
-		...typed,
-		usage: {
-			...usage,
-			reasoningTokens
-		}
-	};
-}
-/**
-* @param input `fetch` input (URL string, URL, or Request).
-* @returns Whether this request is an OpenAI-compat completion/response call.
-*/
-function shouldTapRequest(input) {
-	const url = requestUrl(input);
-	return url.includes("/chat/completions") || url.includes("/responses");
-}
-/**
-* Pass upstream bytes through unchanged while parsing usage on the same chunks.
-* Reasoning is written to `slot` before the official client sees those bytes.
-* @param response Upstream `fetch` response. The body is consumed via a wrapper.
-* @param slot Request-local slot to update.
-* @returns A response with identical status, headers, and body bytes.
-*/
-function tapFetchResponse(response, slot) {
-	if (response.body === null) return response;
-	const reader = response.body.getReader();
-	const decoder = new TextDecoder();
-	let buffer = "";
-	const stream = new ReadableStream({
-		async pull(controller) {
-			const { done, value } = await reader.read();
-			if (done) {
-				buffer += decoder.decode();
-				ingestBuffer(buffer, slot);
-				controller.close();
-				return;
-			}
-			buffer += decoder.decode(value, { stream: true });
-			ingestBuffer(buffer, slot);
-			controller.enqueue(value);
-		},
-		cancel(reason) {
-			return reader.cancel(reason);
-		}
-	});
-	return new Response(stream, {
-		status: response.status,
-		statusText: response.statusText,
-		headers: response.headers
-	});
-}
-/**
-* Wrap `globalThis.fetch` so in-flight `llm.stream` calls can see gateway usage.
-* Responses outside an active tap slot, or to other URLs, pass through untouched.
-* @param slots Active stream slots. Async generators drop AsyncLocalStorage
-*   across `await`, so the fetch tap reads this stack, not ALS alone.
-* @returns Disposer that restores the previous `fetch`.
-*/
-function installFetchTap(slots) {
-	const original = globalThis.fetch;
-	if (typeof original !== "function") return () => {};
-	const tapped = async (input, init) => {
-		const response = await original(input, init);
-		const store = slots.at(-1);
-		if (store === void 0 || !shouldTapRequest(input)) return response;
-		return tapFetchResponse(response, store);
-	};
-	globalThis.fetch = tapped;
-	return () => {
-		if (globalThis.fetch === tapped) globalThis.fetch = original;
-	};
-}
-function popSlot(slots, store) {
-	const index = slots.lastIndexOf(store);
-	if (index >= 0) slots.splice(index, 1);
-}
-/**
-* Wrap `llm.stream` so each call has a tap slot and usage chunks carry reasoning.
-* The slot stays on the stack until the iterator settles so `fetch` inside an
-* async generator still sees it. AsyncLocalStorage does not survive that hop.
-* @param stream Original `llm.stream` bound to the service.
-* @param slots Active stream slots read by the fetch tap.
-* @returns A replacement `stream` with the same call signature.
-*/
-function wrapLlmStream(stream, slots) {
-	return (options) => {
-		const store = {};
-		slots.push(store);
-		let released = false;
-		const release = () => {
-			if (released) return;
-			released = true;
-			popSlot(slots, store);
-		};
-		let inner;
-		try {
-			inner = stream(options);
-		} catch (error) {
-			release();
-			throw error;
-		}
-		return { [Symbol.asyncIterator]() {
-			const iterator = inner[Symbol.asyncIterator]();
-			return {
-				next: async () => {
-					try {
-						const result = await iterator.next();
-						if (result.done) {
-							release();
-							return result;
-						}
-						return {
-							done: false,
-							value: attachReasoningToChunk(result.value, store.reasoningTokens)
-						};
-					} catch (error) {
-						release();
-						throw error;
-					}
-				},
-				return: async (value) => {
-					try {
-						return await (iterator.return?.(value) ?? Promise.resolve({
-							done: true,
-							value
-						}));
-					} finally {
-						release();
-					}
-				},
-				throw: async (error) => {
-					try {
-						return await (iterator.throw?.(error) ?? Promise.reject(error));
-					} finally {
-						release();
-					}
-				}
-			};
-		} };
-	};
-}
-/**
-* Wrap `llm.prepareCall` so the one-shot stream the agent loop actually
-* iterates also carries the fetch-tap slot. `preparedCall.stream` bypasses
-* `llm.stream`; wrapping only the latter leaves grok reasoning off the log.
-* @param prepareCall Original `llm.prepareCall` bound to the service.
-* @param slots Active stream slots read by the fetch tap.
-* @returns A replacement `prepareCall` that taps the returned stream.
-*/
-function wrapPrepareCall(prepareCall, slots) {
-	return async (config, signal) => {
-		const prepared = await prepareCall(config, signal);
-		if (prepared === null || typeof prepared !== "object" || typeof prepared.stream !== "function") return prepared;
-		return {
-			...prepared,
-			stream: wrapLlmStream(prepared.stream.bind(prepared), slots)
-		};
-	};
-}
-/**
-* Install the fetch tap and wrap `ctx.llm.stream` plus `ctx.llm.prepareCall`.
-* The agent loop dispatches through `preparedCall.stream`; title and
-* compaction still use `llm.stream`. Both must enter the same tap slot.
-* @param ctx Host context. `llm` is optional so tests without it still load.
-* @returns Disposer that unwraps fetch, `llm.stream`, and `llm.prepareCall`.
-*/
-function installUsageTap(ctx) {
-	const slots = [];
-	const restoreFetch = installFetchTap(slots);
-	let restoreLlm = () => {};
-	ctx.inject(["llm"], (inner) => {
-		const llm = inner.llm;
-		if (llm === void 0) return;
-		const restorers = [];
-		if (typeof llm.stream === "function") {
-			const original = llm.stream;
-			llm.stream = wrapLlmStream(original.bind(llm), slots);
-			restorers.push(() => {
-				llm.stream = original;
-			});
-		}
-		if (typeof llm.prepareCall === "function") {
-			const original = llm.prepareCall;
-			llm.prepareCall = wrapPrepareCall(original.bind(llm), slots);
-			restorers.push(() => {
-				llm.prepareCall = original;
-			});
-		}
-		restoreLlm = () => {
-			for (const restore of restorers) restore();
-		};
-	});
-	return () => {
-		restoreLlm();
-		restoreFetch();
-	};
-}
-function object(value) {
-	return value !== null && typeof value === "object" ? value : {};
-}
-function requestUrl(input) {
-	if (typeof input === "string") return input;
-	if (input instanceof URL) return input.href;
-	if (input !== null && typeof input === "object" && "url" in input) return String(input.url);
-	return "";
-}
-function ingestBuffer(buffer, slot) {
-	scanSseBuffer(buffer, slot);
-	const trimmed = buffer.trim();
-	if (!trimmed.startsWith("{")) return;
-	try {
-		applyWireUsage(slot, JSON.parse(trimmed).usage);
-	} catch {}
-}
 //#endregion
 //#region src/session-table.ts
 /** Pure session-overview query helpers shared by the host tests and the dock UI. */
@@ -2480,6 +2240,545 @@ function costTableTotals(rows) {
 	return out;
 }
 //#endregion
+//#region src/provider-balance.ts
+/** Live per-provider wallet/quota remaining from Sub2API-compatible `/v1/usage`. */
+const REQUEST_TIMEOUT_MS$1 = 1e4;
+const MAX_RESPONSE_BYTES$1 = 65536;
+const DEFAULT_CONCURRENCY = 4;
+/** Build a `/v1/{leaf}` endpoint without duplicating `/v1`. */
+function v1URL(baseURL, leaf) {
+	const url = new URL(baseURL);
+	const path = url.pathname.replace(/\/+$/, "");
+	url.pathname = `${path.endsWith("/v1") ? path : `${path}/v1`}/${leaf}`.replace(/\/{2,}/g, "/");
+	return url.toString();
+}
+/** Build the key-scoped usage endpoint without duplicating `/v1`. */
+function usageURL(baseURL) {
+	return v1URL(baseURL, "usage");
+}
+/** Build the provider-level models endpoint without duplicating `/v1`. */
+function modelsURL(baseURL) {
+	return v1URL(baseURL, "models");
+}
+/** True when the provider API is down and that same credential still has remaining funds. */
+function shouldRemoveUnavailableProvider(available, remaining) {
+	return available === false && remaining !== null && remaining > 0;
+}
+/** Pricing routes owned by one provider id. */
+function routesForProvider(models, provider) {
+	const prefix = `${provider}/`;
+	return Object.keys(models).filter((key) => key.startsWith(prefix));
+}
+/** Origin used to collapse providers that share a gateway host. */
+function gatewayOrigin(baseURL) {
+	try {
+		const url = new URL(baseURL);
+		if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+		return url.origin;
+	} catch {
+		return null;
+	}
+}
+function finiteNumber(value) {
+	return typeof value === "number" && Number.isFinite(value) ? value : void 0;
+}
+function firstFinite(...values) {
+	for (const value of values) {
+		const parsed = finiteNumber(value);
+		if (parsed !== void 0) return parsed;
+	}
+}
+/**
+* Read remaining funds from a Sub2API `/v1/usage` body.
+* Wallet mode exposes `balance`; quota and subscription modes expose `remaining`.
+*/
+function parseProviderBalance(value) {
+	if (value === null || typeof value !== "object") throw new Error("invalid usage response");
+	const body = value;
+	const quota = body.quota !== null && typeof body.quota === "object" ? body.quota : void 0;
+	const remaining = firstFinite(body.balance, body.remaining, quota?.remaining);
+	if (remaining === void 0) throw new Error("usage response has no remaining balance");
+	return {
+		remaining,
+		unit: typeof body.unit === "string" && body.unit !== "" ? body.unit : typeof quota?.unit === "string" && quota.unit !== "" ? quota.unit : "USD",
+		mode: typeof body.mode === "string" ? body.mode : null
+	};
+}
+/** One target per provider id that has a base URL and credential. */
+function listProviderBalanceTargets(providers) {
+	const out = [];
+	for (const [id, source] of Object.entries(providers ?? {})) {
+		if (id.trim() === "" || source.baseURL === void 0 || source.apiKeyEnv === void 0 || source.apiKeyEnv === "") continue;
+		if (gatewayOrigin(source.baseURL) === null) continue;
+		const name = typeof source.displayName === "string" && source.displayName.trim() !== "" ? source.displayName.trim() : id;
+		out.push({
+			provider: id,
+			name,
+			baseURL: source.baseURL,
+			apiKeyEnv: source.apiKeyEnv
+		});
+	}
+	return out.sort((a, b) => a.provider.localeCompare(b.provider));
+}
+/** Collapse configured providers onto one probe group per gateway origin. */
+function groupProviderBalanceTargetsByOrigin(targets) {
+	const groups = /* @__PURE__ */ new Map();
+	for (const target of targets) {
+		const origin = gatewayOrigin(target.baseURL);
+		if (origin === null) continue;
+		const list = groups.get(origin);
+		if (list === void 0) groups.set(origin, [target]);
+		else list.push(target);
+	}
+	return [...groups.entries()].sort((left, right) => left[0].localeCompare(right[0])).map(([origin, grouped]) => ({
+		origin,
+		targets: grouped
+	}));
+}
+async function readBoundedJson$1(response) {
+	const reader = response.body?.getReader();
+	if (reader === void 0) return response.json();
+	const chunks = [];
+	let total = 0;
+	while (true) {
+		const next = await reader.read();
+		if (next.done) break;
+		total += next.value.byteLength;
+		if (total > MAX_RESPONSE_BYTES$1) {
+			await reader.cancel();
+			throw new Error("usage response exceeds 64 KiB");
+		}
+		chunks.push(next.value);
+	}
+	const bytes = new Uint8Array(total);
+	let offset = 0;
+	for (const chunk of chunks) {
+		bytes.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	return JSON.parse(new TextDecoder().decode(bytes));
+}
+/** Remaining balance for one provider credential. Failures keep `remaining: null`. */
+async function probeProviderBalance(target, credentials, fetchImpl = fetch, now = Date.now) {
+	const observedAt = now();
+	const failed = (error) => ({
+		provider: target.provider,
+		name: target.name,
+		origin: gatewayOrigin(target.baseURL) ?? target.baseURL,
+		remaining: null,
+		unit: "USD",
+		mode: null,
+		error,
+		observedAt
+	});
+	const credential = await credentials?.resolve(target.apiKeyEnv);
+	if (credential === void 0 || credential.value === "") return failed(`credential ${target.apiKeyEnv} is unavailable`);
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS$1);
+	try {
+		const response = await fetchImpl(usageURL(target.baseURL), {
+			method: "GET",
+			headers: {
+				accept: "application/json",
+				authorization: `Bearer ${credential.value}`
+			},
+			redirect: "error",
+			signal: controller.signal
+		});
+		if (!response.ok) return failed(`HTTP ${response.status}`);
+		const parsed = parseProviderBalance(await readBoundedJson$1(response));
+		const origin = gatewayOrigin(target.baseURL) ?? target.baseURL;
+		return {
+			provider: target.provider,
+			name: new URL(origin).host,
+			origin,
+			remaining: parsed.remaining,
+			unit: parsed.unit,
+			mode: parsed.mode,
+			observedAt: now()
+		};
+	} catch (error) {
+		return failed(error instanceof Error ? error.message : String(error));
+	} finally {
+		clearTimeout(timeout);
+	}
+}
+/** Provider-level `/v1/models` availability for one credential. */
+async function probeProviderAvailability(target, credentials, fetchImpl = fetch) {
+	const credential = await credentials?.resolve(target.apiKeyEnv);
+	if (credential === void 0 || credential.value === "") return {
+		provider: target.provider,
+		available: false,
+		error: `credential ${target.apiKeyEnv} is unavailable`
+	};
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS$1);
+	try {
+		const response = await fetchImpl(modelsURL(target.baseURL), {
+			method: "GET",
+			headers: {
+				accept: "application/json",
+				authorization: `Bearer ${credential.value}`
+			},
+			redirect: "error",
+			signal: controller.signal
+		});
+		if (response.ok) return {
+			provider: target.provider,
+			available: true
+		};
+		return {
+			provider: target.provider,
+			available: false,
+			error: `HTTP ${response.status}`
+		};
+	} catch (error) {
+		return {
+			provider: target.provider,
+			available: false,
+			error: error instanceof Error ? error.message : String(error)
+		};
+	} finally {
+		clearTimeout(timeout);
+	}
+}
+function succeeded(row) {
+	return row.remaining !== null && row.error === void 0;
+}
+function gatewayHost(origin) {
+	try {
+		return new URL(origin).host;
+	} catch {
+		return origin;
+	}
+}
+/** True when `origin` is an http(s) wallet URL that can be opened. */
+function walletHref(origin) {
+	if (origin === void 0 || origin === "") return void 0;
+	try {
+		const url = new URL(origin);
+		if (url.protocol !== "http:" && url.protocol !== "https:") return void 0;
+		return url.origin;
+	} catch {
+		return;
+	}
+}
+/**
+* One chip per gateway origin. Failed probes and rows without an openable
+* origin are dropped so a chip never appears without a host and href.
+*/
+function collapseBalanceChips(rows) {
+	const order = [];
+	const byOrigin = /* @__PURE__ */ new Map();
+	for (const row of rows) {
+		if (!succeeded(row)) continue;
+		const origin = walletHref(row.origin);
+		if (origin === void 0 || byOrigin.has(origin)) continue;
+		order.push(origin);
+		byOrigin.set(origin, {
+			...row,
+			origin,
+			name: gatewayHost(origin)
+		});
+	}
+	return order.map((origin) => byOrigin.get(origin));
+}
+/** Fetch remaining balance once per gateway origin. Failed origins are omitted. */
+async function collectProviderBalances(input) {
+	const groups = groupProviderBalanceTargetsByOrigin(listProviderBalanceTargets(input.providers));
+	if (groups.length === 0) return [];
+	const fetchImpl = input.fetchImpl ?? fetch;
+	const now = input.now ?? Date.now;
+	const rows = await mapWithConcurrency(groups, input.concurrency ?? DEFAULT_CONCURRENCY, async (group) => {
+		for (const target of group.targets) {
+			const row = await probeProviderBalance(target, input.credentials, fetchImpl, now);
+			if (succeeded(row)) return {
+				...row,
+				origin: group.origin,
+				name: new URL(group.origin).host
+			};
+		}
+		return null;
+	});
+	const out = [];
+	for (const row of rows) if (row !== null) out.push(row);
+	return out;
+}
+//#endregion
+//#region src/usage-tap.ts
+/**
+* Read `reasoning_tokens` from an OpenAI-compat usage object.
+* Wanzhao grok keeps this disjoint from `completion_tokens`.
+* @param usage Wire `usage` object, or undefined when the chunk has none.
+* @returns A positive reasoning count, or 0 when the field is absent.
+*/
+function reasoningFromWireUsage(usage) {
+	if (usage === null || typeof usage !== "object") return 0;
+	const raw = usage;
+	const completionDetails = object(raw.completion_tokens_details);
+	const outputDetails = object(raw.output_tokens_details);
+	for (const value of [
+		raw.reasoning_tokens,
+		completionDetails.reasoning_tokens,
+		outputDetails.reasoning_tokens
+	]) if (typeof value === "number" && Number.isFinite(value) && value > 0) return value;
+	return 0;
+}
+/**
+* Record reasoning from one wire usage object onto the in-flight tap slot.
+* @param slot Request-local slot created around one `llm.stream` call.
+* @param usage Wire `usage` object.
+*/
+function applyWireUsage(slot, usage) {
+	const reasoning = reasoningFromWireUsage(usage);
+	if (reasoning > 0) slot.reasoningTokens = reasoning;
+}
+/**
+* Scan an SSE buffer for `data:` frames that carry `usage`.
+* Incomplete trailing JSON is ignored until more bytes arrive.
+* @param buffer Decoded SSE text received so far.
+* @param slot Request-local slot to update.
+*/
+function scanSseBuffer(buffer, slot) {
+	for (const line of buffer.split("\n")) {
+		const trimmed = line.trim();
+		if (!trimmed.startsWith("data:")) continue;
+		const data = trimmed.slice(5).trim();
+		if (data === "" || data === "[DONE]") continue;
+		try {
+			const payload = JSON.parse(data);
+			if (payload.usage !== void 0) applyWireUsage(slot, payload.usage);
+		} catch {}
+	}
+}
+/**
+* Attach captured reasoning onto a harness usage chunk if the adapter omitted it.
+* @param chunk One value yielded by `llm.stream`.
+* @param reasoningTokens Captured gateway reasoning count.
+* @returns The original chunk, or a shallow copy with `usage.reasoningTokens`.
+*/
+function attachReasoningToChunk(chunk, reasoningTokens) {
+	if (reasoningTokens === void 0 || reasoningTokens <= 0) return chunk;
+	if (chunk === null || typeof chunk !== "object") return chunk;
+	const typed = chunk;
+	if (typed.type !== "usage" || typed.usage === null || typeof typed.usage !== "object") return chunk;
+	const usage = typed.usage;
+	if (typeof usage.reasoningTokens === "number" && usage.reasoningTokens > 0) return chunk;
+	return {
+		...typed,
+		usage: {
+			...usage,
+			reasoningTokens
+		}
+	};
+}
+/**
+* @param input `fetch` input (URL string, URL, or Request).
+* @returns Whether this request is an OpenAI-compat completion/response call.
+*/
+function shouldTapRequest(input) {
+	const url = requestUrl(input);
+	return url.includes("/chat/completions") || url.includes("/responses");
+}
+/**
+* Pass upstream bytes through unchanged while parsing usage on the same chunks.
+* Reasoning is written to `slot` before the official client sees those bytes.
+* @param response Upstream `fetch` response. The body is consumed via a wrapper.
+* @param slot Request-local slot to update.
+* @returns A response with identical status, headers, and body bytes.
+*/
+function tapFetchResponse(response, slot) {
+	if (response.body === null) return response;
+	const reader = response.body.getReader();
+	const decoder = new TextDecoder();
+	let buffer = "";
+	const stream = new ReadableStream({
+		async pull(controller) {
+			const { done, value } = await reader.read();
+			if (done) {
+				buffer += decoder.decode();
+				ingestBuffer(buffer, slot);
+				controller.close();
+				return;
+			}
+			buffer += decoder.decode(value, { stream: true });
+			ingestBuffer(buffer, slot);
+			controller.enqueue(value);
+		},
+		cancel(reason) {
+			return reader.cancel(reason);
+		}
+	});
+	return new Response(stream, {
+		status: response.status,
+		statusText: response.statusText,
+		headers: response.headers
+	});
+}
+/**
+* Wrap `globalThis.fetch` so in-flight `llm.stream` calls can see gateway usage.
+* Responses outside an active tap slot, or to other URLs, pass through untouched.
+* @param slots Active stream slots. Async generators drop AsyncLocalStorage
+*   across `await`, so the fetch tap reads this stack, not ALS alone.
+* @returns Disposer that restores the previous `fetch`.
+*/
+function installFetchTap(slots) {
+	const original = globalThis.fetch;
+	if (typeof original !== "function") return () => {};
+	const tapped = async (input, init) => {
+		const response = await original(input, init);
+		const store = slots.at(-1);
+		if (store === void 0 || !shouldTapRequest(input)) return response;
+		return tapFetchResponse(response, store);
+	};
+	globalThis.fetch = tapped;
+	return () => {
+		if (globalThis.fetch === tapped) globalThis.fetch = original;
+	};
+}
+function popSlot(slots, store) {
+	const index = slots.lastIndexOf(store);
+	if (index >= 0) slots.splice(index, 1);
+}
+/**
+* Wrap `llm.stream` so each call has a tap slot and usage chunks carry reasoning.
+* The slot stays on the stack until the iterator settles so `fetch` inside an
+* async generator still sees it. AsyncLocalStorage does not survive that hop.
+* @param stream Original `llm.stream` bound to the service.
+* @param slots Active stream slots read by the fetch tap.
+* @returns A replacement `stream` with the same call signature.
+*/
+function wrapLlmStream(stream, slots) {
+	return (options) => {
+		const store = {};
+		slots.push(store);
+		let released = false;
+		const release = () => {
+			if (released) return;
+			released = true;
+			popSlot(slots, store);
+		};
+		let inner;
+		try {
+			inner = stream(options);
+		} catch (error) {
+			release();
+			throw error;
+		}
+		return { [Symbol.asyncIterator]() {
+			const iterator = inner[Symbol.asyncIterator]();
+			return {
+				next: async () => {
+					try {
+						const result = await iterator.next();
+						if (result.done) {
+							release();
+							return result;
+						}
+						return {
+							done: false,
+							value: attachReasoningToChunk(result.value, store.reasoningTokens)
+						};
+					} catch (error) {
+						release();
+						throw error;
+					}
+				},
+				return: async (value) => {
+					try {
+						return await (iterator.return?.(value) ?? Promise.resolve({
+							done: true,
+							value
+						}));
+					} finally {
+						release();
+					}
+				},
+				throw: async (error) => {
+					try {
+						return await (iterator.throw?.(error) ?? Promise.reject(error));
+					} finally {
+						release();
+					}
+				}
+			};
+		} };
+	};
+}
+/**
+* Wrap `llm.prepareCall` so the one-shot stream the agent loop actually
+* iterates also carries the fetch-tap slot. `preparedCall.stream` bypasses
+* `llm.stream`; wrapping only the latter leaves grok reasoning off the log.
+* @param prepareCall Original `llm.prepareCall` bound to the service.
+* @param slots Active stream slots read by the fetch tap.
+* @returns A replacement `prepareCall` that taps the returned stream.
+*/
+function wrapPrepareCall(prepareCall, slots) {
+	return async (config, signal) => {
+		const prepared = await prepareCall(config, signal);
+		if (prepared === null || typeof prepared !== "object" || typeof prepared.stream !== "function") return prepared;
+		return {
+			...prepared,
+			stream: wrapLlmStream(prepared.stream.bind(prepared), slots)
+		};
+	};
+}
+/**
+* Install the fetch tap and wrap `ctx.llm.stream` plus `ctx.llm.prepareCall`.
+* The agent loop dispatches through `preparedCall.stream`; title and
+* compaction still use `llm.stream`. Both must enter the same tap slot.
+* @param ctx Host context. `llm` is optional so tests without it still load.
+* @returns Disposer that unwraps fetch, `llm.stream`, and `llm.prepareCall`.
+*/
+function installUsageTap(ctx) {
+	const slots = [];
+	const restoreFetch = installFetchTap(slots);
+	let restoreLlm = () => {};
+	ctx.inject(["llm"], (inner) => {
+		const llm = inner.llm;
+		if (llm === void 0) return;
+		const restorers = [];
+		if (typeof llm.stream === "function") {
+			const original = llm.stream;
+			llm.stream = wrapLlmStream(original.bind(llm), slots);
+			restorers.push(() => {
+				llm.stream = original;
+			});
+		}
+		if (typeof llm.prepareCall === "function") {
+			const original = llm.prepareCall;
+			llm.prepareCall = wrapPrepareCall(original.bind(llm), slots);
+			restorers.push(() => {
+				llm.prepareCall = original;
+			});
+		}
+		restoreLlm = () => {
+			for (const restore of restorers) restore();
+		};
+	});
+	return () => {
+		restoreLlm();
+		restoreFetch();
+	};
+}
+function object(value) {
+	return value !== null && typeof value === "object" ? value : {};
+}
+function requestUrl(input) {
+	if (typeof input === "string") return input;
+	if (input instanceof URL) return input.href;
+	if (input !== null && typeof input === "object" && "url" in input) return String(input.url);
+	return "";
+}
+function ingestBuffer(buffer, slot) {
+	scanSseBuffer(buffer, slot);
+	const trimmed = buffer.trim();
+	if (!trimmed.startsWith("{")) return;
+	try {
+		applyWireUsage(slot, JSON.parse(trimmed).usage);
+	} catch {}
+}
+//#endregion
 //#region src/upstream-billing-probe.ts
 const REQUEST_TIMEOUT_MS = 1e4;
 const MAX_RESPONSE_BYTES = 65536;
@@ -2510,21 +2809,22 @@ function parseBillingMultiplier(value) {
 		observedAt: Number.isFinite(observedAt) ? observedAt : void 0
 	};
 }
-/** Append a newly observed multiplier without changing pricing before observation time. */
+/** Record the latest successful probe time; change the live multiplier only when it differs. */
 function assignmentWithObservedMultiplier(assignment, multiplier, observedAt) {
 	const history = [...assignment.discountMultiplierHistory ?? []];
 	if (history.length === 0) history.push({
 		effectiveAt: BASELINE_EFFECTIVE_AT,
 		discountMultiplier: multiplierOrOne(assignment.discountMultiplier)
 	});
-	if ((history[history.length - 1]?.discountMultiplier ?? multiplierOrOne(assignment.discountMultiplier)) !== multiplier) history.push({
+	const changed = (history[history.length - 1]?.discountMultiplier ?? multiplierOrOne(assignment.discountMultiplier)) !== multiplier;
+	if (changed) history.push({
 		effectiveAt: Math.max(observedAt, (history[history.length - 1]?.effectiveAt ?? -1) + 1),
 		discountMultiplier: multiplier,
 		source: "probe"
 	});
 	return {
 		...assignment,
-		discountMultiplier: multiplier,
+		discountMultiplier: changed ? multiplier : assignment.discountMultiplier,
 		discountMultiplierHistory: history,
 		lastProbedAt: Math.max(observedAt, assignment.lastProbedAt ?? 0)
 	};
@@ -2551,6 +2851,11 @@ async function readBoundedJson(response) {
 		offset += chunk.byteLength;
 	}
 	return JSON.parse(new TextDecoder().decode(bytes));
+}
+/** Successful and unsupported endpoints wait `intervalMinutes`; failed probes retry on the next tick. */
+function nextBillingProbeDue(now, intervalMinutes, status) {
+	if (status === "ok" || status === "unsupported") return now + Math.max(1, intervalMinutes) * 6e4;
+	return now + 6e4;
 }
 async function probe(baseURL, apiKeyEnv, credentials) {
 	const credential = await credentials?.resolve(apiKeyEnv);
@@ -2595,8 +2900,6 @@ async function probe(baseURL, apiKeyEnv, credentials) {
 }
 /** Install one process-local runner; settings persist multiplier history across restarts. */
 function installUpstreamBillingProbes(ctx, scope) {
-	const credentials = ctx.get("credentials");
-	const settings = ctx.get("settings");
 	const due = /* @__PURE__ */ new Map();
 	let disposed = false;
 	let timer;
@@ -2613,36 +2916,57 @@ function installUpstreamBillingProbes(ctx, scope) {
 		if (disposed || running) return;
 		running = true;
 		try {
-			const config = normalizePricing(scope.get());
-			const billing = config.billingProbe;
+			const billing = normalizePricing(scope.get()).billingProbe;
 			if (billing?.enabled !== true) return;
+			const credentials = ctx.get("credentials");
+			const settings = ctx.get("settings");
 			const providers = (settings?.get("llm-pi-ai"))?.providers ?? {};
 			const now = Date.now();
-			const targets = /* @__PURE__ */ new Map();
-			for (const route of Object.keys(config.models)) {
-				const provider = route.slice(0, route.indexOf("/"));
-				if (billing.providers !== void 0 && !billing.providers.includes(provider)) continue;
-				const source = providers[provider];
-				if (source?.baseURL === void 0 || source.apiKeyEnv === void 0 || source.apiKeyEnv === "") continue;
-				const identity = `${source.baseURL}\u0000${source.apiKeyEnv}`;
-				if ((due.get(identity) ?? 0) <= now) targets.set(identity, {
-					provider,
-					baseURL: source.baseURL,
-					apiKeyEnv: source.apiKeyEnv
-				});
-			}
-			const results = await mapWithConcurrency([...targets.values()], billing.concurrency ?? 2, async (target) => ({
-				target,
-				result: await probe(target.baseURL, target.apiKeyEnv, credentials)
-			}));
+			const allowed = billing.providers === void 0 ? void 0 : new Set(billing.providers);
+			const results = await mapWithConcurrency(listProviderBalanceTargets(providers).filter((target) => allowed === void 0 || allowed.has(target.provider)).filter((target) => (due.get(target.provider) ?? 0) <= now), billing.concurrency ?? 2, async (target) => {
+				const [availability, usage, result] = await Promise.all([
+					probeProviderAvailability(target, credentials),
+					probeProviderBalance(target, credentials),
+					probe(target.baseURL, target.apiKeyEnv, credentials)
+				]);
+				return {
+					target,
+					availability,
+					usage,
+					result
+				};
+			});
 			if (disposed) return;
 			const patched = {};
 			const latest = normalizePricing(scope.get());
+			const removedProviders = [];
 			for (const item of results) {
 				if (item === null) continue;
-				due.set(`${item.target.baseURL}\u0000${item.target.apiKeyEnv}`, Date.now() + (billing.intervalMinutes ?? 30) * 6e4);
-				if (item.result.status !== "ok" || item.result.multiplier === void 0) continue;
+				due.set(item.target.provider, nextBillingProbeDue(Date.now(), billing.intervalMinutes ?? 30, item.result.status));
+				if (shouldRemoveUnavailableProvider(item.availability.available, item.usage.remaining)) {
+					removedProviders.push(item.target.provider);
+					ctx.logger?.warn?.("cost-meter removing unavailable provider %s with remaining %s", item.target.provider, String(item.usage.remaining));
+					continue;
+				}
+				if (item.result.status !== "ok" || item.result.multiplier === void 0) {
+					ctx.logger?.warn?.("cost-meter billing probe %s: %s", item.target.provider, item.result.error ?? item.result.status);
+					continue;
+				}
 				for (const [route, assignment] of Object.entries(latest.models)) if (route.startsWith(`${item.target.provider}/`)) patched[route] = assignmentWithObservedMultiplier(assignment, item.result.multiplier, item.result.observedAt ?? Date.now());
+			}
+			if (removedProviders.length > 0 && settings?.mutate !== void 0) {
+				const unique = [...new Set(removedProviders)];
+				for (const provider of unique) for (const route of Object.keys(patched)) if (route.startsWith(`${provider}/`)) delete patched[route];
+				const current = normalizePricing(scope.get());
+				const modelOps = unique.flatMap((provider) => routesForProvider(current.models, provider).map((route) => ({
+					op: "unset",
+					path: ["models", route]
+				})));
+				if (modelOps.length > 0) await settings.mutate("cost-meter", modelOps);
+				await settings.mutate("llm-pi-ai", unique.map((provider) => ({
+					op: "unset",
+					path: ["providers", provider]
+				})));
 			}
 			if (Object.keys(patched).length > 0) await scope.update({ models: patched });
 		} finally {
@@ -2784,6 +3108,8 @@ var CostMeterService = class extends TypertRemoteService {
 	static Config = Config;
 	static inject = ["settings"];
 	folds = new SessionFoldCache();
+	inflightCosts = /* @__PURE__ */ new Map();
+	inflightOverview;
 	constructor(ctx) {
 		super(ctx, "costMeter");
 		ctx.effect(() => installUsageTap(ctx));
@@ -2791,6 +3117,24 @@ var CostMeterService = class extends TypertRemoteService {
 	/** Compute one session's cost together with every descendant subagent session. */
 	async sessionCost(sessionId) {
 		if (typeof sessionId !== "string" || sessionId.length === 0) return null;
+		const pending = this.inflightCosts.get(sessionId);
+		if (pending !== void 0) return pending;
+		const work = this.computeSessionCost(sessionId).finally(() => {
+			if (this.inflightCosts.get(sessionId) === work) this.inflightCosts.delete(sessionId);
+		});
+		this.inflightCosts.set(sessionId, work);
+		return work;
+	}
+	/** Fold every listed session independently for the all-session overview. */
+	async sessionCosts() {
+		if (this.inflightOverview !== void 0) return this.inflightOverview;
+		const work = this.computeSessionCosts().finally(() => {
+			if (this.inflightOverview === work) this.inflightOverview = void 0;
+		});
+		this.inflightOverview = work;
+		return work;
+	}
+	async computeSessionCost(sessionId) {
 		const sessions = this.ctx.get("sessions");
 		const query = this.ctx.get("sessionQuery");
 		const config = normalizePricing(this.ctx.settings.get(SETTINGS_NS) ?? DEFAULT_PRICING);
@@ -2799,12 +3143,21 @@ var CostMeterService = class extends TypertRemoteService {
 		if (query === void 0) return cost;
 		return mergeCosts(cost, await readSubagentTree(query, subagentChildren(await query.listSessions()), sessionId, config, /* @__PURE__ */ new Set([sessionId]), sessions, this.folds));
 	}
-	/** Fold every listed session independently for the all-session overview. */
-	async sessionCosts() {
+	async computeSessionCosts() {
 		const query = this.ctx.get("sessionQuery");
 		const sessions = this.ctx.get("sessions");
 		return collectSessionCosts(query, normalizePricing(this.ctx.settings.get(SETTINGS_NS) ?? DEFAULT_PRICING), this.folds, sessions);
 	}
+	/** Remaining balance once per gateway origin; failed origins are omitted. */
+	async providerBalances() {
+		const settings = this.ctx.get("settings");
+		const credentials = this.ctx.get("credentials");
+		const providers = (settings?.get("llm-pi-ai"))?.providers;
+		return collectProviderBalances({
+			providers,
+			credentials
+		});
+	}
 };
 //#endregion
-export { applyWireUsage as $, localDateOfHour as A, queryDailyOverview as B, formatRatedCost as C, resolveContextSurcharge as Ct, groupDailyOverview as D, validatePricing as Dt, groupCostTableRows as E, routeKey as Et, metricTokens as F, sessionRoutes as G, querySessionRows as H, optionalCostTableColumns as I, sortCostTableRows as J, sessionTotalTokens as K, overviewCost as L, mapWithConcurrency as M, mergeListedSessionCost as N, groupHourlyEntries as O, metricCost as P, toggleSessionTableSort as Q, queryCostTable as R, formatMoneyAmount as S, resolveContextMultiplier as St, formatUsageCell as T, resolveReasoningExtra as Tt, resolveVisibleCostColumns as U, queryHourlyOverview as V, rowTotalTokens as W, sumHourlySlices as X, sortSessionRows as Y, toggleCostTableSort as Z, filterHourlyEntries as _, formatContextSurcharge as _t, billingProbeURL as a, tapFetchResponse as at, flattenHourlyEntries as b, normalizePricing as bt, activityText as c, SessionFoldCache as ct, costTableTotals as d, DEFAULT_GROUP as dt, attachReasoningToChunk as et, defaultChildCostTableSort as f, DEFAULT_PRICING as ft, filterCostTableRows as g, foldSession as gt, displayCellText as h, discountMultiplierAt as ht, assignmentWithObservedMultiplier as i, shouldTapRequest as it, localTodayDate as j, isNumericCostTableColumn as k, averageUnitPrice as l, logFingerprint as lt, defaultVisibleCostColumns as m, contextTokensOf as mt, CostMeterService as n, reasoningFromWireUsage as nt, installUpstreamBillingProbes as o, wrapLlmStream as ot, defaultCostTableSort as p, billedOutputTokens as pt, sharedContextSurcharge as q, collectSessionCosts as r, scanSseBuffer as rt, parseBillingMultiplier as s, wrapPrepareCall as st, Config as t, installUsageTap as tt, costTableColumnValues as u, pricingFingerprint as ut, filterSessionRows as v, formatTokenThreshold as vt, formatUnitTokensLabel as w, resolvePricing as wt, formatCacheRatedCost as x, normalizeUsage as xt, flattenCostTableRows as y, lastProbeAt as yt, queryCostTableGroups as z };
+export { localDateOfHour as $, walletHref as A, discountMultiplierAt as At, filterHourlyEntries as B, resolveContextSurcharge as Bt, modelsURL as C, logFingerprint as Ct, routesForProvider as D, assignmentWithManualMultiplier as Dt, probeProviderBalance as E, DEFAULT_PRICING as Et, defaultChildCostTableSort as F, lastUpdatedAt as Ft, formatMoneyAmount as G, flattenCostTableRows as H, resolveReasoningExtra as Ht, defaultCostTableSort as I, multiplierHistoryRows as It, formatUsageCell as J, formatRatedCost as K, defaultVisibleCostColumns as L, normalizePricing as Lt, averageUnitPrice as M, formatContextSurcharge as Mt, costTableColumnValues as N, formatTokenThreshold as Nt, shouldRemoveUnavailableProvider as O, billedOutputTokens as Ot, costTableTotals as P, lastProbeAt as Pt, isNumericCostTableColumn as Q, displayCellText as R, normalizeUsage as Rt, listProviderBalanceTargets as S, SessionFoldCache as St, probeProviderAvailability as T, DEFAULT_GROUP as Tt, flattenHourlyEntries as U, routeKey as Ut, filterSessionRows as V, resolvePricing as Vt, formatCacheRatedCost as W, validatePricing as Wt, groupDailyOverview as X, groupCostTableRows as Y, groupHourlyEntries as Z, wrapPrepareCall as _, sortCostTableRows as _t, billingProbeURL as a, optionalCostTableColumns as at, gatewayOrigin as b, toggleCostTableSort as bt, parseBillingMultiplier as c, queryCostTableGroups as ct, installUsageTap as d, querySessionRows as dt, localTodayDate as et, reasoningFromWireUsage as f, resolveVisibleCostColumns as ft, wrapLlmStream as g, sharedContextSurcharge as gt, tapFetchResponse as h, sessionTotalTokens as ht, assignmentWithObservedMultiplier as i, metricTokens as it, activityText as j, foldSession as jt, usageURL as k, contextTokensOf as kt, applyWireUsage as l, queryDailyOverview as lt, shouldTapRequest as m, sessionRoutes as mt, CostMeterService as n, mergeListedSessionCost as nt, installUpstreamBillingProbes as o, overviewCost as ot, scanSseBuffer as p, rowTotalTokens as pt, formatUnitTokensLabel as q, collectSessionCosts as r, metricCost as rt, nextBillingProbeDue as s, queryCostTable as st, Config as t, mapWithConcurrency as tt, attachReasoningToChunk as u, queryHourlyOverview as ut, collapseBalanceChips as v, sortSessionRows as vt, parseProviderBalance as w, pricingFingerprint as wt, groupProviderBalanceTargetsByOrigin as x, toggleSessionTableSort as xt, collectProviderBalances as y, sumHourlySlices as yt, filterCostTableRows as z, resolveContextMultiplier as zt };

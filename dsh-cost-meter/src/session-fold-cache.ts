@@ -13,13 +13,14 @@ function stableValue(value: unknown): unknown {
     return Object.fromEntries(
       Object.keys(value as Record<string, unknown>)
         .sort()
+        .filter(key => key !== 'lastProbedAt')
         .map(key => [key, stableValue((value as Record<string, unknown>)[key])]),
     )
   }
   return value
 }
 
-/** Deterministic fingerprint of the live pricing used to value a fold. */
+/** Deterministic fingerprint of the live pricing used to value a fold. Probe timestamps do not change billed rates. */
 export function pricingFingerprint(config: PricingConfig): string {
   return JSON.stringify(stableValue(config))
 }

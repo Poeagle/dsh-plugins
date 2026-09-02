@@ -9,6 +9,9 @@ import {
   billedOutputTokens,
   discountMultiplierAt,
   lastProbeAt,
+  lastUpdatedAt,
+  multiplierHistoryRows,
+  assignmentWithManualMultiplier,
   contextTokensOf,
   foldSession,
   formatContextSurcharge,
@@ -26,10 +29,12 @@ import {
   type PricingConfig,
 } from './pricing.js'
 import { SessionFoldCache, logFingerprint, pricingFingerprint } from './session-fold-cache.js'
+import { collectProviderBalances, type ProviderBalance, type ProviderSource } from './provider-balance.js'
 import { installUsageTap } from './usage-tap.js'
 
-export { DEFAULT_GROUP, DEFAULT_PRICING, billedOutputTokens, contextTokensOf, discountMultiplierAt, foldSession, formatContextSurcharge, formatTokenThreshold, lastProbeAt, normalizePricing, normalizeUsage, resolveContextMultiplier, resolveContextSurcharge, resolvePricing, resolveReasoningExtra, routeKey, validatePricing }
-export { assignmentWithObservedMultiplier, billingProbeURL, parseBillingMultiplier } from './upstream-billing-probe.js'
+export { DEFAULT_GROUP, DEFAULT_PRICING, assignmentWithManualMultiplier, billedOutputTokens, contextTokensOf, discountMultiplierAt, foldSession, formatContextSurcharge, formatTokenThreshold, lastProbeAt, lastUpdatedAt, multiplierHistoryRows, normalizePricing, normalizeUsage, resolveContextMultiplier, resolveContextSurcharge, resolvePricing, resolveReasoningExtra, routeKey, validatePricing }
+export { assignmentWithObservedMultiplier, billingProbeURL, nextBillingProbeDue, parseBillingMultiplier } from './upstream-billing-probe.js'
+export { collapseBalanceChips, collectProviderBalances, gatewayOrigin, groupProviderBalanceTargetsByOrigin, listProviderBalanceTargets, modelsURL, parseProviderBalance, probeProviderAvailability, probeProviderBalance, routesForProvider, shouldRemoveUnavailableProvider, usageURL, walletHref } from './provider-balance.js'
 export { applyWireUsage, attachReasoningToChunk, installUsageTap, reasoningFromWireUsage, scanSseBuffer, shouldTapRequest, tapFetchResponse, wrapLlmStream, wrapPrepareCall } from './usage-tap.js'
 export { SessionFoldCache, logFingerprint, pricingFingerprint }
 export {
@@ -80,6 +85,7 @@ export {
   toggleSessionTableSort,
 } from './session-table.js'
 export type { BillingProbeConfig, ContextSurcharge, CostDetail, CostFold, CostSubagent, HourlyDetail, ModelAssignment, MultiplierHistoryEntry, PartialTokenRates, PricingConfig, PricingGroup, PricingPeriod, PricingPlan, TokenRates } from './pricing.js'
+export type { ProviderBalance, ProviderBalanceTarget, ProviderSource } from './provider-balance.js'
 export type {
   CostDisplayColumn,
   CostRateKind,
@@ -140,6 +146,10 @@ interface SessionQueryFace {
 
 interface SettingsReaderFace {
   get(namespace: string): unknown
+}
+
+interface CredentialsFace {
+  resolve(ref: string): Promise<{ value: string } | undefined>
 }
 
 export interface SessionFoldStore {
@@ -297,6 +307,8 @@ export default class CostMeterService extends TypertRemoteService {
   static inject = ['settings']
 
   private readonly folds = new SessionFoldCache()
+  private readonly inflightCosts = new Map<string, Promise<ReturnType<typeof foldSession> | null>>()
+  private inflightOverview: Promise<SessionCostRecord[]> | undefined
 
   constructor(ctx: Context) {
     super(ctx, 'costMeter')
@@ -306,6 +318,26 @@ export default class CostMeterService extends TypertRemoteService {
   /** Compute one session's cost together with every descendant subagent session. */
   async sessionCost(sessionId: string): Promise<ReturnType<typeof foldSession> | null> {
     if (typeof sessionId !== 'string' || sessionId.length === 0) return null
+    const pending = this.inflightCosts.get(sessionId)
+    if (pending !== undefined) return pending
+    const work = this.computeSessionCost(sessionId).finally(() => {
+      if (this.inflightCosts.get(sessionId) === work) this.inflightCosts.delete(sessionId)
+    })
+    this.inflightCosts.set(sessionId, work)
+    return work
+  }
+
+  /** Fold every listed session independently for the all-session overview. */
+  async sessionCosts(): Promise<SessionCostRecord[]> {
+    if (this.inflightOverview !== undefined) return this.inflightOverview
+    const work = this.computeSessionCosts().finally(() => {
+      if (this.inflightOverview === work) this.inflightOverview = undefined
+    })
+    this.inflightOverview = work
+    return work
+  }
+
+  private async computeSessionCost(sessionId: string): Promise<ReturnType<typeof foldSession> | null> {
     const sessions = this.ctx.get('sessions') as SessionsFace | undefined
     const query = this.ctx.get('sessionQuery') as SessionQueryFace | undefined
     const pricing = (this.ctx as Context & { settings: SettingsReaderFace }).settings.get(SETTINGS_NS) as PricingConfig | undefined
@@ -318,11 +350,18 @@ export default class CostMeterService extends TypertRemoteService {
     return mergeCosts(cost, subagents)
   }
 
-  /** Fold every listed session independently for the all-session overview. */
-  async sessionCosts(): Promise<SessionCostRecord[]> {
+  private async computeSessionCosts(): Promise<SessionCostRecord[]> {
     const query = this.ctx.get('sessionQuery') as SessionQueryFace | undefined
     const sessions = this.ctx.get('sessions') as SessionsFace | undefined
     const pricing = (this.ctx as Context & { settings: SettingsReaderFace }).settings.get(SETTINGS_NS) as PricingConfig | undefined
     return collectSessionCosts(query, normalizePricing(pricing ?? DEFAULT_PRICING), this.folds, sessions)
+  }
+
+  /** Remaining balance once per gateway origin; failed origins are omitted. */
+  async providerBalances(): Promise<ProviderBalance[]> {
+    const settings = this.ctx.get('settings') as SettingsReaderFace | undefined
+    const credentials = this.ctx.get('credentials') as CredentialsFace | undefined
+    const providers = (settings?.get('llm-pi-ai') as { providers?: Record<string, ProviderSource> } | undefined)?.providers
+    return collectProviderBalances({ providers, credentials })
   }
 }

@@ -207,6 +207,46 @@ export function lastProbeAt(assignment: ModelAssignment | undefined): number | n
   return null
 }
 
+/** Dated discount-multiplier changes, newest last. Baseline `effectiveAt: 0` is omitted. */
+export function multiplierHistoryRows(assignment: ModelAssignment | undefined): MultiplierHistoryEntry[] {
+  return (assignment?.discountMultiplierHistory ?? []).filter(entry => Number.isFinite(entry.effectiveAt) && entry.effectiveAt > 0)
+}
+
+/** Latest probe or dated multiplier change, or null when none. */
+export function lastUpdatedAt(assignment: ModelAssignment | undefined): number | null {
+  const probe = lastProbeAt(assignment)
+  const changed = multiplierHistoryRows(assignment).at(-1)?.effectiveAt
+  const times = [probe, changed].filter((value): value is number => value !== undefined && value !== null && value > 0)
+  return times.length === 0 ? null : Math.max(...times)
+}
+
+/** Keep previous history and append a manual change when the discount multiplier moved. */
+export function assignmentWithManualMultiplier(previous: ModelAssignment, next: ModelAssignment, now: number): ModelAssignment {
+  const history = next.discountMultiplierHistory ?? previous.discountMultiplierHistory
+  const lastProbedAt = next.lastProbedAt ?? previous.lastProbedAt
+  if (next.discountMultiplier === undefined || next.discountMultiplier === previous.discountMultiplier) {
+    return {
+      ...next,
+      ...(history !== undefined ? { discountMultiplierHistory: history } : {}),
+      ...(lastProbedAt !== undefined ? { lastProbedAt } : {}),
+    }
+  }
+  const last = [...(history ?? [])]
+  if (last.length === 0) last.push({ effectiveAt: 0, discountMultiplier: previous.discountMultiplier ?? 1 })
+  if (last[last.length - 1]?.discountMultiplier !== next.discountMultiplier) {
+    last.push({
+      effectiveAt: Math.max(now, (last[last.length - 1]?.effectiveAt ?? -1) + 1),
+      discountMultiplier: next.discountMultiplier,
+      source: 'manual',
+    })
+  }
+  return {
+    ...next,
+    discountMultiplierHistory: last,
+    ...(lastProbedAt !== undefined ? { lastProbedAt } : {}),
+  }
+}
+
 /** Resolve the latest observed discount whose effective time is not after the request. */
 export function discountMultiplierAt(assignment: ModelAssignment | undefined, time: number): number {
   const history = assignment?.discountMultiplierHistory ?? []

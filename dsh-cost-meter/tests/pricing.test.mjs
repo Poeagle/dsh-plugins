@@ -4,9 +4,13 @@ import {
   Config,
   DEFAULT_PRICING,
   assignmentWithObservedMultiplier,
+  nextBillingProbeDue,
   billedOutputTokens,
   discountMultiplierAt,
   lastProbeAt,
+  lastUpdatedAt,
+  multiplierHistoryRows,
+  assignmentWithManualMultiplier,
   contextTokensOf,
   foldSession,
   formatContextSurcharge,
@@ -72,16 +76,68 @@ test('lastProbeAt prefers lastProbedAt then the latest probe history entry', () 
   }), 1000)
 })
 
+test('multiplierHistoryRows lists dated changes and omits the baseline', () => {
+  assert.deepEqual(multiplierHistoryRows(undefined), [])
+  assert.deepEqual(multiplierHistoryRows({ groupId: 'default' }), [])
+  assert.deepEqual(multiplierHistoryRows({
+    groupId: 'default',
+    discountMultiplierHistory: [
+      { effectiveAt: 0, discountMultiplier: 1 },
+      { effectiveAt: 1000, discountMultiplier: 0.1, source: 'probe' },
+      { effectiveAt: 2000, discountMultiplier: 0.2, source: 'manual' },
+    ],
+  }), [
+    { effectiveAt: 1000, discountMultiplier: 0.1, source: 'probe' },
+    { effectiveAt: 2000, discountMultiplier: 0.2, source: 'manual' },
+  ])
+})
+
+test('assignmentWithManualMultiplier appends a dated change without relying on array identity', () => {
+  const previous = {
+    groupId: 'default',
+    discountMultiplier: 0.12,
+    discountMultiplierHistory: [{ effectiveAt: 0, discountMultiplier: 0.12 }],
+    lastProbedAt: 1000,
+  }
+  const cloned = JSON.parse(JSON.stringify(previous))
+  cloned.discountMultiplier = 0.08
+  const next = assignmentWithManualMultiplier(previous, cloned, 9_000)
+  assert.equal(next.lastProbedAt, 1000)
+  assert.deepEqual(next.discountMultiplierHistory?.at(-1), { effectiveAt: 9_000, discountMultiplier: 0.08, source: 'manual' })
+  const same = assignmentWithManualMultiplier(previous, JSON.parse(JSON.stringify(previous)), 9_000)
+  assert.equal(same.discountMultiplierHistory?.at(-1)?.source, undefined)
+  assert.equal(same.lastProbedAt, 1000)
+})
+
 test('assignmentWithObservedMultiplier records lastProbedAt even when the multiplier is unchanged', () => {
   const same = assignmentWithObservedMultiplier({ groupId: 'default', discountMultiplier: 0.8 }, 0.8, 9_000)
   assert.equal(same.discountMultiplier, 0.8)
   assert.equal(same.lastProbedAt, 9_000)
   assert.equal(same.discountMultiplierHistory?.at(-1)?.source, undefined)
+  const again = assignmentWithObservedMultiplier(same, 0.8, 10_000)
+  assert.equal(again.discountMultiplier, 0.8)
+  assert.equal(again.lastProbedAt, 10_000)
   const changed = assignmentWithObservedMultiplier({ groupId: 'default', discountMultiplier: 0.8, lastProbedAt: 1_000 }, 0.5, 9_000)
   assert.equal(changed.discountMultiplier, 0.5)
   assert.equal(changed.lastProbedAt, 9_000)
   assert.equal(changed.discountMultiplierHistory?.at(-1)?.source, 'probe')
   assert.equal(changed.discountMultiplierHistory?.at(-1)?.effectiveAt, 9_000)
+})
+
+test('nextBillingProbeDue waits the interval only after success or unsupported', () => {
+  assert.equal(nextBillingProbeDue(1_000, 5, 'ok'), 301_000)
+  assert.equal(nextBillingProbeDue(1_000, 5, 'unsupported'), 301_000)
+  assert.equal(nextBillingProbeDue(1_000, 5, 'failed'), 61_000)
+})
+
+test('lastUpdatedAt is the latest probe or dated multiplier change', () => {
+  assert.equal(lastUpdatedAt(undefined), null)
+  assert.equal(lastUpdatedAt({ groupId: 'default', lastProbedAt: 5000 }), 5000)
+  assert.equal(lastUpdatedAt({
+    groupId: 'default',
+    lastProbedAt: 1000,
+    discountMultiplierHistory: [{ effectiveAt: 3000, discountMultiplier: 0.1, source: 'manual' }],
+  }), 3000)
 })
 
 test('applies discount and model multipliers after group rates', () => {

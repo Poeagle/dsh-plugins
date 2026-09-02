@@ -1,29 +1,14 @@
-import { Dt as validatePricing, bt as normalizePricing, o as installUpstreamBillingProbes, t as Config } from "./src-DSOzHANW.js";
+import { Dt as assignmentWithManualMultiplier, Lt as normalizePricing, Wt as validatePricing, o as installUpstreamBillingProbes, t as Config } from "./src-CFt2NalZ.js";
 //#region src/settings.ts
 const SETTINGS_NS = "cost-meter";
 const ROUTE_PATH = "/cost-meter/pricing";
 function mergeHistory(current, incoming) {
 	const models = { ...incoming.models };
+	const now = Date.now();
 	for (const [key, next] of Object.entries(models)) {
 		const previous = current.models[key];
 		if (previous === void 0) continue;
-		const history = previous.discountMultiplierHistory;
-		if (history !== void 0 && next.discountMultiplierHistory === void 0) next.discountMultiplierHistory = history;
-		if (previous.lastProbedAt !== void 0 && next.lastProbedAt === void 0) next.lastProbedAt = previous.lastProbedAt;
-		if (next.discountMultiplier !== void 0 && next.discountMultiplier !== previous.discountMultiplier && next.discountMultiplierHistory === history) {
-			const effectiveAt = Date.now();
-			const last = [...history ?? []];
-			if (last.length === 0) last.push({
-				effectiveAt: 0,
-				discountMultiplier: previous.discountMultiplier ?? 1
-			});
-			if (last[last.length - 1]?.discountMultiplier !== next.discountMultiplier) last.push({
-				effectiveAt: Math.max(effectiveAt, last[last.length - 1].effectiveAt + 1),
-				discountMultiplier: next.discountMultiplier,
-				source: "manual"
-			});
-			next.discountMultiplierHistory = last;
-		}
+		models[key] = assignmentWithManualMultiplier(previous, next, now);
 	}
 	return {
 		...incoming,
@@ -122,7 +107,7 @@ function apply(ctx, config) {
 					await settings.replace(SETTINGS_NS, merged);
 					send(200, {
 						ok: true,
-						value: body
+						value: merged
 					});
 				} catch (error) {
 					send(400, {

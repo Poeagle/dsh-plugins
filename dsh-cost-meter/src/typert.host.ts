@@ -43,6 +43,7 @@ export const TYPERT = {
   invocations: [
     inv('sessionCost', [strParam('sessionCost', 'sessionId')]),
     inv('sessionCosts', []),
+    inv('providerBalances', []),
   ],
   model: {
     services: [],

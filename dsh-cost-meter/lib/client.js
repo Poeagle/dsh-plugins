@@ -76,6 +76,15 @@ window.__ModuleLoader__.load({
 			}
 			return null;
 		}
+		/** Dated discount-multiplier changes, newest last. Baseline `effectiveAt: 0` is omitted. */
+		function multiplierHistoryRows(assignment) {
+			return (assignment?.discountMultiplierHistory ?? []).filter((entry) => Number.isFinite(entry.effectiveAt) && entry.effectiveAt > 0);
+		}
+		/** Latest probe or dated multiplier change, or null when none. */
+		function lastUpdatedAt(assignment) {
+			const times = [lastProbeAt(assignment), multiplierHistoryRows(assignment).at(-1)?.effectiveAt].filter((value) => value !== void 0 && value !== null && value > 0);
+			return times.length === 0 ? null : Math.max(...times);
+		}
 		/** Compact a token threshold for UI labels, e.g. 200000 → `200K`. */
 		function formatTokenThreshold(tokens) {
 			if (Number.isSafeInteger(tokens) && tokens >= 1e6 && tokens % 1e6 === 0) return `${tokens / 1e6}M`;
@@ -779,6 +788,49 @@ window.__ModuleLoader__.load({
 			return out;
 		}
 		//#endregion
+		//#region src/provider-balance.ts
+		function succeeded(row) {
+			return row.remaining !== null && row.error === void 0;
+		}
+		function gatewayHost(origin) {
+			try {
+				return new URL(origin).host;
+			} catch {
+				return origin;
+			}
+		}
+		/** True when `origin` is an http(s) wallet URL that can be opened. */
+		function walletHref(origin) {
+			if (origin === void 0 || origin === "") return void 0;
+			try {
+				const url = new URL(origin);
+				if (url.protocol !== "http:" && url.protocol !== "https:") return void 0;
+				return url.origin;
+			} catch {
+				return;
+			}
+		}
+		/**
+		* One chip per gateway origin. Failed probes and rows without an openable
+		* origin are dropped so a chip never appears without a host and href.
+		*/
+		function collapseBalanceChips(rows) {
+			const order = [];
+			const byOrigin = /* @__PURE__ */ new Map();
+			for (const row of rows) {
+				if (!succeeded(row)) continue;
+				const origin = walletHref(row.origin);
+				if (origin === void 0 || byOrigin.has(origin)) continue;
+				order.push(origin);
+				byOrigin.set(origin, {
+					...row,
+					origin,
+					name: gatewayHost(origin)
+				});
+			}
+			return order.map((origin) => byOrigin.get(origin));
+		}
+		//#endregion
 		//#region src/client.ts
 		const inject = [
 			"slots",
@@ -838,12 +890,16 @@ window.__ModuleLoader__.load({
 					};
 					else {
 						const body = await response.json();
-						this.snapshot = body.ok && body.value ? {
-							status: "ready",
-							value: body.value,
-							revision: 0,
-							writable: true
-						} : {
+						if (body.ok && body.value) {
+							const previous = this.snapshot.value;
+							const changed = previous === void 0 || JSON.stringify(previous) !== JSON.stringify(body.value);
+							this.snapshot = {
+								status: "ready",
+								value: body.value,
+								revision: (this.snapshot.revision ?? 0) + (changed ? 1 : 0),
+								writable: true
+							};
+						} else this.snapshot = {
 							status: "unavailable",
 							writable: false
 						};
@@ -1229,7 +1285,7 @@ window.__ModuleLoader__.load({
 		}
 		function GroupModelRow(props) {
 			const set = (next) => props.onChange(next);
-			const probedAt = lastProbeAt(props.assignment);
+			const updatedAt = lastUpdatedAt(props.assignment);
 			return react.default.createElement("div", { style: {
 				borderTop: "1px solid var(--dsw-alias-border-l2)",
 				padding: "10px 0",
@@ -1292,10 +1348,10 @@ window.__ModuleLoader__.load({
 					else delete next.reasoningExtra;
 					set(next);
 				}
-			}), "推理另计")), probedAt === null ? null : react.default.createElement("div", { style: {
+			}), "推理另计")), updatedAt === null ? null : react.default.createElement("div", { style: {
 				fontSize: 11,
 				color: "var(--dsw-alias-label-tertiary)"
-			} }, `自动探测 ${formatProbeTime(probedAt)}`));
+			} }, `更新 ${formatProbeTime(updatedAt)}`));
 		}
 		function GroupModelPicker(props) {
 			const [open, setOpen] = react.default.useState(false);
@@ -1591,15 +1647,23 @@ window.__ModuleLoader__.load({
 			const catalog = props.useCatalog((snapshot) => snapshot);
 			const [draft, setDraft] = react.default.useState(() => cloneConfig(settings.value));
 			const [seedRevision, setSeedRevision] = react.default.useState(settings.revision);
+			const seedJson = react.default.useRef(JSON.stringify(cloneConfig(settings.value)));
+			const acceptRemote = react.default.useRef(false);
 			const [saving, setSaving] = react.default.useState(false);
 			const [saved, setSaved] = react.default.useState(false);
 			const [failure, setFailure] = react.default.useState(null);
 			react.default.useEffect(() => {
-				if (settings.revision !== seedRevision) {
-					setDraft(cloneConfig(settings.value));
-					setSeedRevision(settings.revision);
-					setFailure(null);
-				}
+				if (settings.revision === seedRevision) return;
+				const next = cloneConfig(settings.value);
+				const nextJson = JSON.stringify(next);
+				setDraft((current) => {
+					if (!acceptRemote.current && JSON.stringify(current) !== seedJson.current) return current;
+					acceptRemote.current = false;
+					seedJson.current = nextJson;
+					return next;
+				});
+				setSeedRevision(settings.revision);
+				setFailure(null);
 			}, [
 				settings.revision,
 				settings.value,
@@ -1608,6 +1672,14 @@ window.__ModuleLoader__.load({
 			react.default.useEffect(() => {
 				props.refreshCatalog();
 			}, [props.refreshCatalog]);
+			react.default.useEffect(() => {
+				if (props.refreshPricing === void 0 || props.interval === void 0) return;
+				const load = () => {
+					props.refreshPricing?.();
+				};
+				load();
+				return props.interval(load, 3e4);
+			}, [props.refreshPricing, props.interval]);
 			if (settings.status === "unavailable") return react.default.createElement("p", { style: {
 				margin: 0,
 				fontSize: 13,
@@ -1644,6 +1716,7 @@ window.__ModuleLoader__.load({
 				const error = await props.save(draft);
 				setSaving(false);
 				if (error === null) {
+					acceptRemote.current = true;
 					setSaved(true);
 					setTimeout(() => setSaved(false), 2e3);
 				} else setFailure(error);
@@ -2290,20 +2363,43 @@ window.__ModuleLoader__.load({
 			cacheWriteRate: null,
 			outputRate: null
 		};
-		const CHIP_STYLE = {
+		const DOCK_TEXT = {
+			margin: 0,
+			padding: "2px 16px 0",
+			textAlign: "center",
+			color: "var(--dsw-alias-label-tertiary)",
+			fontSize: 12,
+			lineHeight: "20px"
+		};
+		const DOCK_ACTION = {
+			display: "inline",
+			padding: 0,
+			border: "none",
+			background: "none",
+			color: "inherit",
+			font: "inherit",
+			lineHeight: "inherit",
+			cursor: "pointer",
+			textDecoration: "none"
+		};
+		const BALANCE_CARD = {
 			display: "inline-flex",
-			alignItems: "baseline",
-			gap: 6,
-			height: 32,
-			padding: "0 12px",
+			flexDirection: "column",
+			justifyContent: "center",
+			alignItems: "flex-start",
+			gap: 0,
+			minHeight: 32,
+			padding: "2px 10px",
+			flex: "none",
 			border: "1px solid var(--dsw-alias-border-l2)",
-			borderRadius: 18,
+			borderRadius: 12,
 			background: "transparent",
 			color: "var(--dsw-alias-label-primary)",
 			font: "inherit",
-			fontSize: 13,
-			lineHeight: "20px",
-			cursor: "pointer"
+			textDecoration: "none",
+			cursor: "pointer",
+			lineHeight: 1.2,
+			whiteSpace: "nowrap"
 		};
 		function CostModal(props) {
 			return react.default.createElement("div", {
@@ -2362,24 +2458,86 @@ window.__ModuleLoader__.load({
 				flexDirection: "column"
 			} }, props.children)));
 		}
-		function CostHeader(props) {
+		function BalanceHeader(props) {
+			const [balances, setBalances] = react.default.useState([]);
+			react.default.useEffect(() => {
+				let loading = false;
+				const load = () => {
+					if (loading) return;
+					loading = true;
+					props.costMeter.providerBalances().then((response) => {
+						if (response.ok && Array.isArray(response.value)) setBalances(response.value);
+					}).catch(() => {}).finally(() => {
+						loading = false;
+					});
+				};
+				load();
+				return props.interval(load, 5e3);
+			}, []);
+			const cards = [];
+			for (const item of collapseBalanceChips(balances)) {
+				const href = walletHref(item.origin);
+				if (href === void 0) continue;
+				cards.push(react.default.createElement("a", {
+					key: href,
+					href,
+					target: "_blank",
+					rel: "noreferrer",
+					style: BALANCE_CARD,
+					title: href
+				}, react.default.createElement("span", { style: {
+					fontSize: 11,
+					color: "var(--dsw-alias-label-tertiary)",
+					maxWidth: 160,
+					overflow: "hidden",
+					textOverflow: "ellipsis"
+				} }, item.name), react.default.createElement("span", { style: {
+					display: "inline-flex",
+					alignItems: "baseline",
+					gap: 6
+				} }, react.default.createElement("span", { style: {
+					fontSize: 13,
+					fontWeight: 600
+				} }, `${currencySymbol(item.unit)}${money(item.remaining ?? 0)}`), react.default.createElement("span", { style: {
+					fontSize: 10,
+					color: "var(--dsw-alias-label-tertiary)"
+				} }, new Date(item.observedAt).toLocaleTimeString("zh-CN", { hour12: false })))));
+			}
+			if (cards.length === 0) return null;
+			return react.default.createElement("div", { style: {
+				display: "flex",
+				alignItems: "stretch",
+				gap: 8,
+				minWidth: 0,
+				overflowX: "auto",
+				flexWrap: "nowrap"
+			} }, ...cards);
+		}
+		function CostDock(props) {
 			const [state, setState] = react.default.useState(null);
 			const [sessionRows, setSessionRows] = react.default.useState([]);
 			const [sessionLoadError, setSessionLoadError] = react.default.useState(null);
 			const [sessionLoading, setSessionLoading] = react.default.useState(false);
 			const [modal, setModal] = react.default.useState(null);
 			react.default.useEffect(() => {
+				let loading = false;
 				const load = () => {
-					if (typeof props.sessionId !== "string") return;
+					if (typeof props.sessionId !== "string" || loading) return;
+					loading = true;
 					props.costMeter.sessionCost(props.sessionId).then((response) => {
 						if (response.ok && response.value && typeof response.value === "object") setState(response.value);
-					}).catch(() => {});
+					}).catch(() => {}).finally(() => {
+						loading = false;
+					});
 				};
 				load();
-				return props.interval(load, 2e3);
+				return props.interval(load, 5e3);
 			}, [props.sessionId]);
 			react.default.useEffect(() => {
+				let loading = false;
 				const load = () => {
+					if (loading) return;
+					loading = true;
 					setSessionLoading(true);
 					loadAllSessionCosts(props.costMeter, props.sessions).then((rows) => {
 						setSessionRows(rows);
@@ -2387,11 +2545,12 @@ window.__ModuleLoader__.load({
 					}).catch((error) => {
 						setSessionLoadError(`会话费用加载失败：${remoteErrorText(error)}`);
 					}).finally(() => {
+						loading = false;
 						setSessionLoading(false);
 					});
 				};
 				load();
-				return props.interval(load, 5e3);
+				return props.interval(load, 3e4);
 			}, []);
 			const symbol = currencySymbol(state?.currency ?? sessionRows[0]?.cost.currency ?? "CNY");
 			const unitTokens = state?.unitTokens ?? sessionRows[0]?.cost.unitTokens ?? 1e6;
@@ -2400,15 +2559,12 @@ window.__ModuleLoader__.load({
 			const historyCost = overviewCost(sessionRows);
 			const allEntries = flattenHourlyEntries(sessionRows);
 			const todayEntries = allEntries.filter((item) => localDateOfHour(item.entry.hour) === today);
-			const chip = (label, value, view) => react.default.createElement("button", {
+			const costText = (label, value, view) => react.default.createElement("button", {
 				type: "button",
-				style: CHIP_STYLE,
+				style: DOCK_ACTION,
 				onClick: () => setModal(view),
 				title: label
-			}, react.default.createElement("span", { style: {
-				fontSize: 11,
-				color: "var(--dsw-alias-label-tertiary)"
-			} }, label), react.default.createElement("span", { style: { fontWeight: 600 } }, `${symbol}${money(value)}`));
+			}, `${label} ${symbol}${money(value)}`);
 			const loading = sessionLoading && sessionRows.length === 0 ? react.default.createElement("p", { style: {
 				margin: 0,
 				fontSize: 12,
@@ -2422,11 +2578,12 @@ window.__ModuleLoader__.load({
 					color: "var(--dsw-alias-label-error)"
 				}
 			}, sessionLoadError) : null;
-			return react.default.createElement(react.default.Fragment, null, react.default.createElement("div", { style: {
-				display: "flex",
-				alignItems: "center",
-				gap: 8
-			} }, chip("本会话", state?.cost ?? 0, "session"), chip("今日", todayCost, "today"), chip("累计", historyCost, "history")), modal === "session" ? react.default.createElement(CostModal, {
+			const parts = [
+				costText("本会话", state?.cost ?? 0, "session"),
+				costText("今日", todayCost, "today"),
+				costText("累计", historyCost, "history")
+			];
+			return react.default.createElement(react.default.Fragment, null, react.default.createElement("p", { style: DOCK_TEXT }, ...parts.flatMap((part, index) => index === 0 ? [part] : [" · ", part])), modal === "session" ? react.default.createElement(CostModal, {
 				title: "本会话费用",
 				onClose: () => setModal(null),
 				children: react.default.createElement(CostTable, {
@@ -2472,49 +2629,68 @@ window.__ModuleLoader__.load({
 			if (!remote) return;
 			await remote.$mount({
 				package: "dsh-cost-meter",
-				descriptors: [{
-					id: "dsh-cost-meter#costMeter/sessionCost",
-					service: "costMeter",
-					namespace: "costMeter",
-					method: "sessionCost",
-					invocation: { kind: "direct" },
-					parameters: [{
-						name: "sessionId",
-						wire: "sessionId",
-						source: "json",
-						codec: {
+				descriptors: [
+					{
+						id: "dsh-cost-meter#costMeter/sessionCost",
+						service: "costMeter",
+						namespace: "costMeter",
+						method: "sessionCost",
+						invocation: { kind: "direct" },
+						parameters: [{
+							name: "sessionId",
+							wire: "sessionId",
+							source: "json",
+							codec: {
+								mode: "strict",
+								typeSymbol: "dsh-cost-meter#sessionCost#sessionId",
+								schema: {
+									_zod: true,
+									parse: (value) => value
+								}
+							}
+						}],
+						result: {
 							mode: "strict",
-							typeSymbol: "dsh-cost-meter#sessionCost#sessionId",
+							typeSymbol: "dsh-cost-meter#sessionCost#result",
 							schema: {
 								_zod: true,
 								parse: (value) => value
 							}
 						}
-					}],
-					result: {
-						mode: "strict",
-						typeSymbol: "dsh-cost-meter#sessionCost#result",
-						schema: {
-							_zod: true,
-							parse: (value) => value
+					},
+					{
+						id: "dsh-cost-meter#costMeter/sessionCosts",
+						service: "costMeter",
+						namespace: "costMeter",
+						method: "sessionCosts",
+						invocation: { kind: "direct" },
+						parameters: [],
+						result: {
+							mode: "strict",
+							typeSymbol: "dsh-cost-meter#sessionCosts#result",
+							schema: {
+								_zod: true,
+								parse: (value) => value
+							}
+						}
+					},
+					{
+						id: "dsh-cost-meter#costMeter/providerBalances",
+						service: "costMeter",
+						namespace: "costMeter",
+						method: "providerBalances",
+						invocation: { kind: "direct" },
+						parameters: [],
+						result: {
+							mode: "strict",
+							typeSymbol: "dsh-cost-meter#providerBalances#result",
+							schema: {
+								_zod: true,
+								parse: (value) => value
+							}
 						}
 					}
-				}, {
-					id: "dsh-cost-meter#costMeter/sessionCosts",
-					service: "costMeter",
-					namespace: "costMeter",
-					method: "sessionCosts",
-					invocation: { kind: "direct" },
-					parameters: [],
-					result: {
-						mode: "strict",
-						typeSymbol: "dsh-cost-meter#sessionCosts#result",
-						schema: {
-							_zod: true,
-							parse: (value) => value
-						}
-					}
-				}]
+				]
 			});
 			const slots = ctx.get("slots");
 			const costMeter = ctx.get("remote.costMeter");
@@ -2530,9 +2706,17 @@ window.__ModuleLoader__.load({
 			}) ?? (() => {}), "cost-meter catalog updates");
 			slots.inject("conversation.session.header.utilities", () => slots.register({
 				name: "conversation.session.header.utilities",
+				id: "cost-meter-balance",
+				order: 40
+			}, () => react.default.createElement(BalanceHeader, {
+				costMeter,
+				interval: (callback, delay) => ctx.interval(callback, delay)
+			})));
+			slots.inject("conversation.composer.dock", () => slots.register({
+				name: "conversation.composer.dock",
 				id: "cost-meter",
 				order: 40
-			}, (props) => react.default.createElement(CostHeader, {
+			}, (props) => react.default.createElement(CostDock, {
 				...props,
 				costMeter,
 				sessions: connection.api.sessions,
@@ -2549,6 +2733,8 @@ window.__ModuleLoader__.load({
 						catalog
 					},
 					refreshCatalog: catalog.load,
+					refreshPricing: pricing.load,
+					interval: (callback, delay) => ctx.interval(callback, delay),
 					save: (config) => pricing.save(config)
 				})
 			}, PricingSettingsCard));

@@ -2,7 +2,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import { Config } from './index.js'
-import { normalizePricing, validatePricing, type PricingConfig } from './pricing.js'
+import { assignmentWithManualMultiplier, normalizePricing, validatePricing, type PricingConfig } from './pricing.js'
 import { installUpstreamBillingProbes } from './upstream-billing-probe.js'
 
 interface SettingsScopeFace<T> {
@@ -30,19 +30,11 @@ const ROUTE_PATH = '/cost-meter/pricing'
 
 function mergeHistory(current: PricingConfig, incoming: PricingConfig): PricingConfig {
   const models = { ...incoming.models }
+  const now = Date.now()
   for (const [key, next] of Object.entries(models)) {
     const previous = current.models[key]
     if (previous === undefined) continue
-    const history = previous.discountMultiplierHistory
-    if (history !== undefined && next.discountMultiplierHistory === undefined) next.discountMultiplierHistory = history
-    if (previous.lastProbedAt !== undefined && next.lastProbedAt === undefined) next.lastProbedAt = previous.lastProbedAt
-    if (next.discountMultiplier !== undefined && next.discountMultiplier !== previous.discountMultiplier && next.discountMultiplierHistory === history) {
-      const effectiveAt = Date.now()
-      const last = [...(history ?? [])]
-      if (last.length === 0) last.push({ effectiveAt: 0, discountMultiplier: previous.discountMultiplier ?? 1 })
-      if (last[last.length - 1]?.discountMultiplier !== next.discountMultiplier) last.push({ effectiveAt: Math.max(effectiveAt, last[last.length - 1]!.effectiveAt + 1), discountMultiplier: next.discountMultiplier, source: 'manual' })
-      next.discountMultiplierHistory = last
-    }
+    models[key] = assignmentWithManualMultiplier(previous, next, now)
   }
   return { ...incoming, models }
 }
@@ -130,7 +122,7 @@ export function apply(ctx: Context, config: PricingConfig): void {
           const merged = mergeHistory(normalizePricing(scope.get()), body)
           validatePricing(merged)
           await settings.replace(SETTINGS_NS, merged)
-          send(200, { ok: true, value: body })
+          send(200, { ok: true, value: merged })
         } catch (error) {
           send(400, { ok: false, error: String(error instanceof Error ? error.message : error) })
         }

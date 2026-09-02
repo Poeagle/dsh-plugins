@@ -3,7 +3,8 @@
 import type { Context } from '@deepseek-ai/cordis'
 import React from 'react'
 import type { ContextSurcharge, ModelAssignment, PricingConfig, PricingGroup, PricingPeriod } from './pricing.js'
-import { DEFAULT_GROUP, DEFAULT_PRICING, formatTokenThreshold, lastProbeAt, normalizePricing, validatePricing } from './pricing.js'
+import { collapseBalanceChips, walletHref } from './provider-balance.js'
+import { DEFAULT_GROUP, DEFAULT_PRICING, formatTokenThreshold, lastUpdatedAt, normalizePricing, validatePricing } from './pricing.js'
 import {
   costTableColumnValues,
   costTableTotals,
@@ -121,9 +122,21 @@ interface SessionCostRecord {
 }
 interface RemoteEnvelope<T> { ok: boolean; value?: T; error?: unknown }
 interface RemoteMount { $mount(contribution: unknown): Promise<() => Promise<void>> }
+interface ProviderBalance {
+  provider: string
+  name: string
+  origin?: string
+  remaining: number | null
+  unit: string
+  mode: string | null
+  error?: string
+  observedAt: number
+}
+
 interface CostMeterFace {
   sessionCost(sessionId: string): Promise<RemoteEnvelope<CostFold | null>>
   sessionCosts(): Promise<RemoteEnvelope<SessionCostRecord[]>>
+  providerBalances(): Promise<RemoteEnvelope<ProviderBalance[]>>
 }
 interface SlotsFace {
   inject(name: string, fn: () => unknown): void
@@ -204,9 +217,18 @@ class PricingRouteSource implements Observable<SettingsSnapshot> {
         this.snapshot = { status: 'unavailable', writable: false }
       } else {
         const body = (await response.json()) as { ok: boolean; value?: PricingConfig }
-        this.snapshot = body.ok && body.value
-          ? { status: 'ready', value: body.value, revision: 0, writable: true }
-          : { status: 'unavailable', writable: false }
+        if (body.ok && body.value) {
+          const previous = this.snapshot.value
+          const changed = previous === undefined || JSON.stringify(previous) !== JSON.stringify(body.value)
+          this.snapshot = {
+            status: 'ready',
+            value: body.value,
+            revision: (this.snapshot.revision ?? 0) + (changed ? 1 : 0),
+            writable: true,
+          }
+        } else {
+          this.snapshot = { status: 'unavailable', writable: false }
+        }
       }
     } catch {
       this.snapshot = { status: 'unavailable', writable: false }
@@ -408,7 +430,7 @@ function GroupModelRow(props: {
   onRemove(): void
 }) {
   const set = (next: ModelAssignment) => props.onChange(next)
-  const probedAt = lastProbeAt(props.assignment)
+  const updatedAt = lastUpdatedAt(props.assignment)
   return React.createElement('div', { style: { borderTop: '1px solid var(--dsw-alias-border-l2)', padding: '10px 0', display: 'flex', flexDirection: 'column', gap: 8 } },
     React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } },
       React.createElement('div', { style: { flex: 1, minWidth: 0 } },
@@ -444,7 +466,7 @@ function GroupModelRow(props: {
         '推理另计',
       ),
     ),
-    probedAt === null ? null : React.createElement('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, `自动探测 ${formatProbeTime(probedAt)}`),
+    updatedAt === null ? null : React.createElement('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, `更新 ${formatProbeTime(updatedAt)}`),
   )
 }
 
@@ -623,25 +645,41 @@ function PricingSettingsCard(props: {
   usePricing<T>(selector: (snapshot: SettingsSnapshot) => T): T
   useCatalog<T>(selector: (snapshot: CatalogSnapshot) => T): T
   refreshCatalog(): Promise<void>
+  refreshPricing?(): Promise<void>
+  interval?(callback: () => void, delay: number): () => void
   save(config: PricingConfig): Promise<string | null>
 }) {
   const settings = props.usePricing(snapshot => snapshot)
   const catalog = props.useCatalog(snapshot => snapshot)
   const [draft, setDraft] = React.useState<PricingConfig>(() => cloneConfig(settings.value))
   const [seedRevision, setSeedRevision] = React.useState(settings.revision)
+  const seedJson = React.useRef(JSON.stringify(cloneConfig(settings.value)))
+  const acceptRemote = React.useRef(false)
   const [saving, setSaving] = React.useState(false)
   const [saved, setSaved] = React.useState(false)
   const [failure, setFailure] = React.useState<string | null>(null)
   React.useEffect(() => {
-    if (settings.revision !== seedRevision) {
-      setDraft(cloneConfig(settings.value))
-      setSeedRevision(settings.revision)
-      setFailure(null)
-    }
+    if (settings.revision === seedRevision) return
+    const next = cloneConfig(settings.value)
+    const nextJson = JSON.stringify(next)
+    setDraft(current => {
+      if (!acceptRemote.current && JSON.stringify(current) !== seedJson.current) return current
+      acceptRemote.current = false
+      seedJson.current = nextJson
+      return next
+    })
+    setSeedRevision(settings.revision)
+    setFailure(null)
   }, [settings.revision, settings.value, seedRevision])
   React.useEffect(() => {
     void props.refreshCatalog()
   }, [props.refreshCatalog])
+  React.useEffect(() => {
+    if (props.refreshPricing === undefined || props.interval === undefined) return
+    const load = () => { void props.refreshPricing?.() }
+    load()
+    return props.interval(load, 30_000)
+  }, [props.refreshPricing, props.interval])
   if (settings.status === 'unavailable') {
     return React.createElement('p', { style: { margin: 0, fontSize: 13, color: 'var(--dsw-alias-label-tertiary)' } }, '费用设置暂不可用。')
   }
@@ -668,6 +706,7 @@ function PricingSettingsCard(props: {
     const error = await props.save(draft)
     setSaving(false)
     if (error === null) {
+      acceptRemote.current = true
       setSaved(true)
       setTimeout(() => setSaved(false), 2000)
     } else {
@@ -966,10 +1005,23 @@ const rowZero: CostTableRow = {
   inputRate: null, cacheReadRate: null, cacheWriteRate: null, outputRate: null,
 }
 
-const CHIP_STYLE: React.CSSProperties = {
-  display: 'inline-flex', alignItems: 'baseline', gap: 6, height: 32, padding: '0 12px',
-  border: '1px solid var(--dsw-alias-border-l2)', borderRadius: 18, background: 'transparent',
-  color: 'var(--dsw-alias-label-primary)', font: 'inherit', fontSize: 13, lineHeight: '20px', cursor: 'pointer',
+const DOCK_TEXT: React.CSSProperties = {
+  margin: 0, padding: '2px 16px 0', textAlign: 'center',
+  color: 'var(--dsw-alias-label-tertiary)', fontSize: 12, lineHeight: '20px',
+}
+
+const DOCK_ACTION: React.CSSProperties = {
+  display: 'inline', padding: 0, border: 'none', background: 'none',
+  color: 'inherit', font: 'inherit', lineHeight: 'inherit', cursor: 'pointer',
+  textDecoration: 'none',
+}
+
+const BALANCE_CARD: React.CSSProperties = {
+  display: 'inline-flex', flexDirection: 'column', justifyContent: 'center', alignItems: 'flex-start',
+  gap: 0, minHeight: 32, padding: '2px 10px', flex: 'none',
+  border: '1px solid var(--dsw-alias-border-l2)', borderRadius: 12, background: 'transparent',
+  color: 'var(--dsw-alias-label-primary)', font: 'inherit', textDecoration: 'none', cursor: 'pointer',
+  lineHeight: 1.2, whiteSpace: 'nowrap',
 }
 
 function CostModal(props: { title: string; onClose(): void; children: React.ReactNode }) {
@@ -990,24 +1042,70 @@ function CostModal(props: { title: string; onClose(): void; children: React.Reac
   )
 }
 
-function CostHeader(props: { sessionId: string; costMeter: CostMeterFace; sessions: ApiFace['sessions']; interval(callback: () => void, delay: number): () => void }) {
+function BalanceHeader(props: { costMeter: CostMeterFace; interval(callback: () => void, delay: number): () => void }) {
+  const [balances, setBalances] = React.useState<ProviderBalance[]>([])
+  React.useEffect(() => {
+    let loading = false
+    const load = () => {
+      if (loading) return
+      loading = true
+      props.costMeter.providerBalances().then(response => {
+        if (response.ok && Array.isArray(response.value)) setBalances(response.value)
+      }).catch(() => {}).finally(() => { loading = false })
+    }
+    load()
+    return props.interval(load, 5000)
+  }, [])
+  const cards = []
+  for (const item of collapseBalanceChips(balances)) {
+    const href = walletHref(item.origin)
+    if (href === undefined) continue
+    cards.push(React.createElement('a', {
+      key: href,
+      href,
+      target: '_blank',
+      rel: 'noreferrer',
+      style: BALANCE_CARD,
+      title: href,
+    },
+      React.createElement('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)', maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis' } }, item.name),
+      React.createElement('span', { style: { display: 'inline-flex', alignItems: 'baseline', gap: 6 } },
+        React.createElement('span', { style: { fontSize: 13, fontWeight: 600 } }, `${currencySymbol(item.unit)}${money(item.remaining ?? 0)}`),
+        React.createElement('span', { style: { fontSize: 10, color: 'var(--dsw-alias-label-tertiary)' } },
+          new Date(item.observedAt).toLocaleTimeString('zh-CN', { hour12: false }),
+        ),
+      ),
+    ))
+  }
+  if (cards.length === 0) return null
+  return React.createElement('div', {
+    style: { display: 'flex', alignItems: 'stretch', gap: 8, minWidth: 0, overflowX: 'auto', flexWrap: 'nowrap' },
+  }, ...cards)
+}
+
+function CostDock(props: { sessionId: string; costMeter: CostMeterFace; sessions: ApiFace['sessions']; interval(callback: () => void, delay: number): () => void }) {
   const [state, setState] = React.useState<CostFold | null>(null)
   const [sessionRows, setSessionRows] = React.useState<SessionCostRecord[]>([])
   const [sessionLoadError, setSessionLoadError] = React.useState<string | null>(null)
   const [sessionLoading, setSessionLoading] = React.useState(false)
   const [modal, setModal] = React.useState<'session' | 'today' | 'history' | null>(null)
   React.useEffect(() => {
+    let loading = false
     const load = () => {
-      if (typeof props.sessionId !== 'string') return
+      if (typeof props.sessionId !== 'string' || loading) return
+      loading = true
       props.costMeter.sessionCost(props.sessionId).then(response => {
         if (response.ok && response.value && typeof response.value === 'object') setState(response.value)
-      }).catch(() => {})
+      }).catch(() => {}).finally(() => { loading = false })
     }
     load()
-    return props.interval(load, 2000)
+    return props.interval(load, 5000)
   }, [props.sessionId])
   React.useEffect(() => {
+    let loading = false
     const load = () => {
+      if (loading) return
+      loading = true
       setSessionLoading(true)
       loadAllSessionCosts(props.costMeter, props.sessions).then(rows => {
         setSessionRows(rows)
@@ -1015,11 +1113,12 @@ function CostHeader(props: { sessionId: string; costMeter: CostMeterFace; sessio
       }).catch((error: unknown) => {
         setSessionLoadError(`会话费用加载失败：${remoteErrorText(error)}`)
       }).finally(() => {
+        loading = false
         setSessionLoading(false)
       })
     }
     load()
-    return props.interval(load, 5000)
+    return props.interval(load, 30_000)
   }, [])
   const symbol = currencySymbol(state?.currency ?? sessionRows[0]?.cost.currency ?? 'CNY')
   const unitTokens = state?.unitTokens ?? sessionRows[0]?.cost.unitTokens ?? 1_000_000
@@ -1028,22 +1127,22 @@ function CostHeader(props: { sessionId: string; costMeter: CostMeterFace; sessio
   const historyCost = overviewCost(sessionRows)
   const allEntries = flattenHourlyEntries(sessionRows)
   const todayEntries = allEntries.filter(item => localDateOfHour(item.entry.hour) === today)
-  const chip = (label: string, value: number, view: 'session' | 'today' | 'history') => React.createElement('button', {
+  const costText = (label: string, value: number, view: 'session' | 'today' | 'history') => React.createElement('button', {
     type: 'button',
-    style: CHIP_STYLE,
+    style: DOCK_ACTION,
     onClick: () => setModal(view),
     title: label,
-  },
-    React.createElement('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, label),
-    React.createElement('span', { style: { fontWeight: 600 } }, `${symbol}${money(value)}`),
-  )
+  }, `${label} ${symbol}${money(value)}`)
   const loading = sessionLoading && sessionRows.length === 0 ? React.createElement('p', { style: { margin: 0, fontSize: 12, color: 'var(--dsw-alias-label-tertiary)' } }, '正在加载…') : null
   const error = sessionLoadError ? React.createElement('p', { role: 'alert', style: { margin: 0, fontSize: 12, color: 'var(--dsw-alias-label-error)' } }, sessionLoadError) : null
+  const parts = [
+    costText('本会话', state?.cost ?? 0, 'session'),
+    costText('今日', todayCost, 'today'),
+    costText('累计', historyCost, 'history'),
+  ]
   return React.createElement(React.Fragment, null,
-    React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
-      chip('本会话', state?.cost ?? 0, 'session'),
-      chip('今日', todayCost, 'today'),
-      chip('累计', historyCost, 'history'),
+    React.createElement('p', { style: DOCK_TEXT },
+      ...parts.flatMap((part, index) => index === 0 ? [part] : [' · ', part]),
     ),
     modal === 'session' ? React.createElement(CostModal, { title: '本会话费用', onClose: () => setModal(null), children: React.createElement(CostTable, { entries: flattenFoldEntries(props.sessionId, state), symbol, unitTokens, empty: '本会话还没有可统计的用量。' }) }) : null,
     modal === 'today' ? React.createElement(CostModal, { title: `今日费用 · ${today}`, onClose: () => setModal(null), children: React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 8, minHeight: 0, flex: 1 } }, loading, error, React.createElement(CostTable, { entries: todayEntries, symbol, unitTokens, empty: '今天还没有费用。' })) }) : null,
@@ -1076,6 +1175,21 @@ export async function apply(ctx: Context) {
           parse: (value: unknown) => value,
         },
       },
+    }, {
+      id: 'dsh-cost-meter#costMeter/providerBalances',
+      service: 'costMeter',
+      namespace: 'costMeter',
+      method: 'providerBalances',
+      invocation: { kind: 'direct' },
+      parameters: [],
+      result: {
+        mode: 'strict',
+        typeSymbol: 'dsh-cost-meter#providerBalances#result',
+        schema: {
+          _zod: true,
+          parse: (value: unknown) => value,
+        },
+      },
     }],
   })
   const slots = ctx.get('slots') as SlotsFace | undefined
@@ -1090,8 +1204,12 @@ export async function apply(ctx: Context) {
   ctx.effect(() => remoteEvents.$on?.('llm/adapters-updated', () => { void catalog.load() }) ?? (() => {}), 'cost-meter catalog updates')
 
   slots.inject('conversation.session.header.utilities', () => slots.register(
-    { name: 'conversation.session.header.utilities', id: 'cost-meter', order: 40 },
-    (props: { sessionId: string }) => React.createElement(CostHeader, { ...props, costMeter, sessions: connection.api.sessions, interval: (callback, delay) => (ctx as any).interval(callback, delay) }),
+    { name: 'conversation.session.header.utilities', id: 'cost-meter-balance', order: 40 },
+    () => React.createElement(BalanceHeader, { costMeter, interval: (callback, delay) => (ctx as any).interval(callback, delay) }),
+  ))
+  slots.inject('conversation.composer.dock', () => slots.register(
+    { name: 'conversation.composer.dock', id: 'cost-meter', order: 40 },
+    (props: { sessionId: string }) => React.createElement(CostDock, { ...props, costMeter, sessions: connection.api.sessions, interval: (callback, delay) => (ctx as any).interval(callback, delay) }),
   ))
   slots.inject('settings.section', () => slots.register({
     name: 'settings.section',
@@ -1101,6 +1219,8 @@ export async function apply(ctx: Context) {
     inject: () => ({
       hooks: { pricing, catalog },
       refreshCatalog: catalog.load,
+      refreshPricing: pricing.load,
+      interval: (callback: () => void, delay: number) => (ctx as any).interval(callback, delay),
       save: (config: PricingConfig) => pricing.save(config),
     }),
   }, PricingSettingsCard))

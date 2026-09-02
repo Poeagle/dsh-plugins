@@ -3,6 +3,14 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { mapWithConcurrency } from './session-table.js'
 import { multiplierOrOne, normalizePricing, type ModelAssignment, type PricingConfig } from './pricing.js'
+import {
+  listProviderBalanceTargets,
+  probeProviderAvailability,
+  probeProviderBalance,
+  routesForProvider,
+  shouldRemoveUnavailableProvider,
+  type ProviderSource,
+} from './provider-balance.js'
 
 const REQUEST_TIMEOUT_MS = 10_000
 const MAX_RESPONSE_BYTES = 64 * 1024
@@ -13,6 +21,11 @@ interface SettingsScopeFace<T> {
   get(): T
   watch(callback: (next: T, prev: T) => void | Promise<void>): () => void
   update(patch: object): Promise<void>
+}
+
+interface SettingsMutateFace {
+  get(namespace: string): unknown
+  mutate(namespace: string, ops: readonly { op: 'unset'; path: readonly string[] }[]): Promise<void>
 }
 
 interface CredentialsFace {
@@ -72,17 +85,18 @@ export function parseBillingMultiplier(value: unknown): { multiplier: number; ob
   return { multiplier: body.resolved_rate_multiplier, observedAt: Number.isFinite(observedAt) ? observedAt : undefined }
 }
 
-/** Append a newly observed multiplier without changing pricing before observation time. */
+/** Record the latest successful probe time; change the live multiplier only when it differs. */
 export function assignmentWithObservedMultiplier(assignment: ModelAssignment, multiplier: number, observedAt: number): ModelAssignment {
   const history = [...(assignment.discountMultiplierHistory ?? [])]
   if (history.length === 0) {
     history.push({ effectiveAt: BASELINE_EFFECTIVE_AT, discountMultiplier: multiplierOrOne(assignment.discountMultiplier) })
   }
   const active = history[history.length - 1]?.discountMultiplier ?? multiplierOrOne(assignment.discountMultiplier)
-  if (active !== multiplier) history.push({ effectiveAt: Math.max(observedAt, (history[history.length - 1]?.effectiveAt ?? -1) + 1), discountMultiplier: multiplier, source: 'probe' })
+  const changed = active !== multiplier
+  if (changed) history.push({ effectiveAt: Math.max(observedAt, (history[history.length - 1]?.effectiveAt ?? -1) + 1), discountMultiplier: multiplier, source: 'probe' })
   return {
     ...assignment,
-    discountMultiplier: multiplier,
+    discountMultiplier: changed ? multiplier : assignment.discountMultiplier,
     discountMultiplierHistory: history,
     lastProbedAt: Math.max(observedAt, assignment.lastProbedAt ?? 0),
   }
@@ -112,6 +126,12 @@ async function readBoundedJson(response: Response): Promise<unknown> {
   return JSON.parse(new TextDecoder().decode(bytes))
 }
 
+/** Successful and unsupported endpoints wait `intervalMinutes`; failed probes retry on the next tick. */
+export function nextBillingProbeDue(now: number, intervalMinutes: number, status: ProbeResult['status']): number {
+  if (status === 'ok' || status === 'unsupported') return now + Math.max(1, intervalMinutes) * 60_000
+  return now + 60_000
+}
+
 async function probe(baseURL: string, apiKeyEnv: string, credentials: CredentialsFace | undefined): Promise<ProbeResult> {
   const credential = await credentials?.resolve(apiKeyEnv)
   if (credential === undefined || credential.value === '') return { status: 'failed', error: `credential ${apiKeyEnv} is unavailable` }
@@ -137,8 +157,6 @@ async function probe(baseURL: string, apiKeyEnv: string, credentials: Credential
 
 /** Install one process-local runner; settings persist multiplier history across restarts. */
 export function installUpstreamBillingProbes(ctx: Context, scope: SettingsScopeFace<PricingConfig>): () => void {
-  const credentials = ctx.get('credentials') as CredentialsFace | undefined
-  const settings = ctx.get('settings') as { get(namespace: string): unknown }
   const due = new Map<string, number>()
   let disposed = false
   let timer: ReturnType<typeof setTimeout> | undefined
@@ -153,28 +171,52 @@ export function installUpstreamBillingProbes(ctx: Context, scope: SettingsScopeF
       const config = normalizePricing(scope.get())
       const billing = config.billingProbe
       if (billing?.enabled !== true) return
-      const providers = (settings?.get('llm-pi-ai') as { providers?: Record<string, { baseURL?: string; apiKeyEnv?: string }> } | undefined)?.providers ?? {}
+      const credentials = ctx.get('credentials') as CredentialsFace | undefined
+      const settings = ctx.get('settings') as SettingsMutateFace | undefined
+      const providers = (settings?.get('llm-pi-ai') as { providers?: Record<string, ProviderSource> } | undefined)?.providers ?? {}
       const now = Date.now()
-      const targets = new Map<string, { provider: string; baseURL: string; apiKeyEnv: string }>()
-      for (const route of Object.keys(config.models)) {
-        const provider = route.slice(0, route.indexOf('/'))
-        if (billing.providers !== undefined && !billing.providers.includes(provider)) continue
-        const source = providers[provider]
-        if (source?.baseURL === undefined || source.apiKeyEnv === undefined || source.apiKeyEnv === '') continue
-        const identity = `${source.baseURL}\u0000${source.apiKeyEnv}`
-        if ((due.get(identity) ?? 0) <= now) targets.set(identity, { provider, baseURL: source.baseURL, apiKeyEnv: source.apiKeyEnv })
-      }
-      const results = await mapWithConcurrency([...targets.values()], billing.concurrency ?? 2, async target => ({ target, result: await probe(target.baseURL, target.apiKeyEnv, credentials) }))
+      const allowed = billing.providers === undefined ? undefined : new Set(billing.providers)
+      const targets = listProviderBalanceTargets(providers).filter(target => allowed === undefined || allowed.has(target.provider))
+      const dueTargets = targets.filter(target => (due.get(target.provider) ?? 0) <= now)
+      const results = await mapWithConcurrency(dueTargets, billing.concurrency ?? 2, async target => {
+        const [availability, usage, result] = await Promise.all([
+          probeProviderAvailability(target, credentials),
+          probeProviderBalance(target, credentials),
+          probe(target.baseURL, target.apiKeyEnv, credentials),
+        ])
+        return { target, availability, usage, result }
+      })
       if (disposed) return
       const patched: Record<string, ModelAssignment> = {}
       const latest = normalizePricing(scope.get())
+      const removedProviders: string[] = []
       for (const item of results) {
         if (item === null) continue
-        due.set(`${item.target.baseURL}\u0000${item.target.apiKeyEnv}`, Date.now() + (billing.intervalMinutes ?? 30) * 60_000)
-        if (item.result.status !== 'ok' || item.result.multiplier === undefined) continue
+        due.set(item.target.provider, nextBillingProbeDue(Date.now(), billing.intervalMinutes ?? 30, item.result.status))
+        if (shouldRemoveUnavailableProvider(item.availability.available, item.usage.remaining)) {
+          removedProviders.push(item.target.provider)
+          ctx.logger?.warn?.('cost-meter removing unavailable provider %s with remaining %s', item.target.provider, String(item.usage.remaining))
+          continue
+        }
+        if (item.result.status !== 'ok' || item.result.multiplier === undefined) {
+          ctx.logger?.warn?.('cost-meter billing probe %s: %s', item.target.provider, item.result.error ?? item.result.status)
+          continue
+        }
         for (const [route, assignment] of Object.entries(latest.models)) {
           if (route.startsWith(`${item.target.provider}/`)) patched[route] = assignmentWithObservedMultiplier(assignment, item.result.multiplier, item.result.observedAt ?? Date.now())
         }
+      }
+      if (removedProviders.length > 0 && settings?.mutate !== undefined) {
+        const unique = [...new Set(removedProviders)]
+        for (const provider of unique) {
+          for (const route of Object.keys(patched)) {
+            if (route.startsWith(`${provider}/`)) delete patched[route]
+          }
+        }
+        const current = normalizePricing(scope.get())
+        const modelOps = unique.flatMap(provider => routesForProvider(current.models, provider).map(route => ({ op: 'unset' as const, path: ['models', route] })))
+        if (modelOps.length > 0) await settings.mutate('cost-meter', modelOps)
+        await settings.mutate('llm-pi-ai', unique.map(provider => ({ op: 'unset' as const, path: ['providers', provider] })))
       }
       if (Object.keys(patched).length > 0) await scope.update({ models: patched })
     } finally { running = false; schedule(60_000) }

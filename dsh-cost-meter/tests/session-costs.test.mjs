@@ -140,6 +140,16 @@ test('own-fold cache reuses unchanged historical sessions and skips reread', asy
   assert.equal(second[1].cost.cost, first[1].cost.cost)
 })
 
+test('pricing fingerprint ignores lastProbedAt', () => {
+  const a = structuredClone(DEFAULT_PRICING)
+  const b = structuredClone(DEFAULT_PRICING)
+  a.models['vendor/model-a'] = { groupId: a.groups[0].id, lastProbedAt: 1 }
+  b.models['vendor/model-a'] = { groupId: b.groups[0].id, lastProbedAt: 2 }
+  assert.equal(pricingFingerprint(a), pricingFingerprint(b))
+  delete b.models['vendor/model-a'].lastProbedAt
+  assert.equal(pricingFingerprint(a), pricingFingerprint(b))
+})
+
 test('own-fold cache invalidates on pricing change, live rewrite, and deleted sessions', async () => {
   const keep = { header: { id: 'keep', origin: 'user' }, events: parentEvents }
   const gone = { header: { id: 'gone', origin: 'user' }, events: childEvents }
