@@ -55,7 +55,7 @@ cost-meter:
       modelMultiplier: 1
 ```
 
-A pricing group holds the shared base: uncached input, output, cache-read multiplier, cache-write multiplier, time-window multipliers, and context surcharges. Cache-read and cache-write prices are `input ×` those multipliers. Periods use the configured IANA time zone, may cross midnight, and must not overlap within one group; a matching period multiplies every group rate.
+A pricing group holds the shared base: uncached input, output, cache-read multiplier, cache-write multiplier, time-window multipliers, and context surcharges. Cache-read and cache-write prices are `input ×` those multipliers. Periods use the configured IANA time zone, may cross midnight, and must not overlap within one group; a matching period multiplies every group rate. Optional `days` is ISO weekdays `1–7` (Monday–Sunday); omit it for every day. `start === end` covers the whole selected days; `end: "24:00"` is allowed.
 
 The settings card lists groups, not the full catalog. Add a group, then add models into that group and edit each model's `discountMultiplier` and `modelMultiplier` (blank or omitted means 1). A model belongs to at most one group; moving it into another group takes it out of the previous one. Unassigned models use the group whose id is `default`, or the first group if that id is absent.
 

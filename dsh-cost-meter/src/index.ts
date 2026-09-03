@@ -11,6 +11,7 @@ import {
   lastProbeAt,
   lastUpdatedAt,
   multiplierHistoryRows,
+  periodDays,
   assignmentWithManualMultiplier,
   contextTokensOf,
   foldSession,
@@ -32,7 +33,7 @@ import { SessionFoldCache, logFingerprint, pricingFingerprint } from './session-
 import { collectProviderBalances, type ProviderBalance, type ProviderSource } from './provider-balance.js'
 import { installUsageTap } from './usage-tap.js'
 
-export { DEFAULT_GROUP, DEFAULT_PRICING, assignmentWithManualMultiplier, billedOutputTokens, contextTokensOf, discountMultiplierAt, foldSession, formatContextSurcharge, formatTokenThreshold, lastProbeAt, lastUpdatedAt, multiplierHistoryRows, normalizePricing, normalizeUsage, resolveContextMultiplier, resolveContextSurcharge, resolvePricing, resolveReasoningExtra, routeKey, validatePricing }
+export { DEFAULT_GROUP, DEFAULT_PRICING, assignmentWithManualMultiplier, billedOutputTokens, contextTokensOf, discountMultiplierAt, foldSession, formatContextSurcharge, formatTokenThreshold, lastProbeAt, lastUpdatedAt, multiplierHistoryRows, normalizePricing, normalizeUsage, periodDays, resolveContextMultiplier, resolveContextSurcharge, resolvePricing, resolveReasoningExtra, routeKey, validatePricing }
 export { assignmentWithObservedMultiplier, billingProbeURL, nextBillingProbeDue, parseBillingMultiplier } from './upstream-billing-probe.js'
 export { collapseBalanceChips, collectProviderBalances, gatewayOrigin, groupProviderBalanceTargetsByOrigin, listProviderBalanceTargets, modelsURL, parseProviderBalance, probeProviderAvailability, probeProviderBalance, routesForProvider, shouldRemoveUnavailableProvider, usageURL, walletHref } from './provider-balance.js'
 export { applyWireUsage, attachReasoningToChunk, installUsageTap, reasoningFromWireUsage, scanSseBuffer, shouldTapRequest, tapFetchResponse, wrapLlmStream, wrapPrepareCall } from './usage-tap.js'
@@ -111,7 +112,7 @@ export type {
  * Settings schema admits both the current group document and the previous
  * default/models document, then stores the normalized group form.
  */
-export const Config = z.transform(z.any(), (value) => {
+export const Config = z.transform(z.any(), (value: unknown) => {
   const normalized = normalizePricing(value ?? {})
   validatePricing(normalized)
   return normalized
@@ -120,7 +121,7 @@ export const Config = z.transform(z.any(), (value) => {
 const SETTINGS_NS = 'cost-meter'
 
 interface SessionsFace {
-  get(id: string): { events: readonly CostEvent[] } | undefined
+  get(id: string): { snapshotEvents(): readonly CostEvent[] } | undefined
 }
 
 interface SessionRecord {
@@ -175,7 +176,7 @@ function resolveEvents(
   sessions: SessionsFace | undefined,
   query: SessionQueryFace | undefined,
 ): Promise<readonly CostEvent[] | undefined> | readonly CostEvent[] | undefined {
-  const live = sessions?.get(sessionId)?.events
+  const live = sessions?.get(sessionId)?.snapshotEvents()
   if (live !== undefined) return live
   if (query === undefined) return undefined
   return query.readSession(sessionId).then(snapshot => snapshot.events)
@@ -197,7 +198,7 @@ async function ownFoldFor(
   query: SessionQueryFace | undefined,
   store: SessionFoldStore | undefined,
 ): Promise<ReturnType<typeof foldSession> | undefined> {
-  const live = sessions?.get(sessionId)?.events
+  const live = sessions?.get(sessionId)?.snapshotEvents()
   if (live === undefined && store?.peek !== undefined) {
     const cached = store.peek(sessionId, config)
     if (cached !== undefined) return cached

@@ -53,10 +53,25 @@ window.__ModuleLoader__.load({
 			}
 		};
 		const TIME_PATTERN = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
+		const END_TIME_PATTERN = /^(?:[01]\d|2[0-3]):[0-5]\d$|^24:00$/;
+		const ALL_WEEKDAYS = [
+			1,
+			2,
+			3,
+			4,
+			5,
+			6,
+			7
+		];
 		const DEFAULT_GROUP_ID = "default";
 		function minuteOfDay(value) {
+			if (value === "24:00") return 1440;
 			const [hour, minute] = value.split(":").map(Number);
 			return hour * 60 + minute;
+		}
+		/** ISO weekdays a period matches; omitted or empty means every day. */
+		function periodDays(period) {
+			return period.days !== void 0 && period.days.length > 0 ? period.days : ALL_WEEKDAYS;
 		}
 		function finiteOr(value, fallback) {
 			return value !== void 0 && Number.isFinite(value) ? value : fallback;
@@ -102,10 +117,25 @@ window.__ModuleLoader__.load({
 		function minuteSegments(period) {
 			const start = minuteOfDay(period.start);
 			const end = minuteOfDay(period.end);
+			if (start === end) return [[0, 1440]];
 			return start < end ? [[start, end]] : [[start, 1440], [0, end]];
 		}
+		function daysOverlap(left, right) {
+			const rightDays = new Set(periodDays(right));
+			return periodDays(left).some((day) => rightDays.has(day));
+		}
 		function overlaps(left, right) {
+			if (!daysOverlap(left, right)) return false;
 			return minuteSegments(left).some(([leftStart, leftEnd]) => minuteSegments(right).some(([rightStart, rightEnd]) => Math.max(leftStart, rightStart) < Math.min(leftEnd, rightEnd)));
+		}
+		function assertDays(days, path) {
+			if (days === void 0) return;
+			if (!Array.isArray(days) || days.length === 0) throw new TypeError(`${path}.days must be omitted or contain ISO weekdays 1-7`);
+			const seen = /* @__PURE__ */ new Set();
+			for (const day of days) {
+				if (!Number.isInteger(day) || day < 1 || day > 7 || seen.has(day)) throw new TypeError(`${path}.days must be unique ISO weekdays 1-7`);
+				seen.add(day);
+			}
 		}
 		function assertPeriods(periods, path) {
 			if (periods === void 0) return;
@@ -115,8 +145,9 @@ window.__ModuleLoader__.load({
 				if (period.id.trim() === "" || ids.has(period.id)) throw new TypeError(`${itemPath}.id must be unique and non-empty`);
 				ids.add(period.id);
 				if (period.name.trim() === "") throw new TypeError(`${itemPath}.name is required`);
-				if (!TIME_PATTERN.test(period.start) || !TIME_PATTERN.test(period.end) || period.start === period.end) throw new TypeError(`${itemPath} must use distinct HH:mm start and end times`);
+				if (!TIME_PATTERN.test(period.start) || !END_TIME_PATTERN.test(period.end)) throw new TypeError(`${itemPath} must use HH:mm start and HH:mm or 24:00 end times`);
 				assertNonNegative(period.multiplier, `${itemPath}.multiplier`);
+				assertDays(period.days, itemPath);
 			}
 			for (let left = 0; left < periods.length; left += 1) for (let right = left + 1; right < periods.length; right += 1) if (overlaps(periods[left], periods[right])) throw new TypeError(`${path} contains overlapping periods`);
 		}
@@ -162,15 +193,25 @@ window.__ModuleLoader__.load({
 			if (ratios.length === 0) return 1;
 			return ratios.reduce((sum, value) => sum + value, 0) / ratios.length;
 		}
-		function normalizePeriods(periods, base) {
-			if (periods === void 0) return [];
-			return periods.map((period) => ({
+		function normalizeDays(days) {
+			if (!Array.isArray(days)) return void 0;
+			const unique = [...new Set(days.filter((day) => Number.isInteger(day) && day >= 1 && day <= 7))].sort((left, right) => left - right);
+			return unique.length === 0 || unique.length === ALL_WEEKDAYS.length ? void 0 : unique;
+		}
+		function normalizePeriod(period, multiplier) {
+			const days = normalizeDays(period.days);
+			return {
 				id: period.id,
 				name: period.name,
 				start: period.start,
 				end: period.end,
-				multiplier: periodMultiplierOf(period, base)
-			}));
+				multiplier,
+				...days !== void 0 ? { days } : {}
+			};
+		}
+		function normalizePeriods(periods, base) {
+			if (periods === void 0) return [];
+			return periods.map((period) => normalizePeriod(period, periodMultiplierOf(period, base)));
 		}
 		function tokenRatesOf(partial, fallback) {
 			return {
@@ -229,13 +270,7 @@ window.__ModuleLoader__.load({
 			if (Array.isArray(input.groups) && input.groups.length > 0) {
 				const groups = input.groups.map((group) => ({
 					...group,
-					periods: (group.periods ?? []).map((period) => ({
-						id: period.id,
-						name: period.name,
-						start: period.start,
-						end: period.end,
-						multiplier: multiplierOrOne(period.multiplier)
-					})),
+					periods: (group.periods ?? []).map((period) => normalizePeriod(period, multiplierOrOne(period.multiplier))),
 					contextSurcharges: group.contextSurcharges ?? []
 				}));
 				const models = {};
@@ -298,6 +333,7 @@ window.__ModuleLoader__.load({
 			assertContextSurcharges(group.contextSurcharges, `${path}.contextSurcharges`);
 		}
 		function validatePricing(config) {
+			for (const [index, group] of (config.groups ?? []).entries()) assertPeriods(group.periods, `groups[${index}].periods`);
 			config = normalizePricing(config);
 			if (config.currency.trim() === "" || config.currency.length > 8) throw new TypeError("currency must contain 1-8 characters");
 			if (!Number.isSafeInteger(config.unitTokens) || config.unitTokens < 1) throw new TypeError("unitTokens must be a positive safe integer");
@@ -832,12 +868,11 @@ window.__ModuleLoader__.load({
 		}
 		//#endregion
 		//#region src/client.ts
-		const inject = [
-			"slots",
-			"remote",
-			"timer",
-			"connection"
-		];
+		const inject = ["slots", "remote"];
+		function browserInterval(callback, delay) {
+			const id = window.setInterval(callback, delay);
+			return () => window.clearInterval(id);
+		}
 		function remoteErrorText(error) {
 			if (error && typeof error === "object" && "message" in error && typeof error.message === "string") return error.message;
 			return error === void 0 ? "未知错误" : String(error);
@@ -846,6 +881,7 @@ window.__ModuleLoader__.load({
 		async function loadAllSessionCosts(costMeter, sessions) {
 			const remote = await costMeter.sessionCosts();
 			if (remote.ok && Array.isArray(remote.value)) return remote.value;
+			if (sessions === void 0) throw new Error(remoteErrorText(remote.error) || "会话费用加载失败");
 			const listed = await sessions.list({});
 			if (!listed.result.ok || listed.result.value === void 0) throw new Error(remoteErrorText(remote.error ?? listed.result.error) || "会话费用加载失败");
 			const unique = [];
@@ -1076,11 +1112,42 @@ window.__ModuleLoader__.load({
 			1
 		];
 		const PERIOD_MULT_OPTIONS = [
+			.25,
 			.5,
 			.8,
 			1,
 			1.5,
 			2
+		];
+		const WEEKDAY_OPTIONS = [
+			{
+				value: 1,
+				label: "一"
+			},
+			{
+				value: 2,
+				label: "二"
+			},
+			{
+				value: 3,
+				label: "三"
+			},
+			{
+				value: 4,
+				label: "四"
+			},
+			{
+				value: 5,
+				label: "五"
+			},
+			{
+				value: 6,
+				label: "六"
+			},
+			{
+				value: 7,
+				label: "日"
+			}
 		];
 		const MODEL_MULT_OPTIONS = [
 			.5,
@@ -1141,7 +1208,25 @@ window.__ModuleLoader__.load({
 				...props.period,
 				[key]: value
 			});
+			const selected = new Set(props.period.days ?? WEEKDAY_OPTIONS.map((option) => option.value));
+			const allDay = props.period.start === props.period.end;
+			const toggleDay = (day) => {
+				const next = new Set(selected);
+				if (next.has(day)) next.delete(day);
+				else next.add(day);
+				if (next.size === 0 || next.size === WEEKDAY_OPTIONS.length) {
+					const rest = { ...props.period };
+					delete rest.days;
+					props.onChange(rest);
+					return;
+				}
+				set("days", [...next].sort((left, right) => left - right));
+			};
 			return react.default.createElement("div", { style: {
+				display: "flex",
+				flexDirection: "column",
+				gap: 8
+			} }, react.default.createElement("div", { style: {
 				display: "grid",
 				gridTemplateColumns: "minmax(120px, 1fr) 100px 100px 96px auto",
 				gap: 8,
@@ -1153,12 +1238,14 @@ window.__ModuleLoader__.load({
 			})), field("开始", react.default.createElement("input", {
 				style: inputStyle,
 				type: "time",
-				value: props.period.start,
+				value: allDay ? "00:00" : props.period.start,
+				disabled: allDay,
 				onChange: (event) => set("start", event.target.value)
 			})), field("结束", react.default.createElement("input", {
 				style: inputStyle,
 				type: "time",
-				value: props.period.end,
+				value: allDay ? "00:00" : props.period.end,
+				disabled: allDay,
 				onChange: (event) => set("end", event.target.value)
 			})), field("倍率", react.default.createElement(NumberSelect, {
 				value: props.period.multiplier,
@@ -1169,7 +1256,41 @@ window.__ModuleLoader__.load({
 				type: "button",
 				style: buttonStyle,
 				onClick: props.onRemove
-			}, "删除"));
+			}, "删除")), react.default.createElement("div", { style: {
+				display: "flex",
+				flexWrap: "wrap",
+				gap: 8,
+				alignItems: "center"
+			} }, react.default.createElement("label", { style: {
+				display: "flex",
+				alignItems: "center",
+				gap: 6,
+				fontSize: 12
+			} }, react.default.createElement("input", {
+				type: "checkbox",
+				checked: allDay,
+				onChange: (event) => props.onChange(event.target.checked ? {
+					...props.period,
+					start: "00:00",
+					end: "00:00"
+				} : {
+					...props.period,
+					start: "08:00",
+					end: "22:00"
+				})
+			}), "全天"), ...WEEKDAY_OPTIONS.map((option) => react.default.createElement("label", {
+				key: option.value,
+				style: {
+					display: "flex",
+					alignItems: "center",
+					gap: 4,
+					fontSize: 12
+				}
+			}, react.default.createElement("input", {
+				type: "checkbox",
+				checked: selected.has(option.value),
+				onChange: () => toggleDay(option.value)
+			}), option.label))));
 		}
 		function PeriodsEditor(props) {
 			const add = () => props.onChange([...props.periods, {
@@ -2694,11 +2815,13 @@ window.__ModuleLoader__.load({
 			});
 			const slots = ctx.get("slots");
 			const costMeter = ctx.get("remote.costMeter");
-			const connection = ctx.get("connection");
-			if (!slots || !costMeter || !connection) return;
+			if (!slots || !costMeter) return;
 			const pricing = new PricingRouteSource();
 			pricing.load();
-			const catalog = new CatalogSource(connection.api);
+			const catalog = new CatalogSource({ llm: { models: async () => ({ result: {
+				ok: true,
+				value: { groups: [] }
+			} }) } });
 			catalog.load();
 			const remoteEvents = ctx.get("remote");
 			ctx.effect(() => remoteEvents.$on?.("llm/adapters-updated", () => {
@@ -2710,7 +2833,7 @@ window.__ModuleLoader__.load({
 				order: 40
 			}, () => react.default.createElement(BalanceHeader, {
 				costMeter,
-				interval: (callback, delay) => ctx.interval(callback, delay)
+				interval: browserInterval
 			})));
 			slots.inject("conversation.composer.dock", () => slots.register({
 				name: "conversation.composer.dock",
@@ -2719,8 +2842,8 @@ window.__ModuleLoader__.load({
 			}, (props) => react.default.createElement(CostDock, {
 				...props,
 				costMeter,
-				sessions: connection.api.sessions,
-				interval: (callback, delay) => ctx.interval(callback, delay)
+				sessions: void 0,
+				interval: browserInterval
 			})));
 			slots.inject("settings.section", () => slots.register({
 				name: "settings.section",
@@ -2734,7 +2857,7 @@ window.__ModuleLoader__.load({
 					},
 					refreshCatalog: catalog.load,
 					refreshPricing: pricing.load,
-					interval: (callback, delay) => ctx.interval(callback, delay),
+					interval: browserInterval,
 					save: (config) => pricing.save(config)
 				})
 			}, PricingSettingsCard));

@@ -17,6 +17,7 @@ import {
   formatTokenThreshold,
   normalizePricing,
   normalizeUsage,
+  periodDays,
   resolveContextMultiplier,
   resolvePricing,
   resolveReasoningExtra,
@@ -50,6 +51,59 @@ test('resolves group rates, period multipliers, and default fallback', () => {
   assert.equal(nightFallback.periodName, '默认低峰')
   assert.equal(nightFallback.groupId, 'default')
   assert.deepEqual(nightFallback.rates, { input: 0.5, cacheRead: 0.01, cacheWrite: 0.5, output: 1 })
+})
+
+test('matches weekday-scoped periods and whole-day windows', () => {
+  const priced = structuredClone(DEFAULT_PRICING)
+  priced.groups[0] = {
+    id: 'xindu-deepseek',
+    name: 'xindu-deepseek',
+    input: 3,
+    output: 9,
+    cacheReadMultiplier: 0.1,
+    cacheWriteMultiplier: 1,
+    periods: [
+      { id: 'night-late', name: '谷时 22:00-24:00', start: '22:00', end: '00:00', multiplier: 0.5, days: [1, 2, 3, 5, 6, 7] },
+      { id: 'night-early', name: '谷时 00:00-08:00', start: '00:00', end: '08:00', multiplier: 0.5, days: [1, 2, 3, 5, 6, 7] },
+      { id: 'thursday', name: '周四全天', start: '00:00', end: '00:00', multiplier: 0.25, days: [4] },
+    ],
+    contextSurcharges: [],
+  }
+  priced.models['ds-xindu/deepseek-v4-flash'] = { groupId: 'xindu-deepseek', discountMultiplier: 0.2 }
+  validatePricing(priced)
+  assert.deepEqual(periodDays({ days: [4] }), [4])
+  const peak = resolvePricing(priced, 'ds-xindu', 'deepseek-v4-flash', Date.parse('2026-09-01T02:00:00Z'))
+  assert.equal(peak.source, 'group')
+  assert.equal(peak.rates.input.toFixed(2), '0.60')
+  assert.equal(peak.rates.cacheRead.toFixed(2), '0.06')
+  assert.equal(peak.rates.output.toFixed(2), '1.80')
+  const late = resolvePricing(priced, 'ds-xindu', 'deepseek-v4-flash', Date.parse('2026-09-01T14:30:00Z'))
+  assert.equal(late.periodName, '谷时 22:00-24:00')
+  assert.equal(late.rates.input.toFixed(2), '0.30')
+  assert.equal(late.rates.output.toFixed(2), '0.90')
+  const early = resolvePricing(priced, 'ds-xindu', 'deepseek-v4-flash', Date.parse('2026-09-01T16:30:00Z'))
+  assert.equal(early.periodName, '谷时 00:00-08:00')
+  assert.equal(early.rates.input.toFixed(2), '0.30')
+  const thursday = resolvePricing(priced, 'ds-xindu', 'deepseek-v4-flash', Date.parse('2026-09-03T00:35:00Z'))
+  assert.equal(thursday.periodName, '周四全天')
+  assert.equal(thursday.rates.input.toFixed(2), '0.15')
+  assert.equal(thursday.rates.cacheRead.toFixed(3), '0.015')
+  assert.equal(thursday.rates.output.toFixed(2), '0.45')
+})
+
+test('rejects weekday-overlapping periods and accepts disjoint weekdays', () => {
+  const priced = structuredClone(DEFAULT_PRICING)
+  priced.groups[0].periods = [
+    { id: 'weekday', name: '工作日', start: '08:00', end: '22:00', multiplier: 1, days: [1, 2, 3, 4, 5] },
+    { id: 'weekend', name: '周末', start: '08:00', end: '22:00', multiplier: 0.5, days: [6, 7] },
+  ]
+  validatePricing(priced)
+  const overlap = structuredClone(priced)
+  overlap.groups[0].periods[1].days = [5, 6]
+  assert.throws(() => validatePricing(overlap), /overlapping periods/)
+  const badDay = structuredClone(DEFAULT_PRICING)
+  badDay.groups[0].periods = [{ id: 'bad', name: '坏', start: '08:00', end: '22:00', multiplier: 1, days: [0] }]
+  assert.throws(() => validatePricing(badDay), /ISO weekdays/)
 })
 
 test('selects discount multiplier by effective time history', () => {

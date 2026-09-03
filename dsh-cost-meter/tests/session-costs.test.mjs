@@ -126,7 +126,7 @@ test('own-fold cache reuses unchanged historical sessions and skips reread', asy
       return { events: session.events }
     },
   }
-  const liveMap = { get(id) { return id === 'live' ? { events: childEvents } : undefined } }
+  const liveMap = { get(id) { return id === 'live' ? { snapshotEvents() { return childEvents } } : undefined } }
   const store = new SessionFoldCache()
   const first = await collectSessionCosts(query, DEFAULT_PRICING, store, liveMap)
   assert.equal(reads, 1)
@@ -166,7 +166,7 @@ test('own-fold cache invalidates on pricing change, live rewrite, and deleted se
   }
   const liveMap = {
     get(id) {
-      return id === 'keep' ? { events: keep.events } : undefined
+      return id === 'keep' ? { snapshotEvents() { return keep.events } } : undefined
     },
   }
   const store = new SessionFoldCache()

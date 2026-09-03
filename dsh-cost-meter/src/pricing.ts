@@ -21,6 +21,11 @@ export interface PricingPeriod {
   start: string
   end: string
   multiplier: number
+  /**
+   * ISO weekdays this window applies to: 1=Monday … 7=Sunday.
+   * Omitted or empty means every day. `start === end` is the whole day.
+   */
+  days?: number[]
 }
 
 /** Multiply one request's entire cost when its context exceeds `afterTokens`. */
@@ -138,6 +143,9 @@ export const DEFAULT_PRICING: PricingConfig = {
 }
 
 const TIME_PATTERN = /^(?:[01]\d|2[0-3]):[0-5]\d$/
+const END_TIME_PATTERN = /^(?:[01]\d|2[0-3]):[0-5]\d$|^24:00$/
+const ALL_WEEKDAYS = [1, 2, 3, 4, 5, 6, 7] as const
+const WEEKDAY_SHORT: Record<string, number> = { Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6, Sun: 7 }
 const DEFAULT_GROUP_ID = 'default'
 
 export function routeKey(provider: string | null, model: string | null): string | null {
@@ -145,30 +153,43 @@ export function routeKey(provider: string | null, model: string | null): string 
 }
 
 function minuteOfDay(value: string): number {
+  if (value === '24:00') return 1440
   const [hour, minute] = value.split(':').map(Number)
   return hour! * 60 + minute!
 }
 
-function localMinute(time: number, timezone: string): number {
+function localParts(time: number, timezone: string): { minute: number; weekday: number } {
   const parts = new Intl.DateTimeFormat('en-US', {
     timeZone: timezone,
+    weekday: 'short',
     hour: '2-digit',
     minute: '2-digit',
     hourCycle: 'h23',
   }).formatToParts(new Date(time))
   const hour = Number(parts.find(part => part.type === 'hour')?.value)
   const minute = Number(parts.find(part => part.type === 'minute')?.value)
-  return hour * 60 + minute
+  const weekday = WEEKDAY_SHORT[parts.find(part => part.type === 'weekday')?.value ?? ''] ?? 1
+  return { minute: hour * 60 + minute, weekday }
+}
+
+/** ISO weekdays a period matches; omitted or empty means every day. */
+export function periodDays(period: Pick<PricingPeriod, 'days'>): readonly number[] {
+  return period.days !== undefined && period.days.length > 0 ? period.days : ALL_WEEKDAYS
 }
 
 function includesMinute(period: PricingPeriod, minute: number): boolean {
   const start = minuteOfDay(period.start)
   const end = minuteOfDay(period.end)
+  if (start === end) return true
   return start < end ? minute >= start && minute < end : minute >= start || minute < end
 }
 
-function activePeriod(periods: readonly PricingPeriod[] | undefined, minute: number): PricingPeriod | undefined {
-  return periods?.find(period => includesMinute(period, minute))
+function includesDay(period: PricingPeriod, weekday: number): boolean {
+  return periodDays(period).includes(weekday)
+}
+
+function activePeriod(periods: readonly PricingPeriod[] | undefined, minute: number, weekday: number): PricingPeriod | undefined {
+  return periods?.find(period => includesDay(period, weekday) && includesMinute(period, minute))
 }
 
 function finiteOr(value: number | undefined, fallback: number): number {
@@ -271,10 +292,10 @@ function groupRates(group: PricingGroup, periodMultiplier: number, discountMulti
 
 export function resolvePricing(config: PricingConfig, provider: string | null, model: string | null, time: number): ResolvedPricing {
   config = normalizePricing(config)
-  const minute = localMinute(time, config.timezone)
+  const { minute, weekday } = localParts(time, config.timezone)
   const assignment = assignmentOf(config, provider, model)
   const group = findGroup(config, assignment?.groupId)
-  const period = activePeriod(group.periods, minute)
+  const period = activePeriod(group.periods, minute, weekday)
   const periodMultiplier = multiplierOrOne(period?.multiplier)
   const discountMultiplier = discountMultiplierAt(assignment, time)
   const modelMultiplier = multiplierOrOne(assignment?.modelMultiplier)
@@ -397,12 +418,31 @@ function assertNonNegative(value: number, path: string): void {
 function minuteSegments(period: PricingPeriod): Array<[number, number]> {
   const start = minuteOfDay(period.start)
   const end = minuteOfDay(period.end)
+  if (start === end) return [[0, 1440]]
   return start < end ? [[start, end]] : [[start, 1440], [0, end]]
 }
 
+function daysOverlap(left: PricingPeriod, right: PricingPeriod): boolean {
+  const rightDays = new Set(periodDays(right))
+  return periodDays(left).some(day => rightDays.has(day))
+}
+
 function overlaps(left: PricingPeriod, right: PricingPeriod): boolean {
+  if (!daysOverlap(left, right)) return false
   return minuteSegments(left).some(([leftStart, leftEnd]) => minuteSegments(right)
     .some(([rightStart, rightEnd]) => Math.max(leftStart, rightStart) < Math.min(leftEnd, rightEnd)))
+}
+
+function assertDays(days: readonly number[] | undefined, path: string): void {
+  if (days === undefined) return
+  if (!Array.isArray(days) || days.length === 0) throw new TypeError(`${path}.days must be omitted or contain ISO weekdays 1-7`)
+  const seen = new Set<number>()
+  for (const day of days) {
+    if (!Number.isInteger(day) || day < 1 || day > 7 || seen.has(day)) {
+      throw new TypeError(`${path}.days must be unique ISO weekdays 1-7`)
+    }
+    seen.add(day)
+  }
 }
 
 function assertPeriods(periods: readonly PricingPeriod[] | undefined, path: string): void {
@@ -413,10 +453,11 @@ function assertPeriods(periods: readonly PricingPeriod[] | undefined, path: stri
     if (period.id.trim() === '' || ids.has(period.id)) throw new TypeError(`${itemPath}.id must be unique and non-empty`)
     ids.add(period.id)
     if (period.name.trim() === '') throw new TypeError(`${itemPath}.name is required`)
-    if (!TIME_PATTERN.test(period.start) || !TIME_PATTERN.test(period.end) || period.start === period.end) {
-      throw new TypeError(`${itemPath} must use distinct HH:mm start and end times`)
+    if (!TIME_PATTERN.test(period.start) || !END_TIME_PATTERN.test(period.end)) {
+      throw new TypeError(`${itemPath} must use HH:mm start and HH:mm or 24:00 end times`)
     }
     assertNonNegative(period.multiplier, `${itemPath}.multiplier`)
+    assertDays(period.days, itemPath)
   }
   for (let left = 0; left < periods.length; left += 1) {
     for (let right = left + 1; right < periods.length; right += 1) {
@@ -446,6 +487,7 @@ interface LegacyPeriod {
   end: string
   rates?: PartialTokenRates
   multiplier?: number
+  days?: number[]
 }
 
 interface LegacyPlan {
@@ -508,15 +550,28 @@ function periodMultiplierOf(period: LegacyPeriod, base: TokenRates): number {
   return ratios.reduce((sum, value) => sum + value, 0) / ratios.length
 }
 
-function normalizePeriods(periods: readonly LegacyPeriod[] | undefined, base: TokenRates): PricingPeriod[] {
-  if (periods === undefined) return []
-  return periods.map(period => ({
+function normalizeDays(days: unknown): number[] | undefined {
+  if (!Array.isArray(days)) return undefined
+  const unique = [...new Set(days.filter((day): day is number => Number.isInteger(day) && day >= 1 && day <= 7))]
+    .sort((left, right) => left - right)
+  return unique.length === 0 || unique.length === ALL_WEEKDAYS.length ? undefined : unique
+}
+
+function normalizePeriod(period: LegacyPeriod, multiplier: number): PricingPeriod {
+  const days = normalizeDays(period.days)
+  return {
     id: period.id,
     name: period.name,
     start: period.start,
     end: period.end,
-    multiplier: periodMultiplierOf(period, base),
-  }))
+    multiplier,
+    ...(days !== undefined ? { days } : {}),
+  }
+}
+
+function normalizePeriods(periods: readonly LegacyPeriod[] | undefined, base: TokenRates): PricingPeriod[] {
+  if (periods === undefined) return []
+  return periods.map(period => normalizePeriod(period, periodMultiplierOf(period, base)))
 }
 
 function tokenRatesOf(partial: PartialTokenRates | undefined, fallback: TokenRates): TokenRates {
@@ -590,13 +645,10 @@ export function normalizePricing(raw: unknown): PricingConfig {
   if (hasGroups) {
     const groups = input.groups!.map(group => ({
       ...group,
-      periods: (group.periods ?? []).map(period => ({
-        id: period.id,
-        name: period.name,
-        start: period.start,
-        end: period.end,
-        multiplier: multiplierOrOne((period as LegacyPeriod).multiplier),
-      })),
+      periods: (group.periods ?? []).map(period => normalizePeriod(
+        period as LegacyPeriod,
+        multiplierOrOne((period as LegacyPeriod).multiplier),
+      )),
       contextSurcharges: group.contextSurcharges ?? [],
     }))
     const models: Record<string, ModelAssignment> = {}
@@ -655,6 +707,9 @@ function assertGroup(group: PricingGroup, path: string): void {
 }
 
 export function validatePricing(config: PricingConfig): void {
+  for (const [index, group] of (config.groups ?? []).entries()) {
+    assertPeriods(group.periods, `groups[${index}].periods`)
+  }
   config = normalizePricing(config)
   if (config.currency.trim() === '' || config.currency.length > 8) throw new TypeError('currency must contain 1-8 characters')
   if (!Number.isSafeInteger(config.unitTokens) || config.unitTokens < 1) throw new TypeError('unitTokens must be a positive safe integer')

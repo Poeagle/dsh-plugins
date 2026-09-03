@@ -32,7 +32,12 @@ import {
   type HourlySlice,
 } from './session-table.js'
 
-export const inject = ['slots', 'remote', 'timer', 'connection']
+export const inject = ['slots', 'remote']
+
+function browserInterval(callback: () => void, delay: number): () => void {
+  const id = window.setInterval(callback, delay)
+  return () => window.clearInterval(id)
+}
 
 interface CostFold {
   cost: number
@@ -159,10 +164,8 @@ interface SessionListItem {
 }
 interface ApiFace {
   llm: { models(input: {}): Promise<{ result: { ok: boolean; value?: { groups: ModelGroup[] } } }> }
-  sessions: { list(input: {}): Promise<{ result: { ok: boolean; value?: { items: SessionListItem[] }; error?: unknown } }> }
+  sessions?: { list(input: {}): Promise<{ result: { ok: boolean; value?: { items: SessionListItem[] }; error?: unknown } }> }
 }
-interface ConnectionFace { api: ApiFace }
-
 function remoteErrorText(error: unknown): string {
   if (error && typeof error === 'object' && 'message' in error && typeof (error as { message: unknown }).message === 'string') {
     return (error as { message: string }).message
@@ -175,6 +178,9 @@ const SESSION_COST_CONCURRENCY = 8
 async function loadAllSessionCosts(costMeter: CostMeterFace, sessions: ApiFace['sessions']): Promise<SessionCostRecord[]> {
   const remote = await costMeter.sessionCosts()
   if (remote.ok && Array.isArray(remote.value)) return remote.value
+  if (sessions === undefined) {
+    throw new Error(remoteErrorText(remote.error) || '会话费用加载失败')
+  }
   const listed = await sessions.list({})
   if (!listed.result.ok || listed.result.value === undefined) {
     throw new Error(remoteErrorText(remote.error ?? listed.result.error) || '会话费用加载失败')
@@ -309,7 +315,16 @@ const UNIT_TOKEN_OPTIONS = [1_000, 1_000_000]
 const INTERVAL_OPTIONS = [5, 15, 30, 60, 120, 360, 1440]
 const CONCURRENCY_OPTIONS = [1, 2, 4, 8]
 const CACHE_MULT_OPTIONS = [0, 0.02, 0.1, 0.25, 0.5, 1]
-const PERIOD_MULT_OPTIONS = [0.5, 0.8, 1, 1.5, 2]
+const PERIOD_MULT_OPTIONS = [0.25, 0.5, 0.8, 1, 1.5, 2]
+const WEEKDAY_OPTIONS = [
+  { value: 1, label: '一' },
+  { value: 2, label: '二' },
+  { value: 3, label: '三' },
+  { value: 4, label: '四' },
+  { value: 5, label: '五' },
+  { value: 6, label: '六' },
+  { value: 7, label: '日' },
+] as const
 const MODEL_MULT_OPTIONS = [0.5, 0.8, 1, 1.2, 1.5, 2]
 const SURCHARGE_AFTER_OPTIONS = [32_000, 64_000, 128_000, 200_000, 256_000, 1_000_000]
 const SURCHARGE_MULT_OPTIONS = [1.5, 2, 3]
@@ -348,12 +363,44 @@ function formatUnitTokens(value: number): string {
 
 function PeriodEditor(props: { period: PricingPeriod; onChange(period: PricingPeriod): void; onRemove(): void }) {
   const set = <K extends keyof PricingPeriod>(key: K, value: PricingPeriod[K]) => props.onChange({ ...props.period, [key]: value })
-  return React.createElement('div', { style: { display: 'grid', gridTemplateColumns: 'minmax(120px, 1fr) 100px 100px 96px auto', gap: 8, alignItems: 'end' } },
-    field('时段名称', React.createElement('input', { style: inputStyle, value: props.period.name, onChange: (event: React.ChangeEvent<HTMLInputElement>) => set('name', event.target.value) })),
-    field('开始', React.createElement('input', { style: inputStyle, type: 'time', value: props.period.start, onChange: (event: React.ChangeEvent<HTMLInputElement>) => set('start', event.target.value) })),
-    field('结束', React.createElement('input', { style: inputStyle, type: 'time', value: props.period.end, onChange: (event: React.ChangeEvent<HTMLInputElement>) => set('end', event.target.value) })),
-    field('倍率', React.createElement(NumberSelect, { value: props.period.multiplier, options: PERIOD_MULT_OPTIONS, format: value => `×${value}`, onChange: value => set('multiplier', value) })),
-    React.createElement('button', { type: 'button', style: buttonStyle, onClick: props.onRemove }, '删除'),
+  const selected = new Set(props.period.days ?? WEEKDAY_OPTIONS.map(option => option.value))
+  const allDay = props.period.start === props.period.end
+  const toggleDay = (day: number) => {
+    const next = new Set(selected)
+    if (next.has(day)) next.delete(day)
+    else next.add(day)
+    if (next.size === 0 || next.size === WEEKDAY_OPTIONS.length) {
+      const rest = { ...props.period }
+      delete rest.days
+      props.onChange(rest)
+      return
+    }
+    set('days', [...next].sort((left, right) => left - right))
+  }
+  return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 8 } },
+    React.createElement('div', { style: { display: 'grid', gridTemplateColumns: 'minmax(120px, 1fr) 100px 100px 96px auto', gap: 8, alignItems: 'end' } },
+      field('时段名称', React.createElement('input', { style: inputStyle, value: props.period.name, onChange: (event: React.ChangeEvent<HTMLInputElement>) => set('name', event.target.value) })),
+      field('开始', React.createElement('input', { style: inputStyle, type: 'time', value: allDay ? '00:00' : props.period.start, disabled: allDay, onChange: (event: React.ChangeEvent<HTMLInputElement>) => set('start', event.target.value) })),
+      field('结束', React.createElement('input', { style: inputStyle, type: 'time', value: allDay ? '00:00' : props.period.end, disabled: allDay, onChange: (event: React.ChangeEvent<HTMLInputElement>) => set('end', event.target.value) })),
+      field('倍率', React.createElement(NumberSelect, { value: props.period.multiplier, options: PERIOD_MULT_OPTIONS, format: value => `×${value}`, onChange: value => set('multiplier', value) })),
+      React.createElement('button', { type: 'button', style: buttonStyle, onClick: props.onRemove }, '删除'),
+    ),
+    React.createElement('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' } },
+      React.createElement('label', { style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 } },
+        React.createElement('input', {
+          type: 'checkbox',
+          checked: allDay,
+          onChange: (event: React.ChangeEvent<HTMLInputElement>) => props.onChange(event.target.checked
+            ? { ...props.period, start: '00:00', end: '00:00' }
+            : { ...props.period, start: '08:00', end: '22:00' }),
+        }),
+        '全天',
+      ),
+      ...WEEKDAY_OPTIONS.map(option => React.createElement('label', { key: option.value, style: { display: 'flex', alignItems: 'center', gap: 4, fontSize: 12 } },
+        React.createElement('input', { type: 'checkbox', checked: selected.has(option.value), onChange: () => toggleDay(option.value) }),
+        option.label,
+      )),
+    ),
   )
 }
 
@@ -1194,22 +1241,23 @@ export async function apply(ctx: Context) {
   })
   const slots = ctx.get('slots') as SlotsFace | undefined
   const costMeter = ctx.get('remote.costMeter') as CostMeterFace | undefined
-  const connection = ctx.get('connection') as ConnectionFace | undefined
-  if (!slots || !costMeter || !connection) return
+  if (!slots || !costMeter) return
   const pricing = new PricingRouteSource()
   void pricing.load()
-  const catalog = new CatalogSource(connection.api)
+  const catalog = new CatalogSource({
+    llm: { models: async () => ({ result: { ok: true, value: { groups: [] } } }) },
+  })
   void catalog.load()
   const remoteEvents = ctx.get('remote') as { $on?(event: string, listener: (...args: any[]) => void): () => void }
   ctx.effect(() => remoteEvents.$on?.('llm/adapters-updated', () => { void catalog.load() }) ?? (() => {}), 'cost-meter catalog updates')
 
   slots.inject('conversation.session.header.utilities', () => slots.register(
     { name: 'conversation.session.header.utilities', id: 'cost-meter-balance', order: 40 },
-    () => React.createElement(BalanceHeader, { costMeter, interval: (callback, delay) => (ctx as any).interval(callback, delay) }),
+    () => React.createElement(BalanceHeader, { costMeter, interval: browserInterval }),
   ))
   slots.inject('conversation.composer.dock', () => slots.register(
     { name: 'conversation.composer.dock', id: 'cost-meter', order: 40 },
-    (props: { sessionId: string }) => React.createElement(CostDock, { ...props, costMeter, sessions: connection.api.sessions, interval: (callback, delay) => (ctx as any).interval(callback, delay) }),
+    (props: { sessionId: string }) => React.createElement(CostDock, { ...props, costMeter, sessions: undefined, interval: browserInterval }),
   ))
   slots.inject('settings.section', () => slots.register({
     name: 'settings.section',
@@ -1220,7 +1268,7 @@ export async function apply(ctx: Context) {
       hooks: { pricing, catalog },
       refreshCatalog: catalog.load,
       refreshPricing: pricing.load,
-      interval: (callback: () => void, delay: number) => (ctx as any).interval(callback, delay),
+      interval: browserInterval,
       save: (config: PricingConfig) => pricing.save(config),
     }),
   }, PricingSettingsCard))
