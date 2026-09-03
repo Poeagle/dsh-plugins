@@ -5,14 +5,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import AgentRegistry, { Inbox, type Agent } from '@deepseek-ai/dsh-agent'
 import LlmRuntime, {
-  CallId,
+  ToolCallId,
   LlmAdapter,
   createUserMessage,
   type GenerateOptions,
   type LlmResolvedModelInfo,
   type StreamChunk,
 } from '@deepseek-ai/dsh-llm'
-import { Session, SessionId, SessionStore, type SessionEvent } from '@deepseek-ai/dsh-session'
+import { Session, SessionId, SessionSeq, SessionStore, type SessionEvent } from '@deepseek-ai/dsh-session'
 import { agentEvents } from '@deepseek-ai/dsh-agent'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
@@ -40,7 +40,7 @@ function textResponse(text: string): StreamChunk[] {
 
 /** One tool-call completion ending in a tool-calls finish. */
 function toolCallResponse(rawCallId: string, name: string, args: object): StreamChunk[] {
-  const callId = CallId(rawCallId)
+  const callId = ToolCallId(rawCallId)
   const argumentsJson = JSON.stringify(args)
   return [
     { type: 'block-start', index: 0, blockType: 'tool-call' },
@@ -92,7 +92,7 @@ async function seedFile(target: 'memory' | 'user', ...entries: string[]): Promis
 
 /** Execute one memory tool call through the registry and return the parsed result. */
 async function callMemory(c: Context, args: Record<string, unknown>): Promise<Record<string, unknown>> {
-  const result = await c.tools.execute({ signal: SIGNAL, callId: CallId(`mem-${String(Math.random())}`), name: 'memory', arguments: args })
+  const result = await c.tools.execute({ signal: SIGNAL, callId: ToolCallId(`mem-${String(Math.random())}`), name: 'memory', arguments: args })
   expect(result.isError).toBe(false)
   const text = result.content.find(block => block.type === 'text')
   if (text?.type !== 'text') throw new Error('memory tool produced no text block')
@@ -388,13 +388,13 @@ describe('nudge gating', () => {
     const seed: SessionEvent[] = []
     for (let turn = 1; turn <= 2; turn += 1) {
       const base = (turn - 1) * 3
-      seed.push({ type: 'turn/start', seq: base, time: turn * 10, data: { turn } })
+      seed.push({ type: 'turn/start', seq: SessionSeq(base), time: turn * 10, data: { turn } })
       seed.push({
-        type: 'user/message', seq: base + 1, time: turn * 10 + 1,
+        type: 'user/message', seq: SessionSeq(base + 1), time: turn * 10 + 1,
         data: createUserMessage({ content: [{ type: 'text', text: `old ${String(turn)}` }], source: { kind: 'user' } }),
         surfaceOp: 'append',
       })
-      seed.push({ type: 'turn/end', seq: base + 2, time: turn * 10 + 2, data: { turn, reason: { kind: 'completed' } } })
+      seed.push({ type: 'turn/end', seq: SessionSeq(base + 2), time: turn * 10 + 2, data: { turn, reason: { kind: 'completed' } } })
     }
     const session = c.sessions.create(SessionId('resumed'), { seed })
     session.append('request/header', {
@@ -414,10 +414,10 @@ describe('nudge gating', () => {
     const adapter = new ScriptedAdapter([textResponse('Nothing to save.')])
     c.llm.registerAdapter(['mock'], adapter)
     const seed: SessionEvent[] = [
-      { type: 'user/message', seq: 0, time: 1, data: createUserMessage({ content: [{ type: 'text', text: 'old real user' }], source: { kind: 'user' } }), surfaceOp: 'append' },
-      { type: 'turn/end', seq: 1, time: 2, data: { turn: 1, reason: { kind: 'completed' } } },
-      { type: 'user/message', seq: 2, time: 3, data: createUserMessage({ content: [{ type: 'text', text: 'injected' }], source: { kind: 'plugin', plugin: 'memory' } }), surfaceOp: 'append' },
-      { type: 'user/message', seq: 3, time: 4, data: createUserMessage({ content: [{ type: 'text', text: 'tool context' }], source: { kind: 'tool', callId: CallId('context-call') } }), surfaceOp: 'append' },
+      { type: 'user/message', seq: SessionSeq(0), time: 1, data: createUserMessage({ content: [{ type: 'text', text: 'old real user' }], source: { kind: 'user' } }), surfaceOp: 'append' },
+      { type: 'turn/end', seq: SessionSeq(1), time: 2, data: { turn: 1, reason: { kind: 'completed' } } },
+      { type: 'user/message', seq: SessionSeq(2), time: 3, data: createUserMessage({ content: [{ type: 'text', text: 'injected' }], source: { kind: 'plugin', plugin: 'memory' } }), surfaceOp: 'append' },
+      { type: 'user/message', seq: SessionSeq(3), time: 4, data: createUserMessage({ content: [{ type: 'text', text: 'tool context' }], source: { kind: 'tool', callId: ToolCallId('context-call') } }), surfaceOp: 'append' },
     ]
     const session = c.sessions.create(SessionId('restored-settings'), { seed })
     session.append('request/header', { header: { config: { provider: 'mock', model: 'mock-model' } }, reason: 'initial' })
@@ -506,7 +506,7 @@ describe('background review spawning', () => {
       await expect(memoryReviewNotices.list(String(session.id))).resolves.toHaveLength(1)
     })
     expect((await memoryReviewNotices.list(String(session.id)))[0]).toMatchObject(expected)
-    expect(session.events).not.toContainEqual(expect.objectContaining({ type: 'memory/review-updated' }))
+    expect(session.snapshotEvents()).not.toContainEqual(expect.objectContaining({ type: 'memory/review-updated' }))
   })
 
   it('saves entries the forked review writes', async () => {

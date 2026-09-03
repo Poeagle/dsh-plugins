@@ -402,7 +402,7 @@ describe('MemoryStore', () => {
       expect(r.error).toContain("wouldn't round-trip")
       expect(r.drift_backup).toBeDefined()
       expect(r.remediation).toContain('.bak file')
-      const backups = (await readdir(dir as string)).filter(f => f.includes('.bak.'))
+      const backups = (await readdir(dir as string)).filter((f: string) => f.includes('.bak.'))
       expect(backups.length).toBeGreaterThan(0)
     })
 

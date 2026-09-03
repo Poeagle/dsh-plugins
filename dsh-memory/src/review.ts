@@ -16,7 +16,7 @@ import {
   createToolResultMessage,
   createUserMessage,
 } from '@deepseek-ai/dsh-llm'
-import type { CallId, ContentBlock, Message, ToolSchema } from '@deepseek-ai/dsh-llm'
+import type { ToolCallId, ContentBlock, Message, ToolSchema } from '@deepseek-ai/dsh-llm'
 import type { Session } from '@deepseek-ai/dsh-session'
 import { parameterSchemaSpecToJsonSchema } from '@deepseek-ai/dsh-tools'
 import { MEMORY_TOOL_DESCRIPTION, MEMORY_TOOL_PARAMETERS, dispatchMemoryTool, toMemoryToolArgs } from './schema.ts'
@@ -182,7 +182,7 @@ interface ReviewToolOutcome {
  */
 async function executeReviewToolCall(
   store: MemoryStore,
-  callId: CallId,
+  callId: ToolCallId,
   name: string,
   rawArguments: string,
 ): Promise<ReviewToolOutcome> {

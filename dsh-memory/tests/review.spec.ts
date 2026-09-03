@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import LlmRuntime, {
-  CallId,
+  ToolCallId,
   LlmAdapter,
   createUserMessage,
   type GenerateOptions,
@@ -33,7 +33,7 @@ function textResponse(text: string): StreamChunk[] {
 
 /** One tool-call completion ending in a tool-calls finish. */
 function toolCallResponse(rawCallId: string, name: string, args: object): StreamChunk[] {
-  const callId = CallId(rawCallId)
+  const callId = ToolCallId(rawCallId)
   const argumentsJson = JSON.stringify(args)
   return [
     { type: 'block-start', index: 0, blockType: 'tool-call' },
@@ -334,7 +334,7 @@ describe('runMemoryReview', () => {
     // The argument strings are crafted raw so one fails JSON.parse and the
     // other parses to a non-object.
     const rawJson = (raw: string): StreamChunk[] => {
-      const callId = CallId('c1')
+      const callId = ToolCallId('c1')
       return [
         { type: 'block-start', index: 0, blockType: 'tool-call' },
         { type: 'block-end', index: 0, block: { type: 'tool-call', id: callId, name: 'memory', arguments: raw } },

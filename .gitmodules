@@ -4,9 +4,6 @@
 [submodule "dsh-prompt-enhancer"]
 	path = dsh-prompt-enhancer
 	url = https://github.com/Poeagle/dsh-prompt-enhancer.git
-[submodule "dsh-agent-teams"]
-	path = dsh-agent-teams
-	url = https://github.com/Poeagle/dsh-agent-teams.git
 [submodule "open-design"]
 	path = open-design
 	url = https://github.com/Poeagle/open-design.git

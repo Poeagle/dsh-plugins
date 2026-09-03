@@ -1533,7 +1533,7 @@ function isCountedUserMessage(event) {
 function priorCompletedUserTurns(session) {
 	let pendingUserTurn = false;
 	let count = 0;
-	for (const event of session.events) {
+	for (const event of session.snapshotEvents()) {
 		if (isCountedUserMessage(event)) pendingUserTurn = true;
 		if (event.type !== "turn/end") continue;
 		if (pendingUserTurn && event.data.reason.kind === "completed") count += 1;
@@ -1544,7 +1544,7 @@ function priorCompletedUserTurns(session) {
 /** True when a counted user message is still waiting for its `turn/end`. */
 function hasPendingCountedUserTurn(session) {
 	let pendingUserTurn = false;
-	for (const event of session.events) {
+	for (const event of session.snapshotEvents()) {
 		if (isCountedUserMessage(event)) pendingUserTurn = true;
 		if (event.type === "turn/end") pendingUserTurn = false;
 	}
@@ -1630,7 +1630,7 @@ async function apply(ctx, config) {
 		injectionLocks.set(sid, lock);
 		try {
 			if (agent.session.surface.nodes.some((seq) => {
-				const event = agent.session.events[seq];
+				const event = agent.session.eventAt(seq);
 				if (event?.type !== "user/message") return false;
 				const message = event.data;
 				return message.source?.kind === "plugin" && message.source?.plugin === "memory";
@@ -1784,4 +1784,4 @@ async function apply(ctx, config) {
 //#endregion
 export { DEFAULT_USER_CHAR_LIMIT as a, name as c, memoryReviewNotices as d, MemoryStore as f, DEFAULT_REVIEW_MAX_ITERATIONS as i, memoryReviewProgress as l, DEFAULT_MEMORY_CHAR_LIMIT as n, apply as o, DEFAULT_NUDGE_INTERVAL as r, inject as s, Config as t, remainingTurnsUntilReview as u };
 
-//# sourceMappingURL=src-Dtyemm0a.js.map
+//# sourceMappingURL=src-D3nwv_5e.js.map

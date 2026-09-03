@@ -22,7 +22,7 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { PreStepDecision } from '@deepseek-ai/dsh-agent'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import type { SessionId } from '@deepseek-ai/dsh-session'
-import type { JsonValue } from '@deepseek-ai/dsh-session'
+import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 import { MemoryStore } from './store.ts'
 import { memoryReviewNotices } from './review-notices.ts'
 import { memoryReviewProgress, remainingTurnsUntilReview } from './review-progress.ts'
@@ -115,7 +115,7 @@ function isCountedUserMessage(event: SessionEvent): event is Extract<SessionEven
 function priorCompletedUserTurns(session: Session): number {
   let pendingUserTurn = false
   let count = 0
-  for (const event of session.events) {
+  for (const event of session.snapshotEvents()) {
     if (isCountedUserMessage(event)) pendingUserTurn = true
     if (event.type !== 'turn/end') continue
     if (pendingUserTurn && event.data.reason.kind === 'completed') count += 1
@@ -127,7 +127,7 @@ function priorCompletedUserTurns(session: Session): number {
 /** True when a counted user message is still waiting for its `turn/end`. */
 function hasPendingCountedUserTurn(session: Session): boolean {
   let pendingUserTurn = false
-  for (const event of session.events) {
+  for (const event of session.snapshotEvents()) {
     if (isCountedUserMessage(event)) pendingUserTurn = true
     if (event.type === 'turn/end') pendingUserTurn = false
   }
@@ -232,7 +232,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       // it from the current model-visible surface. Only a surviving surface node
       // proves that this session still carries the memory context.
       const alreadyOnSurface = agent.session.surface.nodes.some(seq => {
-        const event = agent.session.events[seq]
+        const event = agent.session.eventAt(seq)
         if (event?.type !== 'user/message') return false
         const message = event.data as { source?: { kind?: string; plugin?: string } }
         return message.source?.kind === 'plugin' && message.source?.plugin === name
