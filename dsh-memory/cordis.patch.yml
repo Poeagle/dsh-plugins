@@ -1,7 +1,10 @@
-# dsh-memory bundle patch. The settings row registers the HTTP route for memory
-# management. The main dsh-memory row is owned by the cordis-memory preset and
-# must not be mounted a second time by this profile patch.
+# dsh-memory bundle patch. The package-root row is what the Web client scanner
+# can see (`dsh-memory/settings` is a subpath and is ignored). The settings row
+# owns the HTTP route and the `memory` settings namespace.
 - insert:
     - id: memory-settings
       name: dsh-memory/settings
+      config: {}
+    - id: memory
+      name: dsh-memory
       config: {}

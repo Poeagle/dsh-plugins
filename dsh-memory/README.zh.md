@@ -19,12 +19,7 @@
 }
 ```
 
-然后在需要携带记忆的 preset 组合里加一行：
-
-```yaml
-- id: memory
-  name: 'dsh-memory'
-```
+profile 的 bundle patch 会挂上两行 Host 插件：`dsh-memory`（包根，Web 客户端扫描只认这个精确包名）和 `dsh-memory/settings`（HTTP 路由 + settings 命名空间）。不要再在 agent preset 里挂一次 `dsh-memory`：第二次包根行会在 `tools.register('memory')` 上冲突，而只挂在 preset 里则客户端扫描看不到它。
 
 本地构建与测试：
 

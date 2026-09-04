@@ -19,12 +19,7 @@ The source lives outside the harness repo and is linked into a dsh profile with 
 }
 ```
 
-Then add one row to the preset composition that should carry memory:
-
-```yaml
-- id: memory
-  name: 'dsh-memory'
-```
+The profile bundle patch mounts both Host rows: `dsh-memory` (package root, required for Web client discovery) and `dsh-memory/settings` (HTTP route + settings namespace). Do not also mount `dsh-memory` from an agent preset — a second package-root row collides on `tools.register('memory')`, and a preset-only mount is invisible to the client scanner.
 
 Build and test locally:
 
