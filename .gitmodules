@@ -7,3 +7,12 @@
 [submodule "open-design"]
 	path = open-design
 	url = https://github.com/Poeagle/open-design.git
+[submodule "dsh-im"]
+	path = dsh-im
+	url = https://github.com/Poeagle/dsh-im.git
+[submodule "dsh-web"]
+	path = dsh-web
+	url = https://github.com/Poeagle/dsh-web.git
+[submodule "dsh-market"]
+	path = dsh-market
+	url = https://github.com/Poeagle/dsh-market.git
