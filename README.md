@@ -15,5 +15,3 @@ Web profile links:
 | `@xmanrui/dsh-im` | submodule → [Poeagle/dsh-im](https://github.com/Poeagle/dsh-im) (`upstream`: xmanrui), currently `v4.11.0` |
 | `@linxin666/dsh-web-all` | submodule → [Poeagle/dsh-web](https://github.com/Poeagle/dsh-web) (`upstream`: zhu1090093659), currently `v0.3.14` |
 | `dshmarket` | submodule → [Poeagle/dsh-market](https://github.com/Poeagle/dsh-market) (`upstream`: dsh-market), currently `v1.42.0` |
-
-Unused clones kept as submodules: `archify`, `open-design`.

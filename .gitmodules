@@ -1,12 +1,6 @@
-[submodule "archify"]
-	path = archify
-	url = https://github.com/Poeagle/archify.git
 [submodule "dsh-prompt-enhancer"]
 	path = dsh-prompt-enhancer
 	url = https://github.com/Poeagle/dsh-prompt-enhancer.git
-[submodule "open-design"]
-	path = open-design
-	url = https://github.com/Poeagle/open-design.git
 [submodule "dsh-im"]
 	path = dsh-im
 	url = https://github.com/Poeagle/dsh-im.git
