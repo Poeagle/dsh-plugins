@@ -331,7 +331,6 @@ const WEEKDAY_OPTIONS = [
   { value: 6, label: '六' },
   { value: 7, label: '日' },
 ] as const
-const MODEL_MULT_OPTIONS = [0.5, 0.8, 1, 1.2, 1.5, 2]
 const SURCHARGE_AFTER_OPTIONS = [32_000, 64_000, 128_000, 200_000, 256_000, 1_000_000]
 const SURCHARGE_MULT_OPTIONS = [1.5, 2, 3]
 
@@ -493,16 +492,14 @@ function GroupModelRow(props: {
       React.createElement('button', { type: 'button', style: buttonStyle, onClick: props.onRemove }, '移出'),
     ),
     React.createElement('div', { style: { display: 'grid', gridTemplateColumns: 'minmax(110px, 1fr) minmax(110px, 1fr) auto', gap: 8, alignItems: 'end' } },
-      field('优惠倍率', React.createElement(NumberSelect, {
-        value: props.assignment.discountMultiplier ?? 1,
-        options: MODEL_MULT_OPTIONS,
-        format: value => `×${value}`,
+      field('优惠倍率', React.createElement(NumberInput, {
+        value: props.assignment.discountMultiplier,
+        placeholder: '1',
         onChange: value => set({ ...props.assignment, discountMultiplier: value }),
       })),
-      field('模型倍率', React.createElement(NumberSelect, {
-        value: props.assignment.modelMultiplier ?? 1,
-        options: MODEL_MULT_OPTIONS,
-        format: value => `×${value}`,
+      field('模型倍率', React.createElement(NumberInput, {
+        value: props.assignment.modelMultiplier,
+        placeholder: '1',
         onChange: value => set({ ...props.assignment, modelMultiplier: value }),
       })),
       React.createElement('label', { style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: 'var(--dsw-alias-label-secondary)', paddingBottom: 6 } },

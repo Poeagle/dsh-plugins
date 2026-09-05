@@ -1157,14 +1157,6 @@ window.__ModuleLoader__.load({
 				label: "日"
 			}
 		];
-		const MODEL_MULT_OPTIONS = [
-			.5,
-			.8,
-			1,
-			1.2,
-			1.5,
-			2
-		];
 		const SURCHARGE_AFTER_OPTIONS = [
 			32e3,
 			64e3,
@@ -1445,18 +1437,16 @@ window.__ModuleLoader__.load({
 				gridTemplateColumns: "minmax(110px, 1fr) minmax(110px, 1fr) auto",
 				gap: 8,
 				alignItems: "end"
-			} }, field("优惠倍率", react.default.createElement(NumberSelect, {
-				value: props.assignment.discountMultiplier ?? 1,
-				options: MODEL_MULT_OPTIONS,
-				format: (value) => `×${value}`,
+			} }, field("优惠倍率", react.default.createElement(NumberInput, {
+				value: props.assignment.discountMultiplier,
+				placeholder: "1",
 				onChange: (value) => set({
 					...props.assignment,
 					discountMultiplier: value
 				})
-			})), field("模型倍率", react.default.createElement(NumberSelect, {
-				value: props.assignment.modelMultiplier ?? 1,
-				options: MODEL_MULT_OPTIONS,
-				format: (value) => `×${value}`,
+			})), field("模型倍率", react.default.createElement(NumberInput, {
+				value: props.assignment.modelMultiplier,
+				placeholder: "1",
 				onChange: (value) => set({
 					...props.assignment,
 					modelMultiplier: value
