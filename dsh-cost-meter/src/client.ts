@@ -4,7 +4,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import React from 'react'
 import type { ContextSurcharge, ModelAssignment, PricingConfig, PricingGroup, PricingPeriod } from './pricing.js'
 import { collapseBalanceChips, walletHref } from './provider-balance.js'
-import { DEFAULT_GROUP, DEFAULT_PRICING, formatTokenThreshold, lastUpdatedAt, normalizePricing, validatePricing } from './pricing.js'
+import { DEFAULT_GROUP, DEFAULT_PRICING, lastUpdatedAt, normalizePricing, validatePricing } from './pricing.js'
 import {
   costTableColumnValues,
   costTableTotals,
@@ -320,8 +320,6 @@ const TIMEZONES = ['Asia/Shanghai', 'Asia/Hong_Kong', 'Asia/Tokyo', 'Asia/Singap
 const UNIT_TOKEN_OPTIONS = [1_000, 1_000_000]
 const INTERVAL_OPTIONS = [5, 15, 30, 60, 120, 360, 1440]
 const CONCURRENCY_OPTIONS = [1, 2, 4, 8]
-const CACHE_MULT_OPTIONS = [0, 0.02, 0.1, 0.25, 0.5, 1]
-const PERIOD_MULT_OPTIONS = [0.25, 0.5, 0.8, 1, 1.5, 2]
 const WEEKDAY_OPTIONS = [
   { value: 1, label: '一' },
   { value: 2, label: '二' },
@@ -331,8 +329,6 @@ const WEEKDAY_OPTIONS = [
   { value: 6, label: '六' },
   { value: 7, label: '日' },
 ] as const
-const SURCHARGE_AFTER_OPTIONS = [32_000, 64_000, 128_000, 200_000, 256_000, 1_000_000]
-const SURCHARGE_MULT_OPTIONS = [1.5, 2, 3]
 
 function withCurrent(options: readonly number[], value: number | undefined): number[] {
   if (value === undefined || !Number.isFinite(value) || options.includes(value)) return [...options]
@@ -387,7 +383,7 @@ function PeriodEditor(props: { period: PricingPeriod; onChange(period: PricingPe
       field('时段名称', React.createElement('input', { style: inputStyle, value: props.period.name, onChange: (event: React.ChangeEvent<HTMLInputElement>) => set('name', event.target.value) })),
       field('开始', React.createElement('input', { style: inputStyle, type: 'time', value: allDay ? '00:00' : props.period.start, disabled: allDay, onChange: (event: React.ChangeEvent<HTMLInputElement>) => set('start', event.target.value) })),
       field('结束', React.createElement('input', { style: inputStyle, type: 'time', value: allDay ? '00:00' : props.period.end, disabled: allDay, onChange: (event: React.ChangeEvent<HTMLInputElement>) => set('end', event.target.value) })),
-      field('倍率', React.createElement(NumberSelect, { value: props.period.multiplier, options: PERIOD_MULT_OPTIONS, format: value => `×${value}`, onChange: value => set('multiplier', value) })),
+      field('倍率', React.createElement(NumberInput, { value: props.period.multiplier, onChange: value => set('multiplier', value ?? 0) })),
       React.createElement('button', { type: 'button', style: buttonStyle, onClick: props.onRemove }, '删除'),
     ),
     React.createElement('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' } },
@@ -430,17 +426,13 @@ function ContextSurchargesEditor(props: { tiers: ContextSurcharge[]; hint?: stri
       key: `${tier.afterTokens}-${index}`,
       style: { display: 'grid', gridTemplateColumns: 'minmax(140px, 1fr) minmax(100px, 160px) auto', gap: 8, alignItems: 'end' },
     },
-      React.createElement('label', { style: { display: 'flex', flexDirection: 'column', gap: 5, fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, '超过 Token 数', React.createElement(NumberSelect, {
+      React.createElement('label', { style: { display: 'flex', flexDirection: 'column', gap: 5, fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, '超过 Token 数', React.createElement(NumberInput, {
         value: tier.afterTokens,
-        options: SURCHARGE_AFTER_OPTIONS,
-        format: formatTokenThreshold,
-        onChange: value => set(index, { ...tier, afterTokens: value }),
+        onChange: value => set(index, { ...tier, afterTokens: value ?? 0 }),
       })),
-      React.createElement('label', { style: { display: 'flex', flexDirection: 'column', gap: 5, fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, '整单倍率', React.createElement(NumberSelect, {
+      React.createElement('label', { style: { display: 'flex', flexDirection: 'column', gap: 5, fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, '整单倍率', React.createElement(NumberInput, {
         value: tier.multiplier,
-        options: SURCHARGE_MULT_OPTIONS,
-        format: value => `×${value}`,
-        onChange: value => set(index, { ...tier, multiplier: value }),
+        onChange: value => set(index, { ...tier, multiplier: value ?? 0 }),
       })),
       React.createElement('button', { type: 'button', style: buttonStyle, onClick: () => props.onChange(props.tiers.filter((_item, at) => at !== index)) }, '删除'),
     )),
@@ -652,8 +644,8 @@ function GroupEditor(props: {
         field('基准输出', React.createElement(NumberInput, { value: props.group.output, onChange: value => set('output', value ?? 0) })),
       ),
       React.createElement('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(2, minmax(140px, 1fr))', gap: 8 } },
-        field('缓存读倍率', React.createElement(NumberSelect, { value: props.group.cacheReadMultiplier, options: CACHE_MULT_OPTIONS, format: value => `×${value}`, onChange: value => set('cacheReadMultiplier', value) })),
-        field('缓存写倍率', React.createElement(NumberSelect, { value: props.group.cacheWriteMultiplier, options: CACHE_MULT_OPTIONS, format: value => `×${value}`, onChange: value => set('cacheWriteMultiplier', value) })),
+        field('缓存读倍率', React.createElement(NumberInput, { value: props.group.cacheReadMultiplier, onChange: value => set('cacheReadMultiplier', value ?? 0) })),
+        field('缓存写倍率', React.createElement(NumberInput, { value: props.group.cacheWriteMultiplier, onChange: value => set('cacheWriteMultiplier', value ?? 0) })),
       ),
       React.createElement('p', { style: { margin: 0, fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, `缓存读 = 基准输入 × ${props.group.cacheReadMultiplier}；缓存写 = 基准输入 × ${props.group.cacheWriteMultiplier}。时段与上下文倍率作用于整单。`),
       React.createElement('h4', { style: { margin: '4px 0 0', fontSize: 12, fontWeight: 600 } }, '不同时段倍率'),

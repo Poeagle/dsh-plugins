@@ -1111,22 +1111,6 @@ window.__ModuleLoader__.load({
 			4,
 			8
 		];
-		const CACHE_MULT_OPTIONS = [
-			0,
-			.02,
-			.1,
-			.25,
-			.5,
-			1
-		];
-		const PERIOD_MULT_OPTIONS = [
-			.25,
-			.5,
-			.8,
-			1,
-			1.5,
-			2
-		];
 		const WEEKDAY_OPTIONS = [
 			{
 				value: 1,
@@ -1156,19 +1140,6 @@ window.__ModuleLoader__.load({
 				value: 7,
 				label: "日"
 			}
-		];
-		const SURCHARGE_AFTER_OPTIONS = [
-			32e3,
-			64e3,
-			128e3,
-			2e5,
-			256e3,
-			1e6
-		];
-		const SURCHARGE_MULT_OPTIONS = [
-			1.5,
-			2,
-			3
 		];
 		function withCurrent(options, value) {
 			if (value === void 0 || !Number.isFinite(value) || options.includes(value)) return [...options];
@@ -1247,11 +1218,9 @@ window.__ModuleLoader__.load({
 				value: allDay ? "00:00" : props.period.end,
 				disabled: allDay,
 				onChange: (event) => set("end", event.target.value)
-			})), field("倍率", react.default.createElement(NumberSelect, {
+			})), field("倍率", react.default.createElement(NumberInput, {
 				value: props.period.multiplier,
-				options: PERIOD_MULT_OPTIONS,
-				format: (value) => `×${value}`,
-				onChange: (value) => set("multiplier", value)
+				onChange: (value) => set("multiplier", value ?? 0)
 			})), react.default.createElement("button", {
 				type: "button",
 				style: buttonStyle,
@@ -1346,13 +1315,11 @@ window.__ModuleLoader__.load({
 				gap: 5,
 				fontSize: 11,
 				color: "var(--dsw-alias-label-tertiary)"
-			} }, "超过 Token 数", react.default.createElement(NumberSelect, {
+			} }, "超过 Token 数", react.default.createElement(NumberInput, {
 				value: tier.afterTokens,
-				options: SURCHARGE_AFTER_OPTIONS,
-				format: formatTokenThreshold,
 				onChange: (value) => set(index, {
 					...tier,
-					afterTokens: value
+					afterTokens: value ?? 0
 				})
 			})), react.default.createElement("label", { style: {
 				display: "flex",
@@ -1360,13 +1327,11 @@ window.__ModuleLoader__.load({
 				gap: 5,
 				fontSize: 11,
 				color: "var(--dsw-alias-label-tertiary)"
-			} }, "整单倍率", react.default.createElement(NumberSelect, {
+			} }, "整单倍率", react.default.createElement(NumberInput, {
 				value: tier.multiplier,
-				options: SURCHARGE_MULT_OPTIONS,
-				format: (value) => `×${value}`,
 				onChange: (value) => set(index, {
 					...tier,
-					multiplier: value
+					multiplier: value ?? 0
 				})
 			})), react.default.createElement("button", {
 				type: "button",
@@ -1689,16 +1654,12 @@ window.__ModuleLoader__.load({
 				display: "grid",
 				gridTemplateColumns: "repeat(2, minmax(140px, 1fr))",
 				gap: 8
-			} }, field("缓存读倍率", react.default.createElement(NumberSelect, {
+			} }, field("缓存读倍率", react.default.createElement(NumberInput, {
 				value: props.group.cacheReadMultiplier,
-				options: CACHE_MULT_OPTIONS,
-				format: (value) => `×${value}`,
-				onChange: (value) => set("cacheReadMultiplier", value)
-			})), field("缓存写倍率", react.default.createElement(NumberSelect, {
+				onChange: (value) => set("cacheReadMultiplier", value ?? 0)
+			})), field("缓存写倍率", react.default.createElement(NumberInput, {
 				value: props.group.cacheWriteMultiplier,
-				options: CACHE_MULT_OPTIONS,
-				format: (value) => `×${value}`,
-				onChange: (value) => set("cacheWriteMultiplier", value)
+				onChange: (value) => set("cacheWriteMultiplier", value ?? 0)
 			}))), react.default.createElement("p", { style: {
 				margin: 0,
 				fontSize: 11,
