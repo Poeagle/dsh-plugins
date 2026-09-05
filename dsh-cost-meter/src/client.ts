@@ -32,7 +32,7 @@ import {
   type HourlySlice,
 } from './session-table.js'
 
-export const inject = ['slots', 'remote']
+export const inject = ['slots', 'remote', 'remote.session']
 
 function browserInterval(callback: () => void, delay: number): () => void {
   const id = window.setInterval(callback, delay)
@@ -162,8 +162,10 @@ interface SessionListItem {
   parentSessionId?: string
   origin?: string
 }
+interface SessionRemoteFace {
+  modelCatalog(): Promise<{ ok: boolean; value?: { groups: ModelGroup[] } }>
+}
 interface ApiFace {
-  llm: { models(input: {}): Promise<{ result: { ok: boolean; value?: { groups: ModelGroup[] } } }> }
   sessions?: { list(input: {}): Promise<{ result: { ok: boolean; value?: { items: SessionListItem[] }; error?: unknown } }> }
 }
 function remoteErrorText(error: unknown): string {
@@ -264,20 +266,24 @@ class PricingRouteSource implements Observable<SettingsSnapshot> {
 class CatalogSource implements Observable<CatalogSnapshot> {
   private snapshot: CatalogSnapshot = { status: 'loading', groups: [] }
   private readonly listeners = new Set<() => void>()
-  constructor(private readonly api: ApiFace) {}
+  constructor(private readonly session: SessionRemoteFace | undefined) {}
   getSnapshot = (): CatalogSnapshot => this.snapshot
   subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener)
     return () => { this.listeners.delete(listener) }
   }
-  async load(): Promise<void> {
-    try {
-      const response = await this.api.llm.models({})
-      this.snapshot = response.result.ok && response.result.value
-        ? { status: 'ready', groups: response.result.value.groups }
-        : { status: 'error', groups: [] }
-    } catch {
+  load = async (): Promise<void> => {
+    if (this.session === undefined) {
       this.snapshot = { status: 'error', groups: [] }
+    } else {
+      try {
+        const response = await this.session.modelCatalog()
+        this.snapshot = response.ok && response.value
+          ? { status: 'ready', groups: response.value.groups }
+          : { status: 'error', groups: [] }
+      } catch {
+        this.snapshot = { status: 'error', groups: [] }
+      }
     }
     for (const listener of this.listeners) listener()
   }
@@ -1244,9 +1250,8 @@ export async function apply(ctx: Context) {
   if (!slots || !costMeter) return
   const pricing = new PricingRouteSource()
   void pricing.load()
-  const catalog = new CatalogSource({
-    llm: { models: async () => ({ result: { ok: true, value: { groups: [] } } }) },
-  })
+  const sessionRemote = ctx.get('remote.session') as SessionRemoteFace | undefined
+  const catalog = new CatalogSource(sessionRemote)
   void catalog.load()
   const remoteEvents = ctx.get('remote') as { $on?(event: string, listener: (...args: any[]) => void): () => void }
   ctx.effect(() => remoteEvents.$on?.('llm/adapters-updated', () => { void catalog.load() }) ?? (() => {}), 'cost-meter catalog updates')

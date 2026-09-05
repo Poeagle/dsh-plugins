@@ -868,7 +868,11 @@ window.__ModuleLoader__.load({
 		}
 		//#endregion
 		//#region src/client.ts
-		const inject = ["slots", "remote"];
+		const inject = [
+			"slots",
+			"remote",
+			"remote.session"
+		];
 		function browserInterval(callback, delay) {
 			const id = window.setInterval(callback, delay);
 			return () => window.clearInterval(id);
@@ -974,14 +978,14 @@ window.__ModuleLoader__.load({
 			}
 		};
 		var CatalogSource = class {
-			api;
+			session;
 			snapshot = {
 				status: "loading",
 				groups: []
 			};
 			listeners = /* @__PURE__ */ new Set();
-			constructor(api) {
-				this.api = api;
+			constructor(session) {
+				this.session = session;
 			}
 			getSnapshot = () => this.snapshot;
 			subscribe = (listener) => {
@@ -990,12 +994,16 @@ window.__ModuleLoader__.load({
 					this.listeners.delete(listener);
 				};
 			};
-			async load() {
-				try {
-					const response = await this.api.llm.models({});
-					this.snapshot = response.result.ok && response.result.value ? {
+			load = async () => {
+				if (this.session === void 0) this.snapshot = {
+					status: "error",
+					groups: []
+				};
+				else try {
+					const response = await this.session.modelCatalog();
+					this.snapshot = response.ok && response.value ? {
 						status: "ready",
-						groups: response.result.value.groups
+						groups: response.value.groups
 					} : {
 						status: "error",
 						groups: []
@@ -1007,7 +1015,7 @@ window.__ModuleLoader__.load({
 					};
 				}
 				for (const listener of this.listeners) listener();
-			}
+			};
 		};
 		const cloneConfig = (value) => normalizePricing(JSON.parse(JSON.stringify(value ?? DEFAULT_PRICING)));
 		const money = (value) => value > 0 && value < .01 ? value.toFixed(4) : value.toFixed(2);
@@ -2818,10 +2826,7 @@ window.__ModuleLoader__.load({
 			if (!slots || !costMeter) return;
 			const pricing = new PricingRouteSource();
 			pricing.load();
-			const catalog = new CatalogSource({ llm: { models: async () => ({ result: {
-				ok: true,
-				value: { groups: [] }
-			} }) } });
+			const catalog = new CatalogSource(ctx.get("remote.session"));
 			catalog.load();
 			const remoteEvents = ctx.get("remote");
 			ctx.effect(() => remoteEvents.$on?.("llm/adapters-updated", () => {
