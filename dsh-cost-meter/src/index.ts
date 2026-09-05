@@ -6,8 +6,11 @@ import { TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import {
   DEFAULT_GROUP,
   DEFAULT_PRICING,
+  applyPeriodClock,
   billedOutputTokens,
+  clockTime,
   discountMultiplierAt,
+  isPeriodAllDay,
   lastProbeAt,
   lastUpdatedAt,
   multiplierHistoryRows,
@@ -24,6 +27,7 @@ import {
   resolvePricing,
   resolveReasoningExtra,
   routeKey,
+  togglePeriodAllDay,
   validatePricing,
   type CostEvent,
   type CostSubagent,
@@ -33,7 +37,7 @@ import { SessionFoldCache, logFingerprint, pricingFingerprint } from './session-
 import { collectProviderBalances, type ProviderBalance, type ProviderSource } from './provider-balance.js'
 import { installUsageTap } from './usage-tap.js'
 
-export { DEFAULT_GROUP, DEFAULT_PRICING, assignmentWithManualMultiplier, billedOutputTokens, contextTokensOf, discountMultiplierAt, foldSession, formatContextSurcharge, formatTokenThreshold, lastProbeAt, lastUpdatedAt, multiplierHistoryRows, normalizePricing, normalizeUsage, periodDays, resolveContextMultiplier, resolveContextSurcharge, resolvePricing, resolveReasoningExtra, routeKey, validatePricing }
+export { DEFAULT_GROUP, DEFAULT_PRICING, applyPeriodClock, assignmentWithManualMultiplier, billedOutputTokens, clockTime, contextTokensOf, discountMultiplierAt, foldSession, formatContextSurcharge, formatTokenThreshold, isPeriodAllDay, lastProbeAt, lastUpdatedAt, multiplierHistoryRows, normalizePricing, normalizeUsage, periodDays, resolveContextMultiplier, resolveContextSurcharge, resolvePricing, resolveReasoningExtra, routeKey, togglePeriodAllDay, validatePricing }
 export { assignmentWithObservedMultiplier, billingProbeURL, nextBillingProbeDue, parseBillingMultiplier } from './upstream-billing-probe.js'
 export { collapseBalanceChips, collectProviderBalances, gatewayOrigin, groupProviderBalanceTargetsByOrigin, listProviderBalanceTargets, modelsURL, parseProviderBalance, probeProviderAvailability, probeProviderBalance, routesForProvider, shouldRemoveUnavailableProvider, usageURL, walletHref } from './provider-balance.js'
 export { applyWireUsage, attachReasoningToChunk, installUsageTap, reasoningFromWireUsage, scanSseBuffer, shouldTapRequest, tapFetchResponse, wrapLlmStream, wrapPrepareCall } from './usage-tap.js'

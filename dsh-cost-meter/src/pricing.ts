@@ -144,6 +144,39 @@ export const DEFAULT_PRICING: PricingConfig = {
 
 const TIME_PATTERN = /^(?:[01]\d|2[0-3]):[0-5]\d$/
 const END_TIME_PATTERN = /^(?:[01]\d|2[0-3]):[0-5]\d$|^24:00$/
+
+/** Keep `HH:mm`; strip seconds some browsers emit from `<input type="time">`. */
+export function clockTime(value: string): string {
+  const match = /^([01]\d|2[0-3]):[0-5]\d/.exec(value)
+  return match?.[0] ?? value
+}
+
+/** Whole-day window in this plugin: `start === end`, including `08:00`/`08:00`. */
+export function isPeriodAllDay(period: Pick<PricingPeriod, 'start' | 'end'>): boolean {
+  return period.start === period.end
+}
+
+/** Explicit all-day toggle. Unchecking restores a bounded daytime window, not the previous times. */
+export function togglePeriodAllDay<T extends Pick<PricingPeriod, 'start' | 'end'>>(period: T, allDay: boolean): T {
+  return allDay
+    ? { ...period, start: '00:00', end: '00:00' }
+    : { ...period, start: '08:00', end: '22:00' }
+}
+
+/**
+ * Apply one clock field from a time input.
+ * Empty values are ignored so an opening picker cannot collapse the window.
+ */
+export function applyPeriodClock<T extends Pick<PricingPeriod, 'start' | 'end'>>(
+  period: T,
+  field: 'start' | 'end',
+  value: string,
+): T {
+  const next = clockTime(value)
+  if (next === '') return period
+  return { ...period, [field]: next }
+}
+
 const ALL_WEEKDAYS = [1, 2, 3, 4, 5, 6, 7] as const
 const WEEKDAY_SHORT: Record<string, number> = { Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6, Sun: 7 }
 const DEFAULT_GROUP_ID = 'default'

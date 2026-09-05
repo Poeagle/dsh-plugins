@@ -4,7 +4,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import React from 'react'
 import type { ContextSurcharge, ModelAssignment, PricingConfig, PricingGroup, PricingPeriod } from './pricing.js'
 import { collapseBalanceChips, walletHref } from './provider-balance.js'
-import { DEFAULT_GROUP, DEFAULT_PRICING, lastUpdatedAt, normalizePricing, validatePricing } from './pricing.js'
+import { DEFAULT_GROUP, DEFAULT_PRICING, applyPeriodClock, clockTime, isPeriodAllDay, lastUpdatedAt, normalizePricing, togglePeriodAllDay, validatePricing } from './pricing.js'
 import {
   costTableColumnValues,
   costTableTotals,
@@ -362,10 +362,21 @@ function formatUnitTokens(value: number): string {
   return value === 1_000_000 ? '每 1M tokens' : value === 1_000 ? '每 1K tokens' : `每 ${value.toLocaleString('zh-CN')} tokens`
 }
 
+function TimeInput(props: { value: string; onChange(value: string): void }) {
+  return React.createElement('input', {
+    style: { ...inputStyle, position: 'relative', zIndex: 1 },
+    type: 'time',
+    value: clockTime(props.value) === '24:00' ? '00:00' : clockTime(props.value),
+    onMouseDown: (event: React.MouseEvent) => event.stopPropagation(),
+    onClick: (event: React.MouseEvent) => event.stopPropagation(),
+    onChange: (event: React.ChangeEvent<HTMLInputElement>) => props.onChange(event.target.value),
+  })
+}
+
 function PeriodEditor(props: { period: PricingPeriod; onChange(period: PricingPeriod): void; onRemove(): void }) {
   const set = <K extends keyof PricingPeriod>(key: K, value: PricingPeriod[K]) => props.onChange({ ...props.period, [key]: value })
   const selected = new Set(props.period.days ?? WEEKDAY_OPTIONS.map(option => option.value))
-  const allDay = props.period.start === props.period.end
+  const allDay = isPeriodAllDay(props.period)
   const toggleDay = (day: number) => {
     const next = new Set(selected)
     if (next.has(day)) next.delete(day)
@@ -379,24 +390,22 @@ function PeriodEditor(props: { period: PricingPeriod; onChange(period: PricingPe
     set('days', [...next].sort((left, right) => left - right))
   }
   return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 8 } },
-    React.createElement('div', { style: { display: 'grid', gridTemplateColumns: 'minmax(120px, 1fr) 100px 100px 96px auto', gap: 8, alignItems: 'end' } },
+    React.createElement('div', { style: { display: 'grid', gridTemplateColumns: 'minmax(120px, 1fr) 100px 100px 96px auto auto', gap: 8, alignItems: 'end' } },
       field('时段名称', React.createElement('input', { style: inputStyle, value: props.period.name, onChange: (event: React.ChangeEvent<HTMLInputElement>) => set('name', event.target.value) })),
-      field('开始', React.createElement('input', { style: inputStyle, type: 'time', value: allDay ? '00:00' : props.period.start, disabled: allDay, onChange: (event: React.ChangeEvent<HTMLInputElement>) => set('start', event.target.value) })),
-      field('结束', React.createElement('input', { style: inputStyle, type: 'time', value: allDay ? '00:00' : props.period.end, disabled: allDay, onChange: (event: React.ChangeEvent<HTMLInputElement>) => set('end', event.target.value) })),
+      field('开始', React.createElement(TimeInput, { value: props.period.start, onChange: value => props.onChange(applyPeriodClock(props.period, 'start', value)) })),
+      field('结束', React.createElement(TimeInput, { value: props.period.end, onChange: value => props.onChange(applyPeriodClock(props.period, 'end', value)) })),
       field('倍率', React.createElement(NumberInput, { value: props.period.multiplier, onChange: value => set('multiplier', value ?? 0) })),
-      React.createElement('button', { type: 'button', style: buttonStyle, onClick: props.onRemove }, '删除'),
-    ),
-    React.createElement('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' } },
-      React.createElement('label', { style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 } },
+      React.createElement('label', { style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, paddingBottom: 6 } },
         React.createElement('input', {
           type: 'checkbox',
           checked: allDay,
-          onChange: (event: React.ChangeEvent<HTMLInputElement>) => props.onChange(event.target.checked
-            ? { ...props.period, start: '00:00', end: '00:00' }
-            : { ...props.period, start: '08:00', end: '22:00' }),
+          onChange: (event: React.ChangeEvent<HTMLInputElement>) => props.onChange(togglePeriodAllDay(props.period, event.target.checked)),
         }),
         '全天',
       ),
+      React.createElement('button', { type: 'button', style: buttonStyle, onClick: props.onRemove }, '删除'),
+    ),
+    React.createElement('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' } },
       ...WEEKDAY_OPTIONS.map(option => React.createElement('label', { key: option.value, style: { display: 'flex', alignItems: 'center', gap: 4, fontSize: 12 } },
         React.createElement('input', { type: 'checkbox', checked: selected.has(option.value), onChange: () => toggleDay(option.value) }),
         option.label,

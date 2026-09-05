@@ -10,8 +10,12 @@ import {
   lastProbeAt,
   lastUpdatedAt,
   multiplierHistoryRows,
+  applyPeriodClock,
   assignmentWithManualMultiplier,
+  clockTime,
   contextTokensOf,
+  isPeriodAllDay,
+  togglePeriodAllDay,
   foldSession,
   formatContextSurcharge,
   formatTokenThreshold,
@@ -89,6 +93,28 @@ test('matches weekday-scoped periods and whole-day windows', () => {
   assert.equal(thursday.rates.input.toFixed(2), '0.15')
   assert.equal(thursday.rates.cacheRead.toFixed(3), '0.015')
   assert.equal(thursday.rates.output.toFixed(2), '0.45')
+})
+
+test('clock inputs keep HH:mm, ignore empty picker values, and never disable by collapsing to all-day', () => {
+  assert.equal(clockTime('08:30'), '08:30')
+  assert.equal(clockTime('08:30:00'), '08:30')
+  assert.equal(clockTime(''), '')
+  const period = { id: 'off-peak', name: '低峰', start: '00:00', end: '08:00', multiplier: 1 }
+  assert.equal(isPeriodAllDay(period), false)
+  assert.deepEqual(applyPeriodClock(period, 'end', ''), period)
+  assert.deepEqual(applyPeriodClock(period, 'end', '22:00:00'), { ...period, end: '22:00' })
+  const sameClock = applyPeriodClock(period, 'end', '00:00')
+  assert.deepEqual(sameClock, { ...period, end: '00:00' })
+  assert.equal(isPeriodAllDay(sameClock), true)
+  const allDay = togglePeriodAllDay(period, true)
+  assert.deepEqual(allDay, { ...period, start: '00:00', end: '00:00' })
+  assert.equal(isPeriodAllDay(allDay), true)
+  const bounded = togglePeriodAllDay(allDay, false)
+  assert.deepEqual(bounded, { ...period, start: '08:00', end: '22:00' })
+  assert.equal(isPeriodAllDay(bounded), false)
+  const stillEditable = applyPeriodClock(allDay, 'start', '22:00')
+  assert.deepEqual(stillEditable, { ...allDay, start: '22:00' })
+  assert.equal(isPeriodAllDay(stillEditable), false)
 })
 
 test('rejects weekday-overlapping periods and accepts disjoint weekdays', () => {

@@ -26,6 +26,38 @@ const DEFAULT_PRICING = {
 };
 const TIME_PATTERN = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
 const END_TIME_PATTERN = /^(?:[01]\d|2[0-3]):[0-5]\d$|^24:00$/;
+/** Keep `HH:mm`; strip seconds some browsers emit from `<input type="time">`. */
+function clockTime(value) {
+	return /^([01]\d|2[0-3]):[0-5]\d/.exec(value)?.[0] ?? value;
+}
+/** Whole-day window in this plugin: `start === end`, including `08:00`/`08:00`. */
+function isPeriodAllDay(period) {
+	return period.start === period.end;
+}
+/** Explicit all-day toggle. Unchecking restores a bounded daytime window, not the previous times. */
+function togglePeriodAllDay(period, allDay) {
+	return allDay ? {
+		...period,
+		start: "00:00",
+		end: "00:00"
+	} : {
+		...period,
+		start: "08:00",
+		end: "22:00"
+	};
+}
+/**
+* Apply one clock field from a time input.
+* Empty values are ignored so an opening picker cannot collapse the window.
+*/
+function applyPeriodClock(period, field, value) {
+	const next = clockTime(value);
+	if (next === "") return period;
+	return {
+		...period,
+		[field]: next
+	};
+}
 const ALL_WEEKDAYS = [
 	1,
 	2,
@@ -2425,4 +2457,4 @@ var CostMeterService = class extends TypertRemoteService {
 	}
 };
 //#endregion
-export { localDateOfHour as $, walletHref as A, discountMultiplierAt as At, filterHourlyEntries as B, resolveContextMultiplier as Bt, modelsURL as C, logFingerprint as Ct, routesForProvider as D, assignmentWithManualMultiplier as Dt, probeProviderBalance as E, DEFAULT_PRICING as Et, defaultChildCostTableSort as F, lastUpdatedAt as Ft, formatMoneyAmount as G, validatePricing as Gt, flattenCostTableRows as H, resolvePricing as Ht, defaultCostTableSort as I, multiplierHistoryRows as It, formatUsageCell as J, formatRatedCost as K, defaultVisibleCostColumns as L, normalizePricing as Lt, averageUnitPrice as M, formatContextSurcharge as Mt, costTableColumnValues as N, formatTokenThreshold as Nt, shouldRemoveUnavailableProvider as O, billedOutputTokens as Ot, costTableTotals as P, lastProbeAt as Pt, isNumericCostTableColumn as Q, displayCellText as R, normalizeUsage as Rt, listProviderBalanceTargets as S, SessionFoldCache as St, probeProviderAvailability as T, DEFAULT_GROUP as Tt, flattenHourlyEntries as U, resolveReasoningExtra as Ut, filterSessionRows as V, resolveContextSurcharge as Vt, formatCacheRatedCost as W, routeKey as Wt, groupDailyOverview as X, groupCostTableRows as Y, groupHourlyEntries as Z, wrapPrepareCall as _, sortCostTableRows as _t, billingProbeURL as a, optionalCostTableColumns as at, gatewayOrigin as b, toggleCostTableSort as bt, parseBillingMultiplier as c, queryCostTableGroups as ct, installUsageTap as d, querySessionRows as dt, localTodayDate as et, reasoningFromWireUsage as f, resolveVisibleCostColumns as ft, wrapLlmStream as g, sharedContextSurcharge as gt, tapFetchResponse as h, sessionTotalTokens as ht, assignmentWithObservedMultiplier as i, metricTokens as it, activityText as j, foldSession as jt, usageURL as k, contextTokensOf as kt, applyWireUsage as l, queryDailyOverview as lt, shouldTapRequest as m, sessionRoutes as mt, CostMeterService as n, mergeListedSessionCost as nt, installUpstreamBillingProbes as o, overviewCost as ot, scanSseBuffer as p, rowTotalTokens as pt, formatUnitTokensLabel as q, collectSessionCosts as r, metricCost as rt, nextBillingProbeDue as s, queryCostTable as st, Config as t, mapWithConcurrency as tt, attachReasoningToChunk as u, queryHourlyOverview as ut, collapseBalanceChips as v, sortSessionRows as vt, parseProviderBalance as w, pricingFingerprint as wt, groupProviderBalanceTargetsByOrigin as x, toggleSessionTableSort as xt, collectProviderBalances as y, sumHourlySlices as yt, filterCostTableRows as z, periodDays as zt };
+export { localDateOfHour as $, walletHref as A, clockTime as At, filterHourlyEntries as B, normalizePricing as Bt, modelsURL as C, logFingerprint as Ct, routesForProvider as D, applyPeriodClock as Dt, probeProviderBalance as E, DEFAULT_PRICING as Et, defaultChildCostTableSort as F, formatTokenThreshold as Ft, formatMoneyAmount as G, resolvePricing as Gt, flattenCostTableRows as H, periodDays as Ht, defaultCostTableSort as I, isPeriodAllDay as It, formatUsageCell as J, togglePeriodAllDay as Jt, formatRatedCost as K, resolveReasoningExtra as Kt, defaultVisibleCostColumns as L, lastProbeAt as Lt, averageUnitPrice as M, discountMultiplierAt as Mt, costTableColumnValues as N, foldSession as Nt, shouldRemoveUnavailableProvider as O, assignmentWithManualMultiplier as Ot, costTableTotals as P, formatContextSurcharge as Pt, isNumericCostTableColumn as Q, displayCellText as R, lastUpdatedAt as Rt, listProviderBalanceTargets as S, SessionFoldCache as St, probeProviderAvailability as T, DEFAULT_GROUP as Tt, flattenHourlyEntries as U, resolveContextMultiplier as Ut, filterSessionRows as V, normalizeUsage as Vt, formatCacheRatedCost as W, resolveContextSurcharge as Wt, groupDailyOverview as X, groupCostTableRows as Y, validatePricing as Yt, groupHourlyEntries as Z, wrapPrepareCall as _, sortCostTableRows as _t, billingProbeURL as a, optionalCostTableColumns as at, gatewayOrigin as b, toggleCostTableSort as bt, parseBillingMultiplier as c, queryCostTableGroups as ct, installUsageTap as d, querySessionRows as dt, localTodayDate as et, reasoningFromWireUsage as f, resolveVisibleCostColumns as ft, wrapLlmStream as g, sharedContextSurcharge as gt, tapFetchResponse as h, sessionTotalTokens as ht, assignmentWithObservedMultiplier as i, metricTokens as it, activityText as j, contextTokensOf as jt, usageURL as k, billedOutputTokens as kt, applyWireUsage as l, queryDailyOverview as lt, shouldTapRequest as m, sessionRoutes as mt, CostMeterService as n, mergeListedSessionCost as nt, installUpstreamBillingProbes as o, overviewCost as ot, scanSseBuffer as p, rowTotalTokens as pt, formatUnitTokensLabel as q, routeKey as qt, collectSessionCosts as r, metricCost as rt, nextBillingProbeDue as s, queryCostTable as st, Config as t, mapWithConcurrency as tt, attachReasoningToChunk as u, queryHourlyOverview as ut, collapseBalanceChips as v, sortSessionRows as vt, parseProviderBalance as w, pricingFingerprint as wt, groupProviderBalanceTargetsByOrigin as x, toggleSessionTableSort as xt, collectProviderBalances as y, sumHourlySlices as yt, filterCostTableRows as z, multiplierHistoryRows as zt };

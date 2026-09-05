@@ -54,6 +54,38 @@ window.__ModuleLoader__.load({
 		};
 		const TIME_PATTERN = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
 		const END_TIME_PATTERN = /^(?:[01]\d|2[0-3]):[0-5]\d$|^24:00$/;
+		/** Keep `HH:mm`; strip seconds some browsers emit from `<input type="time">`. */
+		function clockTime(value) {
+			return /^([01]\d|2[0-3]):[0-5]\d/.exec(value)?.[0] ?? value;
+		}
+		/** Whole-day window in this plugin: `start === end`, including `08:00`/`08:00`. */
+		function isPeriodAllDay(period) {
+			return period.start === period.end;
+		}
+		/** Explicit all-day toggle. Unchecking restores a bounded daytime window, not the previous times. */
+		function togglePeriodAllDay(period, allDay) {
+			return allDay ? {
+				...period,
+				start: "00:00",
+				end: "00:00"
+			} : {
+				...period,
+				start: "08:00",
+				end: "22:00"
+			};
+		}
+		/**
+		* Apply one clock field from a time input.
+		* Empty values are ignored so an opening picker cannot collapse the window.
+		*/
+		function applyPeriodClock(period, field, value) {
+			const next = clockTime(value);
+			if (next === "") return period;
+			return {
+				...period,
+				[field]: next
+			};
+		}
 		const ALL_WEEKDAYS = [
 			1,
 			2,
@@ -1174,13 +1206,27 @@ window.__ModuleLoader__.load({
 		function formatUnitTokens(value) {
 			return value === 1e6 ? "每 1M tokens" : value === 1e3 ? "每 1K tokens" : `每 ${value.toLocaleString("zh-CN")} tokens`;
 		}
+		function TimeInput(props) {
+			return react.default.createElement("input", {
+				style: {
+					...inputStyle,
+					position: "relative",
+					zIndex: 1
+				},
+				type: "time",
+				value: clockTime(props.value) === "24:00" ? "00:00" : clockTime(props.value),
+				onMouseDown: (event) => event.stopPropagation(),
+				onClick: (event) => event.stopPropagation(),
+				onChange: (event) => props.onChange(event.target.value)
+			});
+		}
 		function PeriodEditor(props) {
 			const set = (key, value) => props.onChange({
 				...props.period,
 				[key]: value
 			});
 			const selected = new Set(props.period.days ?? WEEKDAY_OPTIONS.map((option) => option.value));
-			const allDay = props.period.start === props.period.end;
+			const allDay = isPeriodAllDay(props.period);
 			const toggleDay = (day) => {
 				const next = new Set(selected);
 				if (next.has(day)) next.delete(day);
@@ -1199,29 +1245,33 @@ window.__ModuleLoader__.load({
 				gap: 8
 			} }, react.default.createElement("div", { style: {
 				display: "grid",
-				gridTemplateColumns: "minmax(120px, 1fr) 100px 100px 96px auto",
+				gridTemplateColumns: "minmax(120px, 1fr) 100px 100px 96px auto auto",
 				gap: 8,
 				alignItems: "end"
 			} }, field("时段名称", react.default.createElement("input", {
 				style: inputStyle,
 				value: props.period.name,
 				onChange: (event) => set("name", event.target.value)
-			})), field("开始", react.default.createElement("input", {
-				style: inputStyle,
-				type: "time",
-				value: allDay ? "00:00" : props.period.start,
-				disabled: allDay,
-				onChange: (event) => set("start", event.target.value)
-			})), field("结束", react.default.createElement("input", {
-				style: inputStyle,
-				type: "time",
-				value: allDay ? "00:00" : props.period.end,
-				disabled: allDay,
-				onChange: (event) => set("end", event.target.value)
+			})), field("开始", react.default.createElement(TimeInput, {
+				value: props.period.start,
+				onChange: (value) => props.onChange(applyPeriodClock(props.period, "start", value))
+			})), field("结束", react.default.createElement(TimeInput, {
+				value: props.period.end,
+				onChange: (value) => props.onChange(applyPeriodClock(props.period, "end", value))
 			})), field("倍率", react.default.createElement(NumberInput, {
 				value: props.period.multiplier,
 				onChange: (value) => set("multiplier", value ?? 0)
-			})), react.default.createElement("button", {
+			})), react.default.createElement("label", { style: {
+				display: "flex",
+				alignItems: "center",
+				gap: 6,
+				fontSize: 12,
+				paddingBottom: 6
+			} }, react.default.createElement("input", {
+				type: "checkbox",
+				checked: allDay,
+				onChange: (event) => props.onChange(togglePeriodAllDay(props.period, event.target.checked))
+			}), "全天"), react.default.createElement("button", {
 				type: "button",
 				style: buttonStyle,
 				onClick: props.onRemove
@@ -1230,24 +1280,7 @@ window.__ModuleLoader__.load({
 				flexWrap: "wrap",
 				gap: 8,
 				alignItems: "center"
-			} }, react.default.createElement("label", { style: {
-				display: "flex",
-				alignItems: "center",
-				gap: 6,
-				fontSize: 12
-			} }, react.default.createElement("input", {
-				type: "checkbox",
-				checked: allDay,
-				onChange: (event) => props.onChange(event.target.checked ? {
-					...props.period,
-					start: "00:00",
-					end: "00:00"
-				} : {
-					...props.period,
-					start: "08:00",
-					end: "22:00"
-				})
-			}), "全天"), ...WEEKDAY_OPTIONS.map((option) => react.default.createElement("label", {
+			} }, ...WEEKDAY_OPTIONS.map((option) => react.default.createElement("label", {
 				key: option.value,
 				style: {
 					display: "flex",
