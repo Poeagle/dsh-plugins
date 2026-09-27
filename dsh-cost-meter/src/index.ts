@@ -115,14 +115,29 @@ export type {
 /**
  * Settings schema admits both the current group document and the previous
  * default/models document, then stores the normalized group form.
+ *
+ * The root is declared `volatile()` so the harness settings service projects
+ * the whole pricing document as this entry's live settings page (the namespace
+ * is the profile entry id, `cost-meter`) and writes reach the running
+ * references without remounting the plugin.
  */
 export const Config = z.transform(z.any(), (value: unknown) => {
   const normalized = normalizePricing(value ?? {})
   validatePricing(normalized)
   return normalized
-})
+}).volatile()
 
 const SETTINGS_NS = 'cost-meter'
+
+/**
+ * Read one profile entry's resolved settings value through the harness
+ * settings service. The pre-`0.1.7` `settings.get(ns)` reader was removed, so
+ * cross-namespace reads now go through `describe()`.
+ */
+function settingsValue(ctx: Context, ns: string): unknown {
+  const settings = ctx.get('settings') as { describe?(): { ns: string; value: unknown }[] } | undefined
+  return settings?.describe?.().find(row => row.ns === ns)?.value
+}
 
 interface SessionsFace {
   get(id: string): { snapshotEvents(): readonly CostEvent[] } | undefined
@@ -147,10 +162,6 @@ export interface SessionCostRecord {
 interface SessionQueryFace {
   listSessions(): Promise<readonly SessionRecord[]>
   readSession(id: string): Promise<{ events: readonly CostEvent[] }>
-}
-
-interface SettingsReaderFace {
-  get(namespace: string): unknown
 }
 
 interface CredentialsFace {
@@ -345,7 +356,7 @@ export default class CostMeterService extends TypertRemoteService {
   private async computeSessionCost(sessionId: string): Promise<ReturnType<typeof foldSession> | null> {
     const sessions = this.ctx.get('sessions') as SessionsFace | undefined
     const query = this.ctx.get('sessionQuery') as SessionQueryFace | undefined
-    const pricing = (this.ctx as Context & { settings: SettingsReaderFace }).settings.get(SETTINGS_NS) as PricingConfig | undefined
+    const pricing = settingsValue(this.ctx, SETTINGS_NS) as PricingConfig | undefined
     const config = normalizePricing(pricing ?? DEFAULT_PRICING)
     const cost = await ownFoldFor(sessionId, config, sessions, query, this.folds)
     if (cost === undefined) return null
@@ -358,15 +369,14 @@ export default class CostMeterService extends TypertRemoteService {
   private async computeSessionCosts(): Promise<SessionCostRecord[]> {
     const query = this.ctx.get('sessionQuery') as SessionQueryFace | undefined
     const sessions = this.ctx.get('sessions') as SessionsFace | undefined
-    const pricing = (this.ctx as Context & { settings: SettingsReaderFace }).settings.get(SETTINGS_NS) as PricingConfig | undefined
+    const pricing = settingsValue(this.ctx, SETTINGS_NS) as PricingConfig | undefined
     return collectSessionCosts(query, normalizePricing(pricing ?? DEFAULT_PRICING), this.folds, sessions)
   }
 
   /** Remaining balance once per gateway origin; failed origins are omitted. */
   async providerBalances(): Promise<ProviderBalance[]> {
-    const settings = this.ctx.get('settings') as SettingsReaderFace | undefined
     const credentials = this.ctx.get('credentials') as CredentialsFace | undefined
-    const providers = (settings?.get('llm-pi-ai') as { providers?: Record<string, ProviderSource> } | undefined)?.providers
+    const providers = (settingsValue(this.ctx, 'llm-pi-ai') as { providers?: Record<string, ProviderSource> } | undefined)?.providers
     return collectProviderBalances({ providers, credentials })
   }
 }

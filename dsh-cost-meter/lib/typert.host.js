@@ -6,7 +6,7 @@ const zString = z.string();
 const jsonResult = (method) => ({
 	mode: "strict",
 	typeSymbol: `${PKG}#${method}#result`,
-	schema: zUnknown
+	create: () => zUnknown
 });
 const strParam = (method, name) => ({
 	name,
@@ -15,7 +15,7 @@ const strParam = (method, name) => ({
 	codec: {
 		mode: "strict",
 		typeSymbol: `${PKG}#${method}#${name}`,
-		schema: zString
+		create: () => zString
 	}
 });
 const inv = (method, parameters) => ({

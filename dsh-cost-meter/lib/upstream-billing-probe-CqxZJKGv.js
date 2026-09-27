@@ -1,5 +1,3 @@
-import z from "@deepseek-ai/schemastery";
-import { TypertRemoteService } from "@deepseek-ai/dsh-typert-protocol";
 //#region src/pricing.ts
 const DEFAULT_GROUP = {
 	id: "default",
@@ -561,14 +559,14 @@ function firstNumber(...values) {
 	for (const value of values) if (typeof value === "number" && Number.isFinite(value) && value >= 0) return value;
 	return 0;
 }
-function object$1(value) {
+function object(value) {
 	return value !== null && typeof value === "object" ? value : {};
 }
 /** Normalize common provider usage responses into DSH's disjoint token buckets. */
 function normalizeUsage(raw) {
-	const promptDetails = object$1(raw.prompt_tokens_details);
-	const inputDetails = object$1(raw.input_tokens_details);
-	const completionDetails = object$1(raw.completion_tokens_details);
+	const promptDetails = object(raw.prompt_tokens_details);
+	const inputDetails = object(raw.input_tokens_details);
+	const completionDetails = object(raw.completion_tokens_details);
 	const cacheRead = firstNumber(raw.cacheReadTokens, raw.cache_read_input_tokens, raw.cache_read_tokens, promptDetails.cached_tokens, inputDetails.cached_tokens, raw.prompt_cache_hit_tokens);
 	const cacheWrite = firstNumber(raw.cacheWriteTokens, raw.cache_write_input_tokens, raw.cache_write_tokens, raw.cache_creation_input_tokens, raw.cache_creation_tokens, promptDetails.cache_creation_input_tokens, inputDetails.cache_creation_input_tokens);
 	const canonicalInput = raw.inputTokens;
@@ -616,6 +614,22 @@ function hourLabel(time) {
 	const d = new Date(time);
 	const h = String(d.getHours()).padStart(2, "0");
 	return `${h}:00–${h}:59`;
+}
+/**
+* Usage reported for one assistant event.
+* v4 commits it on `assistant/message.data.usage` and also embeds the usage
+* chunk in `data.stream`; v2 committed it on a standalone `assistant/chunk`.
+* A message that already carries `data.usage` wins, so the embedded chunk of
+* the same event is not billed twice.
+* @param event - one session-log event.
+* @returns the usage object, or undefined when the event reports none.
+*/
+function usageOf(event) {
+	if (event.type === "assistant/message") {
+		if (event.data.usage !== void 0) return event.data.usage;
+		return event.data.stream?.find((record) => record.chunk?.type === "usage")?.chunk?.usage;
+	}
+	if (event.type === "assistant/chunk" && event.data.chunk?.type === "usage") return event.data.chunk.usage;
 }
 /** Fold request routes and provider usage into a cumulative estimate. */
 function foldSession(events, config = DEFAULT_PRICING) {
@@ -706,11 +720,8 @@ function foldSession(events, config = DEFAULT_PRICING) {
 			ensureHour(hourKey(event.time), pricing, 1, null).toolCalls += 1;
 			continue;
 		}
-		let usage;
-		if (event.type === "assistant/message") usage = event.data.usage;
-		else if (event.type === "assistant/chunk" && event.data.chunk?.type === "usage") usage = event.data.chunk.usage;
-		else continue;
-		if (usage === void 0 || usage === null) continue;
+		const usage = usageOf(event);
+		if (usage === void 0) continue;
 		const pricing = resolvePricing(config, provider, model, event.time);
 		const normalized = normalizeUsage(usage);
 		const tokens = {
@@ -846,116 +857,6 @@ function foldSession(events, config = DEFAULT_PRICING) {
 	}).sort((a, b) => a.hour.localeCompare(b.hour) || (a.provider ?? "").localeCompare(b.provider ?? "") || (a.model ?? "").localeCompare(b.model ?? "") || a.contextMultiplier - b.contextMultiplier);
 	return out;
 }
-//#endregion
-//#region src/session-fold-cache.ts
-/** In-process cache of each session's own fold, keyed by pricing and log fingerprints. */
-function stableValue(value) {
-	if (Array.isArray(value)) return value.map(stableValue);
-	if (value !== null && typeof value === "object") return Object.fromEntries(Object.keys(value).sort().filter((key) => key !== "lastProbedAt").map((key) => [key, stableValue(value[key])]));
-	return value;
-}
-/** Deterministic fingerprint of the live pricing used to value a fold. Probe timestamps do not change billed rates. */
-function pricingFingerprint(config) {
-	return JSON.stringify(stableValue(config));
-}
-function usageMix(event) {
-	const usage = event.data.usage ?? (event.data.chunk?.type === "usage" ? event.data.chunk.usage : void 0);
-	if (usage === void 0) return 0;
-	let mix = 0;
-	for (const value of Object.values(usage)) if (typeof value === "number" && Number.isFinite(value)) mix = Math.imul(mix, 33) + (value | 0) >>> 0;
-	return mix;
-}
-/**
-* Cheap identity of one session log. Length, a rolling mix of type/time/usage,
-* and the last event distinguish appends and last-writer-wins usage
-* replacements without hashing the whole payload.
-*/
-function logFingerprint(events) {
-	let mix = events.length >>> 0;
-	for (const event of events) {
-		mix = Math.imul(mix, 33) + event.type.length >>> 0;
-		mix = Math.imul(mix, 33) + (event.time | 0) >>> 0;
-		const turn = event.data.turn;
-		const step = event.data.step;
-		if (typeof turn === "number") mix = Math.imul(mix, 33) + (turn | 0) >>> 0;
-		if (typeof step === "number") mix = Math.imul(mix, 33) + (step | 0) >>> 0;
-		mix = Math.imul(mix, 33) + usageMix(event) >>> 0;
-	}
-	const last = events[events.length - 1];
-	return `${events.length}:${mix}:${last?.type ?? ""}:${last?.time ?? 0}:${last?.data.turn ?? ""}:${last?.data.step ?? ""}:${usageMix(last ?? {
-		type: "",
-		time: 0,
-		data: {}
-	})}`;
-}
-/**
-* Reuse a session's own fold when the pricing config and log fingerprint match.
-* A pricing change drops every entry. Deleted ids are dropped by `retain()`.
-*/
-var SessionFoldCache = class {
-	compute;
-	entries = /* @__PURE__ */ new Map();
-	pricing = "";
-	stats = {
-		hits: 0,
-		misses: 0
-	};
-	constructor(compute = foldSession) {
-		this.compute = compute;
-	}
-	get size() {
-		return this.entries.size;
-	}
-	alignPricing(config) {
-		const pricing = pricingFingerprint(config);
-		if (this.pricing !== "" && this.pricing !== pricing) this.entries.clear();
-		this.pricing = pricing;
-		return pricing;
-	}
-	/**
-	* Return a previously stored own-fold when the live pricing still matches.
-	* Callers that already know the session is not live may skip a durable reread.
-	* @param sessionId Durable session id.
-	* @param config Live pricing. A different fingerprint clears the cache first.
-	* @returns The cached own-fold, or undefined on a miss.
-	*/
-	peek(sessionId, config) {
-		const pricing = this.alignPricing(config);
-		const hit = this.entries.get(sessionId);
-		if (hit === void 0 || hit.pricing !== pricing) return void 0;
-		this.stats.hits += 1;
-		return hit.cost;
-	}
-	/**
-	* Return the cached own-fold or compute and store a new one.
-	* @param sessionId Durable session id.
-	* @param events Complete log used for the fingerprint and, on a miss, the fold.
-	* @param config Live pricing. A different fingerprint clears the cache first.
-	* @returns The session's own fold, never a parent-merged total.
-	*/
-	fold(sessionId, events, config) {
-		const pricing = this.alignPricing(config);
-		const log = logFingerprint(events);
-		const hit = this.entries.get(sessionId);
-		if (hit !== void 0 && hit.pricing === pricing && hit.log === log) {
-			this.stats.hits += 1;
-			return hit.cost;
-		}
-		this.stats.misses += 1;
-		const cost = this.compute(events, config);
-		this.entries.set(sessionId, {
-			pricing,
-			log,
-			cost
-		});
-		return cost;
-	}
-	/** Drop entries whose session is no longer in the listed corpus. */
-	retain(sessionIds) {
-		const keep = new Set(sessionIds);
-		for (const id of this.entries.keys()) if (!keep.has(id)) this.entries.delete(id);
-	}
-};
 //#endregion
 //#region src/session-table.ts
 /** Pure session-overview query helpers shared by the host tests and the dock UI. */
@@ -1802,280 +1703,6 @@ async function collectProviderBalances(input) {
 	return out;
 }
 //#endregion
-//#region src/usage-tap.ts
-/**
-* Read `reasoning_tokens` from an OpenAI-compat usage object.
-* Wanzhao grok keeps this disjoint from `completion_tokens`.
-* @param usage Wire `usage` object, or undefined when the chunk has none.
-* @returns A positive reasoning count, or 0 when the field is absent.
-*/
-function reasoningFromWireUsage(usage) {
-	if (usage === null || typeof usage !== "object") return 0;
-	const raw = usage;
-	const completionDetails = object(raw.completion_tokens_details);
-	const outputDetails = object(raw.output_tokens_details);
-	for (const value of [
-		raw.reasoning_tokens,
-		completionDetails.reasoning_tokens,
-		outputDetails.reasoning_tokens
-	]) if (typeof value === "number" && Number.isFinite(value) && value > 0) return value;
-	return 0;
-}
-/**
-* Record reasoning from one wire usage object onto the in-flight tap slot.
-* @param slot Request-local slot created around one `llm.stream` call.
-* @param usage Wire `usage` object.
-*/
-function applyWireUsage(slot, usage) {
-	const reasoning = reasoningFromWireUsage(usage);
-	if (reasoning > 0) slot.reasoningTokens = reasoning;
-}
-/**
-* Scan an SSE buffer for `data:` frames that carry `usage`.
-* Incomplete trailing JSON is ignored until more bytes arrive.
-* @param buffer Decoded SSE text received so far.
-* @param slot Request-local slot to update.
-*/
-function scanSseBuffer(buffer, slot) {
-	for (const line of buffer.split("\n")) {
-		const trimmed = line.trim();
-		if (!trimmed.startsWith("data:")) continue;
-		const data = trimmed.slice(5).trim();
-		if (data === "" || data === "[DONE]") continue;
-		try {
-			const payload = JSON.parse(data);
-			if (payload.usage !== void 0) applyWireUsage(slot, payload.usage);
-		} catch {}
-	}
-}
-/**
-* Attach captured reasoning onto a harness usage chunk if the adapter omitted it.
-* @param chunk One value yielded by `llm.stream`.
-* @param reasoningTokens Captured gateway reasoning count.
-* @returns The original chunk, or a shallow copy with `usage.reasoningTokens`.
-*/
-function attachReasoningToChunk(chunk, reasoningTokens) {
-	if (reasoningTokens === void 0 || reasoningTokens <= 0) return chunk;
-	if (chunk === null || typeof chunk !== "object") return chunk;
-	const typed = chunk;
-	if (typed.type !== "usage" || typed.usage === null || typeof typed.usage !== "object") return chunk;
-	const usage = typed.usage;
-	if (typeof usage.reasoningTokens === "number" && usage.reasoningTokens > 0) return chunk;
-	return {
-		...typed,
-		usage: {
-			...usage,
-			reasoningTokens
-		}
-	};
-}
-/**
-* @param input `fetch` input (URL string, URL, or Request).
-* @returns Whether this request is an OpenAI-compat completion/response call.
-*/
-function shouldTapRequest(input) {
-	const url = requestUrl(input);
-	return url.includes("/chat/completions") || url.includes("/responses");
-}
-/**
-* Pass upstream bytes through unchanged while parsing usage on the same chunks.
-* Reasoning is written to `slot` before the official client sees those bytes.
-* @param response Upstream `fetch` response. The body is consumed via a wrapper.
-* @param slot Request-local slot to update.
-* @returns A response with identical status, headers, and body bytes.
-*/
-function tapFetchResponse(response, slot) {
-	if (response.body === null) return response;
-	const reader = response.body.getReader();
-	const decoder = new TextDecoder();
-	let buffer = "";
-	const stream = new ReadableStream({
-		async pull(controller) {
-			const { done, value } = await reader.read();
-			if (done) {
-				buffer += decoder.decode();
-				ingestBuffer(buffer, slot);
-				controller.close();
-				return;
-			}
-			buffer += decoder.decode(value, { stream: true });
-			ingestBuffer(buffer, slot);
-			controller.enqueue(value);
-		},
-		cancel(reason) {
-			return reader.cancel(reason);
-		}
-	});
-	return new Response(stream, {
-		status: response.status,
-		statusText: response.statusText,
-		headers: response.headers
-	});
-}
-/**
-* Wrap `globalThis.fetch` so in-flight `llm.stream` calls can see gateway usage.
-* Responses outside an active tap slot, or to other URLs, pass through untouched.
-* @param slots Active stream slots. Async generators drop AsyncLocalStorage
-*   across `await`, so the fetch tap reads this stack, not ALS alone.
-* @returns Disposer that restores the previous `fetch`.
-*/
-function installFetchTap(slots) {
-	const original = globalThis.fetch;
-	if (typeof original !== "function") return () => {};
-	const tapped = async (input, init) => {
-		const response = await original(input, init);
-		const store = slots.at(-1);
-		if (store === void 0 || !shouldTapRequest(input)) return response;
-		return tapFetchResponse(response, store);
-	};
-	globalThis.fetch = tapped;
-	return () => {
-		if (globalThis.fetch === tapped) globalThis.fetch = original;
-	};
-}
-function popSlot(slots, store) {
-	const index = slots.lastIndexOf(store);
-	if (index >= 0) slots.splice(index, 1);
-}
-/**
-* Wrap `llm.stream` so each call has a tap slot and usage chunks carry reasoning.
-* The slot stays on the stack until the iterator settles so `fetch` inside an
-* async generator still sees it. AsyncLocalStorage does not survive that hop.
-* @param stream Original `llm.stream` bound to the service.
-* @param slots Active stream slots read by the fetch tap.
-* @returns A replacement `stream` with the same call signature.
-*/
-function wrapLlmStream(stream, slots) {
-	return (options) => {
-		const store = {};
-		slots.push(store);
-		let released = false;
-		const release = () => {
-			if (released) return;
-			released = true;
-			popSlot(slots, store);
-		};
-		let inner;
-		try {
-			inner = stream(options);
-		} catch (error) {
-			release();
-			throw error;
-		}
-		return { [Symbol.asyncIterator]() {
-			const iterator = inner[Symbol.asyncIterator]();
-			return {
-				next: async () => {
-					try {
-						const result = await iterator.next();
-						if (result.done) {
-							release();
-							return result;
-						}
-						return {
-							done: false,
-							value: attachReasoningToChunk(result.value, store.reasoningTokens)
-						};
-					} catch (error) {
-						release();
-						throw error;
-					}
-				},
-				return: async (value) => {
-					try {
-						return await (iterator.return?.(value) ?? Promise.resolve({
-							done: true,
-							value
-						}));
-					} finally {
-						release();
-					}
-				},
-				throw: async (error) => {
-					try {
-						return await (iterator.throw?.(error) ?? Promise.reject(error));
-					} finally {
-						release();
-					}
-				}
-			};
-		} };
-	};
-}
-/**
-* Wrap `llm.prepareCall` so the one-shot stream the agent loop actually
-* iterates also carries the fetch-tap slot. `preparedCall.stream` bypasses
-* `llm.stream`; wrapping only the latter leaves grok reasoning off the log.
-* @param prepareCall Original `llm.prepareCall` bound to the service.
-* @param slots Active stream slots read by the fetch tap.
-* @returns A replacement `prepareCall` that taps the returned stream.
-*/
-function wrapPrepareCall(prepareCall, slots) {
-	return async (config, signal) => {
-		const prepared = await prepareCall(config, signal);
-		if (prepared === null || typeof prepared !== "object" || typeof prepared.stream !== "function") return prepared;
-		return {
-			...prepared,
-			stream: wrapLlmStream(prepared.stream.bind(prepared), slots)
-		};
-	};
-}
-/**
-* Install the fetch tap and wrap `ctx.llm.stream` plus `ctx.llm.prepareCall`.
-* The agent loop dispatches through `preparedCall.stream`; title and
-* compaction still use `llm.stream`. Both must enter the same tap slot.
-* @param ctx Host context. `llm` is optional so tests without it still load.
-* @returns Disposer that unwraps fetch, `llm.stream`, and `llm.prepareCall`.
-*/
-function installUsageTap(ctx) {
-	const slots = [];
-	const restoreFetch = installFetchTap(slots);
-	let restoreLlm = () => {};
-	ctx.inject(["llm"], (inner) => {
-		const llm = inner.llm;
-		if (llm === void 0) return;
-		const restorers = [];
-		if (typeof llm.stream === "function") {
-			const original = llm.stream;
-			llm.stream = wrapLlmStream(original.bind(llm), slots);
-			restorers.push(() => {
-				llm.stream = original;
-			});
-		}
-		if (typeof llm.prepareCall === "function") {
-			const original = llm.prepareCall;
-			llm.prepareCall = wrapPrepareCall(original.bind(llm), slots);
-			restorers.push(() => {
-				llm.prepareCall = original;
-			});
-		}
-		restoreLlm = () => {
-			for (const restore of restorers) restore();
-		};
-	});
-	return () => {
-		restoreLlm();
-		restoreFetch();
-	};
-}
-function object(value) {
-	return value !== null && typeof value === "object" ? value : {};
-}
-function requestUrl(input) {
-	if (typeof input === "string") return input;
-	if (input instanceof URL) return input.href;
-	if (input !== null && typeof input === "object" && "url" in input) return String(input.url);
-	return "";
-}
-function ingestBuffer(buffer, slot) {
-	scanSseBuffer(buffer, slot);
-	const trimmed = buffer.trim();
-	if (!trimmed.startsWith("{")) return;
-	try {
-		applyWireUsage(slot, JSON.parse(trimmed).usage);
-	} catch {}
-}
-//#endregion
 //#region src/upstream-billing-probe.ts
 const REQUEST_TIMEOUT_MS = 1e4;
 const MAX_RESPONSE_BYTES = 65536;
@@ -2217,7 +1844,7 @@ function installUpstreamBillingProbes(ctx, scope) {
 			if (billing?.enabled !== true) return;
 			const credentials = ctx.get("credentials");
 			const settings = ctx.get("settings");
-			const providers = (settings?.get("llm-pi-ai"))?.providers ?? {};
+			const providers = (settings?.describe?.().find((row) => row.ns === "llm-pi-ai")?.value)?.providers ?? {};
 			const now = Date.now();
 			const allowed = billing.providers === void 0 ? void 0 : new Set(billing.providers);
 			const results = await mapWithConcurrency(listProviderBalanceTargets(providers).filter((target) => allowed === void 0 || allowed.has(target.provider)).filter((target) => (due.get(target.provider) ?? 0) <= now), billing.concurrency ?? 2, async (target) => {
@@ -2280,181 +1907,4 @@ function installUpstreamBillingProbes(ctx, scope) {
 	};
 }
 //#endregion
-//#region src/index.ts
-/**
-* Settings schema admits both the current group document and the previous
-* default/models document, then stores the normalized group form.
-*/
-const Config = z.transform(z.any(), (value) => {
-	const normalized = normalizePricing(value ?? {});
-	validatePricing(normalized);
-	return normalized;
-});
-const SETTINGS_NS = "cost-meter";
-function subagentChildren(records) {
-	const children = /* @__PURE__ */ new Map();
-	for (const record of records) {
-		const parent = record.header.parentSession;
-		if (parent === void 0 || record.header.origin !== "subagent") continue;
-		const ids = children.get(parent);
-		if (ids === void 0) children.set(parent, [record.header.id]);
-		else ids.push(record.header.id);
-	}
-	return children;
-}
-function resolveEvents(sessionId, sessions, query) {
-	const live = sessions?.get(sessionId)?.snapshotEvents();
-	if (live !== void 0) return live;
-	if (query === void 0) return void 0;
-	return query.readSession(sessionId).then((snapshot) => snapshot.events);
-}
-async function foldOwnSession(sessionId, events, config, store) {
-	return store === void 0 ? foldSession(events, config) : store.fold(sessionId, events, config);
-}
-async function ownFoldFor(sessionId, config, sessions, query, store) {
-	const live = sessions?.get(sessionId)?.snapshotEvents();
-	if (live === void 0 && store?.peek !== void 0) {
-		const cached = store.peek(sessionId, config);
-		if (cached !== void 0) return cached;
-	}
-	const events = live ?? await resolveEvents(sessionId, void 0, query);
-	if (events === void 0) return void 0;
-	return foldOwnSession(sessionId, events, config, store);
-}
-async function readSubagentTree(query, children, sessionId, config, seen, sessions, store) {
-	const ids = children.get(sessionId) ?? [];
-	const rows = [];
-	for (const id of ids) {
-		if (seen.has(id)) continue;
-		seen.add(id);
-		const cost = await ownFoldFor(id, config, sessions, query, store);
-		if (cost === void 0) continue;
-		rows.push({
-			...cost,
-			sessionId: id,
-			children: await readSubagentTree(query, children, id, config, seen, sessions, store)
-		});
-	}
-	return rows;
-}
-function mergeCostInto(target, cost) {
-	target.cost += cost.cost;
-	target.inputCost += cost.inputCost;
-	target.cacheReadCost += cost.cacheReadCost;
-	target.cacheWriteCost += cost.cacheWriteCost;
-	target.outputCost += cost.outputCost;
-	target.inputTokens += cost.inputTokens;
-	target.cacheReadTokens += cost.cacheReadTokens;
-	target.cacheWriteTokens += cost.cacheWriteTokens;
-	target.outputTokens += cost.outputTokens;
-	target.details.push(...cost.details);
-}
-/**
-* Fold every listed session independently.
-* @param query Durable session listing/read face, or undefined when the host has none.
-* @param config Live pricing used for every session.
-* @param store Optional own-fold cache. Hits reuse the previous fold for an unchanged log and pricing.
-* @param sessions Optional live session map. Live events take precedence over a durable read.
-* @returns Listed sessions in original order, skipping duplicate ids and unreadable logs. A listing failure returns [].
-*/
-async function collectSessionCosts(query, config, store, sessions) {
-	if (query === void 0) return [];
-	let records;
-	try {
-		records = await query.listSessions();
-	} catch {
-		return [];
-	}
-	const seen = /* @__PURE__ */ new Set();
-	const rows = [];
-	for (const record of records) {
-		const sessionId = record.header.id;
-		if (sessionId === "" || seen.has(sessionId)) continue;
-		seen.add(sessionId);
-		let cost;
-		try {
-			cost = await ownFoldFor(sessionId, config, sessions, query, store);
-		} catch {
-			continue;
-		}
-		if (cost === void 0) continue;
-		rows.push({
-			sessionId,
-			parentSession: record.header.parentSession ?? null,
-			origin: record.header.origin ?? null,
-			cost
-		});
-	}
-	store?.retain?.(seen);
-	return rows;
-}
-function mergeCosts(primary, subagents) {
-	const out = structuredClone(primary);
-	out.subagents = structuredClone([...subagents]);
-	const visit = (rows) => {
-		for (const row of rows) {
-			mergeCostInto(out, row);
-			visit(row.children);
-		}
-	};
-	visit(subagents);
-	return out;
-}
-/** Typert Remote service exposing the cumulative cost of one session. */
-var CostMeterService = class extends TypertRemoteService {
-	static Config = Config;
-	static inject = ["settings"];
-	folds = new SessionFoldCache();
-	inflightCosts = /* @__PURE__ */ new Map();
-	inflightOverview;
-	constructor(ctx) {
-		super(ctx, "costMeter");
-		ctx.effect(() => installUsageTap(ctx));
-	}
-	/** Compute one session's cost together with every descendant subagent session. */
-	async sessionCost(sessionId) {
-		if (typeof sessionId !== "string" || sessionId.length === 0) return null;
-		const pending = this.inflightCosts.get(sessionId);
-		if (pending !== void 0) return pending;
-		const work = this.computeSessionCost(sessionId).finally(() => {
-			if (this.inflightCosts.get(sessionId) === work) this.inflightCosts.delete(sessionId);
-		});
-		this.inflightCosts.set(sessionId, work);
-		return work;
-	}
-	/** Fold every listed session independently for the all-session overview. */
-	async sessionCosts() {
-		if (this.inflightOverview !== void 0) return this.inflightOverview;
-		const work = this.computeSessionCosts().finally(() => {
-			if (this.inflightOverview === work) this.inflightOverview = void 0;
-		});
-		this.inflightOverview = work;
-		return work;
-	}
-	async computeSessionCost(sessionId) {
-		const sessions = this.ctx.get("sessions");
-		const query = this.ctx.get("sessionQuery");
-		const config = normalizePricing(this.ctx.settings.get(SETTINGS_NS) ?? DEFAULT_PRICING);
-		const cost = await ownFoldFor(sessionId, config, sessions, query, this.folds);
-		if (cost === void 0) return null;
-		if (query === void 0) return cost;
-		return mergeCosts(cost, await readSubagentTree(query, subagentChildren(await query.listSessions()), sessionId, config, /* @__PURE__ */ new Set([sessionId]), sessions, this.folds));
-	}
-	async computeSessionCosts() {
-		const query = this.ctx.get("sessionQuery");
-		const sessions = this.ctx.get("sessions");
-		return collectSessionCosts(query, normalizePricing(this.ctx.settings.get(SETTINGS_NS) ?? DEFAULT_PRICING), this.folds, sessions);
-	}
-	/** Remaining balance once per gateway origin; failed origins are omitted. */
-	async providerBalances() {
-		const settings = this.ctx.get("settings");
-		const credentials = this.ctx.get("credentials");
-		const providers = (settings?.get("llm-pi-ai"))?.providers;
-		return collectProviderBalances({
-			providers,
-			credentials
-		});
-	}
-};
-//#endregion
-export { localDateOfHour as $, walletHref as A, clockTime as At, filterHourlyEntries as B, normalizePricing as Bt, modelsURL as C, logFingerprint as Ct, routesForProvider as D, applyPeriodClock as Dt, probeProviderBalance as E, DEFAULT_PRICING as Et, defaultChildCostTableSort as F, formatTokenThreshold as Ft, formatMoneyAmount as G, resolvePricing as Gt, flattenCostTableRows as H, periodDays as Ht, defaultCostTableSort as I, isPeriodAllDay as It, formatUsageCell as J, togglePeriodAllDay as Jt, formatRatedCost as K, resolveReasoningExtra as Kt, defaultVisibleCostColumns as L, lastProbeAt as Lt, averageUnitPrice as M, discountMultiplierAt as Mt, costTableColumnValues as N, foldSession as Nt, shouldRemoveUnavailableProvider as O, assignmentWithManualMultiplier as Ot, costTableTotals as P, formatContextSurcharge as Pt, isNumericCostTableColumn as Q, displayCellText as R, lastUpdatedAt as Rt, listProviderBalanceTargets as S, SessionFoldCache as St, probeProviderAvailability as T, DEFAULT_GROUP as Tt, flattenHourlyEntries as U, resolveContextMultiplier as Ut, filterSessionRows as V, normalizeUsage as Vt, formatCacheRatedCost as W, resolveContextSurcharge as Wt, groupDailyOverview as X, groupCostTableRows as Y, validatePricing as Yt, groupHourlyEntries as Z, wrapPrepareCall as _, sortCostTableRows as _t, billingProbeURL as a, optionalCostTableColumns as at, gatewayOrigin as b, toggleCostTableSort as bt, parseBillingMultiplier as c, queryCostTableGroups as ct, installUsageTap as d, querySessionRows as dt, localTodayDate as et, reasoningFromWireUsage as f, resolveVisibleCostColumns as ft, wrapLlmStream as g, sharedContextSurcharge as gt, tapFetchResponse as h, sessionTotalTokens as ht, assignmentWithObservedMultiplier as i, metricTokens as it, activityText as j, contextTokensOf as jt, usageURL as k, billedOutputTokens as kt, applyWireUsage as l, queryDailyOverview as lt, shouldTapRequest as m, sessionRoutes as mt, CostMeterService as n, mergeListedSessionCost as nt, installUpstreamBillingProbes as o, overviewCost as ot, scanSseBuffer as p, rowTotalTokens as pt, formatUnitTokensLabel as q, routeKey as qt, collectSessionCosts as r, metricCost as rt, nextBillingProbeDue as s, queryCostTable as st, Config as t, mapWithConcurrency as tt, attachReasoningToChunk as u, queryHourlyOverview as ut, collapseBalanceChips as v, sortSessionRows as vt, parseProviderBalance as w, pricingFingerprint as wt, groupProviderBalanceTargetsByOrigin as x, toggleSessionTableSort as xt, collectProviderBalances as y, sumHourlySlices as yt, filterCostTableRows as z, multiplierHistoryRows as zt };
+export { querySessionRows as $, flattenCostTableRows as A, resolvePricing as At, isNumericCostTableColumn as B, defaultChildCostTableSort as C, lastUpdatedAt as Ct, filterCostTableRows as D, periodDays as Dt, displayCellText as E, normalizeUsage as Et, formatUnitTokensLabel as F, metricCost as G, localTodayDate as H, formatUsageCell as I, overviewCost as J, metricTokens as K, groupCostTableRows as L, formatCacheRatedCost as M, routeKey as Mt, formatMoneyAmount as N, togglePeriodAllDay as Nt, filterHourlyEntries as O, resolveContextMultiplier as Ot, formatRatedCost as P, validatePricing as Pt, queryHourlyOverview as Q, groupDailyOverview as R, costTableTotals as S, lastProbeAt as St, defaultVisibleCostColumns as T, normalizePricing as Tt, mapWithConcurrency as U, localDateOfHour as V, mergeListedSessionCost as W, queryCostTableGroups as X, queryCostTable as Y, queryDailyOverview as Z, usageURL as _, discountMultiplierAt as _t, parseBillingMultiplier as a, sortCostTableRows as at, averageUnitPrice as b, formatTokenThreshold as bt, gatewayOrigin as c, toggleCostTableSort as ct, modelsURL as d, DEFAULT_PRICING as dt, resolveVisibleCostColumns as et, parseProviderBalance as f, applyPeriodClock as ft, shouldRemoveUnavailableProvider as g, contextTokensOf as gt, routesForProvider as h, clockTime as ht, nextBillingProbeDue as i, sharedContextSurcharge as it, flattenHourlyEntries as j, resolveReasoningExtra as jt, filterSessionRows as k, resolveContextSurcharge as kt, groupProviderBalanceTargetsByOrigin as l, toggleSessionTableSort as lt, probeProviderBalance as m, billedOutputTokens as mt, billingProbeURL as n, sessionRoutes as nt, collapseBalanceChips as o, sortSessionRows as ot, probeProviderAvailability as p, assignmentWithManualMultiplier as pt, optionalCostTableColumns as q, installUpstreamBillingProbes as r, sessionTotalTokens as rt, collectProviderBalances as s, sumHourlySlices as st, assignmentWithObservedMultiplier as t, rowTotalTokens as tt, listProviderBalanceTargets as u, DEFAULT_GROUP as ut, walletHref as v, foldSession as vt, defaultCostTableSort as w, multiplierHistoryRows as wt, costTableColumnValues as x, isPeriodAllDay as xt, activityText as y, formatContextSurcharge as yt, groupHourlyEntries as z };

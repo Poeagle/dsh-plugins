@@ -508,7 +508,7 @@ test('settings schema persists group assignments over a leftover default section
       'wz/gpt-5.6-terra': { groupId: 'group-1' },
     },
   }
-  const stored = Config(merged)
+  const stored = Config(merged).get()
   assert.equal('default' in stored, false)
   assert.deepEqual(stored.groups.map(group => group.id), ['default', 'group-1'])
   assert.equal(stored.models['wz/gpt-5.6-sol'].groupId, 'group-1')
@@ -528,7 +528,7 @@ test('settings schema migrates a stored legacy document', () => {
         reasoningExtra: true,
       },
     },
-  })
+  }).get()
   assert.equal(stored.groups.length >= 2, true)
   assert.equal(stored.models['grok/grok-4.6'].groupId !== 'default', true)
   assert.equal(stored.models['grok/grok-4.6'].reasoningExtra, true)

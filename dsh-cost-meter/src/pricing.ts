@@ -803,7 +803,10 @@ export interface CostEvent {
     step?: number
     header?: { config?: { provider?: unknown; model?: unknown } }
     usage?: Record<string, unknown>
+    /** v2 logs carried usage on a standalone `assistant/chunk` event. */
     chunk?: { type?: string; usage?: Record<string, unknown> }
+    /** v4 logs embed the same usage chunk inside `assistant/message.stream`. */
+    stream?: readonly { type?: string; chunk?: { type?: string; usage?: Record<string, unknown> } }[]
   }
 }
 
@@ -1029,6 +1032,25 @@ interface HourBucket {
   cost: number
 }
 
+/**
+ * Usage reported for one assistant event.
+ * v4 commits it on `assistant/message.data.usage` and also embeds the usage
+ * chunk in `data.stream`; v2 committed it on a standalone `assistant/chunk`.
+ * A message that already carries `data.usage` wins, so the embedded chunk of
+ * the same event is not billed twice.
+ * @param event - one session-log event.
+ * @returns the usage object, or undefined when the event reports none.
+ */
+function usageOf(event: CostEvent): Record<string, unknown> | undefined {
+  if (event.type === 'assistant/message') {
+    if (event.data.usage !== undefined) return event.data.usage
+    const embedded = event.data.stream?.find(record => record.chunk?.type === 'usage')?.chunk?.usage
+    return embedded
+  }
+  if (event.type === 'assistant/chunk' && event.data.chunk?.type === 'usage') return event.data.chunk.usage
+  return undefined
+}
+
 /** Fold request routes and provider usage into a cumulative estimate. */
 export function foldSession(events: readonly CostEvent[], config: PricingConfig = DEFAULT_PRICING): CostFold {
   config = normalizePricing(config)
@@ -1120,11 +1142,8 @@ export function foldSession(events: readonly CostEvent[], config: PricingConfig 
       ensureHour(hourKey(event.time), pricing, 1, null).toolCalls += 1
       continue
     }
-    let usage: Record<string, unknown> | undefined
-    if (event.type === 'assistant/message') usage = event.data.usage
-    else if (event.type === 'assistant/chunk' && event.data.chunk?.type === 'usage') usage = event.data.chunk.usage
-    else continue
-    if (usage === undefined || usage === null) continue
+    const usage = usageOf(event)
+    if (usage === undefined) continue
 
     const pricing = resolvePricing(config, provider, model, event.time)
     const normalized = normalizeUsage(usage)

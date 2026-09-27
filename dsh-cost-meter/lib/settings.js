@@ -1,7 +1,11 @@
-import { Bt as normalizePricing, Ot as assignmentWithManualMultiplier, Yt as validatePricing, o as installUpstreamBillingProbes, t as Config } from "./src-b-MDgxCr.js";
+import { Pt as validatePricing, Tt as normalizePricing, dt as DEFAULT_PRICING, pt as assignmentWithManualMultiplier, r as installUpstreamBillingProbes } from "./upstream-billing-probe-CqxZJKGv.js";
 //#region src/settings.ts
 const SETTINGS_NS = "cost-meter";
 const ROUTE_PATH = "/cost-meter/pricing";
+/** Read the resolved value of one profile entry's settings namespace. */
+function settingsValue(ctx, ns) {
+	return ctx.get("settings")?.describe?.().find((row) => row.ns === ns)?.value;
+}
 function mergeHistory(current, incoming) {
 	const models = { ...incoming.models };
 	const now = Date.now();
@@ -42,14 +46,15 @@ function isLoopbackHost(hostname) {
 }
 const name = "cost-meter-settings";
 const inject = ["settings"];
-/** Register the live pricing namespace and the browser settings-card route. */
-function apply(ctx, config) {
-	const settings = ctx.get("settings");
-	if (settings === void 0) return;
-	const scope = settings.register(SETTINGS_NS, Config, {
-		base: config,
-		validate: (value) => validatePricing(normalizePricing(value))
-	});
+/** Bridge the live pricing namespace to the browser settings-card route. */
+function apply(ctx) {
+	const scope = {
+		get: () => normalizePricing(settingsValue(ctx, SETTINGS_NS) ?? DEFAULT_PRICING),
+		update: (patch) => ctx.get("settings").update(SETTINGS_NS, patch),
+		watch: (callback) => ctx.on("loader/volatile-update", () => {
+			callback();
+		})
+	};
 	ctx.effect(() => installUpstreamBillingProbes(ctx, scope), "cost-meter upstream billing probes");
 	ctx.inject(["webServer"], (webCtx) => {
 		webCtx.webServer.register({
@@ -65,6 +70,14 @@ function apply(ctx, config) {
 					send(403, {
 						ok: false,
 						error: "request refused: this route answers same-origin loopback only"
+					});
+					return;
+				}
+				const settings = ctx.get("settings");
+				if (settings === void 0) {
+					send(503, {
+						ok: false,
+						error: "settings service unavailable"
 					});
 					return;
 				}

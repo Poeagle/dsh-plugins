@@ -1209,8 +1209,8 @@ export async function apply(ctx: Context) {
     package: 'dsh-cost-meter',
     descriptors: [{
       id: 'dsh-cost-meter#costMeter/sessionCost', service: 'costMeter', namespace: 'costMeter', method: 'sessionCost', invocation: { kind: 'direct' },
-      parameters: [{ name: 'sessionId', wire: 'sessionId', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-cost-meter#sessionCost#sessionId', schema: { _zod: true, parse: (value: unknown) => value } } }],
-      result: { mode: 'strict', typeSymbol: 'dsh-cost-meter#sessionCost#result', schema: { _zod: true, parse: (value: unknown) => value } },
+      parameters: [{ name: 'sessionId', wire: 'sessionId', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-cost-meter#sessionCost#sessionId', create: () => ({ _zod: true, parse: (value: unknown) => value }) } }],
+      result: { mode: 'strict', typeSymbol: 'dsh-cost-meter#sessionCost#result', create: () => ({ _zod: true, parse: (value: unknown) => value }) },
     }, {
       id: 'dsh-cost-meter#costMeter/sessionCosts',
       service: 'costMeter',
@@ -1221,10 +1221,10 @@ export async function apply(ctx: Context) {
       result: {
         mode: 'strict',
         typeSymbol: 'dsh-cost-meter#sessionCosts#result',
-        schema: {
+        create: () => ({
           _zod: true,
           parse: (value: unknown) => value,
-        },
+        }),
       },
     }, {
       id: 'dsh-cost-meter#costMeter/providerBalances',
@@ -1236,10 +1236,10 @@ export async function apply(ctx: Context) {
       result: {
         mode: 'strict',
         typeSymbol: 'dsh-cost-meter#providerBalances#result',
-        schema: {
+        create: () => ({
           _zod: true,
           parse: (value: unknown) => value,
-        },
+        }),
       },
     }],
   })

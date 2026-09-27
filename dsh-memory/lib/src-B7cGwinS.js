@@ -1292,6 +1292,21 @@ async function dispatchMemoryTool(store, args) {
 }
 //#endregion
 //#region src/review.ts
+/**
+* Text of the latest system-role message in a derived history.
+* v4 keeps the rendered prompt on `system/message`, not the request header,
+* and a later system message replaces the one the model actually sees.
+* @param messages - the session's derived history, in surface order.
+* @returns the prompt text, or undefined when the history has none.
+*/
+function renderedSystemPrompt(messages) {
+	let text;
+	for (const message of messages) {
+		if (message.role !== "system") continue;
+		text = message.content.map((block) => block.type === "text" ? block.text : "").join("");
+	}
+	return text;
+}
 /** The review directive appended after the replayed conversation. */
 const MEMORY_REVIEW_PROMPT = "Review the conversation above and consider saving a durable fact if appropriate.\n\nClassify every candidate before writing it:\n1. Use target=\"user\" ONLY for stable facts about the person: name, location, age, identity, education, employer, role, personal preferences, or communication style.\n2. Use target=\"memory\" for project and environment facts: repositories, code conventions, product details, workflows, tool behavior, technical rules, and instructions about how the project should be operated.\n3. Project/API debugging facts and implementation requirements MUST use target=\"memory\"; they do not belong in USER.md. Personal profile facts MUST use target=\"user\".\n\nBefore every write, inspect the current entries and consolidate them: do not add a fact that is duplicated, semantically overlapping, or better represented by replacing, merging, shortening, or removing existing entries. Keep only stable, reusable facts and conventions; remove obsolete, redundant, and timeline-style details when a single compact entry preserves the useful fact. If nothing is worth saving after this review, just say 'Nothing to save.' and stop.\n\nYou can only call the memory tool. Other tools will be denied at runtime — do not attempt them.";
 /**
@@ -1321,17 +1336,14 @@ function memoryToolSchema() {
 */
 async function runMemoryReview(ctx, options) {
 	const { session, store, route, maxIterations, signal } = options;
-	const system = session.requestHeader()?.system;
 	const messages = [...session.deriveMessages(), createUserMessage({
-		source: {
-			kind: "plugin",
-			plugin: "dsh-memory"
-		},
+		source: { kind: "dsh-memory" },
 		content: [{
 			type: "text",
 			text: MEMORY_REVIEW_PROMPT
 		}]
 	})];
+	const system = renderedSystemPrompt(messages);
 	const tools = [memoryToolSchema()];
 	let saved = 0;
 	const changes = [];
@@ -1491,13 +1503,21 @@ const DEFAULT_USER_CHAR_LIMIT = 1375;
 const DEFAULT_NUDGE_INTERVAL = 10;
 /** Review fork request cap, mirroring the upstream max_iterations. */
 const DEFAULT_REVIEW_MAX_ITERATIONS = 16;
-/** Schemastery configuration for the memory plugin. */
+/**
+* Schemastery configuration for the memory plugin.
+*
+* `nudgeInterval` and `reviewEnabled` are declared `volatile()` so the harness
+* settings service projects them as this entry's live settings page (the
+* namespace is the profile entry id, `memory`) and writes reach the running
+* references without remounting the plugin. The character budgets and review
+* step cap stay ordinary mount-time configuration.
+*/
 const Config = z.object({
 	memoryCharLimit: z.number().step(1).min(1).default(DEFAULT_MEMORY_CHAR_LIMIT),
 	userCharLimit: z.number().step(1).min(1).default(DEFAULT_USER_CHAR_LIMIT),
-	nudgeInterval: z.number().step(1).min(0).default(10),
+	nudgeInterval: z.number().step(1).min(0).default(10).volatile(),
 	reviewMaxIterations: z.number().step(1).min(1).default(16),
-	reviewEnabled: z.boolean().default(true)
+	reviewEnabled: z.boolean().default(true).volatile()
 });
 /**
 * Resolve the auxiliary route for one session's review fork: the session's
@@ -1570,17 +1590,11 @@ async function apply(ctx, config) {
 	* unavailable or the namespace is not registered.
 	*/
 	function effectiveSettings() {
-		const settings = ctx.get("settings");
-		if (settings?.get) {
-			const raw = settings.get("memory");
-			if (raw !== void 0) return {
-				nudgeInterval: typeof raw.nudgeInterval === "number" ? raw.nudgeInterval : config.nudgeInterval,
-				reviewEnabled: typeof raw.reviewEnabled === "boolean" ? raw.reviewEnabled : config.reviewEnabled
-			};
-		}
+		const nudgeInterval = config.nudgeInterval.get();
+		const reviewEnabled = config.reviewEnabled.get();
 		return {
-			nudgeInterval: config.nudgeInterval,
-			reviewEnabled: config.reviewEnabled
+			nudgeInterval: typeof nudgeInterval === "number" ? nudgeInterval : 10,
+			reviewEnabled: typeof reviewEnabled === "boolean" ? reviewEnabled : true
 		};
 	}
 	ctx.tools.register(defineTool({
@@ -1632,8 +1646,8 @@ async function apply(ctx, config) {
 			if (agent.session.surface.nodes.some((seq) => {
 				const event = agent.session.eventAt(seq);
 				if (event?.type !== "user/message") return false;
-				const message = event.data;
-				return message.source?.kind === "plugin" && message.source?.plugin === "memory";
+				const kind = event.data.source?.kind;
+				return kind === "memory" || kind === `plugin:memory`;
 			})) {
 				injected.add(sid);
 				return decision;
@@ -1644,10 +1658,7 @@ async function apply(ctx, config) {
 					type: "text",
 					text
 				}],
-				source: {
-					kind: "plugin",
-					plugin: name
-				}
+				source: { kind: "memory" }
 			});
 			const lastClaimedIndex = decision.messages.findLastIndex((m) => messages.includes(m));
 			return {
@@ -1784,4 +1795,4 @@ async function apply(ctx, config) {
 //#endregion
 export { DEFAULT_USER_CHAR_LIMIT as a, name as c, memoryReviewNotices as d, MemoryStore as f, DEFAULT_REVIEW_MAX_ITERATIONS as i, memoryReviewProgress as l, DEFAULT_MEMORY_CHAR_LIMIT as n, apply as o, DEFAULT_NUDGE_INTERVAL as r, inject as s, Config as t, remainingTurnsUntilReview as u };
 
-//# sourceMappingURL=src-D3nwv_5e.js.map
+//# sourceMappingURL=src-B7cGwinS.js.map

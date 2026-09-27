@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
-import AgentRegistry, { Inbox, type Agent } from '@deepseek-ai/dsh-agent'
+import AgentRegistry, { type Agent, type Inbox } from '@deepseek-ai/dsh-agent'
 import LlmRuntime, {
   ToolCallId,
   LlmAdapter,
@@ -12,6 +12,18 @@ import LlmRuntime, {
   type LlmResolvedModelInfo,
   type StreamChunk,
 } from '@deepseek-ai/dsh-llm'
+import { createSystemMessage } from '@deepseek-ai/dsh-llm'
+
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    /** v4 compaction checkpoint, written by the compaction plugin. */
+    'compact-checkpoint': { kind: 'compact-checkpoint' }
+    /** v3 plugin source after the v4 migration renamed it. */
+    'plugin:memory': { kind: 'plugin:memory' }
+    /** A third-party plugin source, used to prove it never counts as a user turn. */
+    'plugin:elsewhere': { kind: 'plugin:elsewhere' }
+  }
+}
 import { Session, SessionId, SessionSeq, SessionStore, type SessionEvent } from '@deepseek-ai/dsh-session'
 import { agentEvents } from '@deepseek-ai/dsh-agent'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
@@ -70,7 +82,7 @@ afterEach(async () => {
 })
 
 /** Mount the four injected services plus the memory plugin. */
-async function mount(config: Partial<memory.Config> = {}): Promise<Context> {
+async function mount(config: memory.Options = {}): Promise<Context> {
   const c = new Context()
   ctx = c
   await c.plugin(SessionStore)
@@ -79,7 +91,7 @@ async function mount(config: Partial<memory.Config> = {}): Promise<Context> {
   await c.plugin(AgentRegistry)
   await c.plugin(LlmRuntime)
   // schemastery fills every omitted field with its default before apply runs.
-  memoryFiber = await c.plugin(memory, config as memory.Config)
+  memoryFiber = await c.plugin(memory, config)
   return c
 }
 
@@ -111,8 +123,9 @@ function appendUserMessage(session: Session, text: string): void {
 function sessionWithRoute(c: Context, id: string): Session {
   const session = c.sessions.create(SessionId(id))
   appendUserMessage(session, 'I work the night shift.')
+  session.append('system/message', { turn: 1, step: 1, message: createSystemMessage('You are helpful.') }, { surfaceOp: 'append' })
   session.append('request/header', {
-    header: { config: { provider: 'mock', model: 'mock-model' }, system: 'You are helpful.' },
+    header: { config: { provider: 'mock', model: 'mock-model' } },
     reason: 'initial',
   })
   return session
@@ -149,13 +162,22 @@ class ScriptedAdapter extends LlmAdapter {
 }
 
 /** One registered fake agent driving `session`. */
-function makeAgent(c: Context, session: Session, options: { provider?: string; model?: string } = {}): Agent {
+async function makeAgent(c: Context, session: Session, options: { provider?: string; model?: string } = {}): Promise<Agent> {
   const scope = c.plugin(() => {})
   const value: Agent = {
     id: session.id,
     options,
     session,
-    inbox: new Inbox(session, { inserted: () => {}, discarded: () => {}, claimed: () => {} }),
+    inbox: {
+      nextTurn: [],
+      nextStep: [],
+      clear() {},
+      append() {},
+      prepend() {},
+      replace: () => false,
+      remove: () => false,
+      splice: () => [],
+    } satisfies Inbox,
     status: 'idle',
     ctx: scope.ctx,
     send: () => {},
@@ -166,7 +188,7 @@ function makeAgent(c: Context, session: Session, options: { provider?: string; m
     runMaintenance: task => task(new AbortController().signal),
     whenIdle: () => Promise.resolve(),
   }
-  c.agents.register(value)
+  await c.agents.register(value)
   return value
 }
 
@@ -179,7 +201,7 @@ describe('memory plugin wiring', () => {
     expect((await c.systemPrompt.assemble()).sections.map(section => section.name)).not.toContain('memory:snapshot')
     const session = c.sessions.create(SessionId('user-role-snapshot'))
     await settle()
-    const agent = makeAgent(c, session)
+    const agent = await makeAgent(c, session)
     const decision = await agentEvents(c, agent).waterfall(
       'agent/pre-step', { messages: [], turn: 1, step: 1, signal: SIGNAL },
       () => Promise.resolve({ kind: 'enter', messages: [] }),
@@ -188,11 +210,11 @@ describe('memory plugin wiring', () => {
     if (decision.kind !== 'enter') return
     expect(decision.messages).toContainEqual(expect.objectContaining({
       content: [{ type: 'text', text: expect.stringContaining('Seeded memory fact') }],
-      source: { kind: 'plugin', plugin: 'memory' },
+      source: { kind: 'memory' },
     }))
     expect(decision.messages).toContainEqual(expect.objectContaining({
       content: [{ type: 'text', text: expect.stringContaining('Seeded user fact') }],
-      source: { kind: 'plugin', plugin: 'memory' },
+      source: { kind: 'memory' },
     }))
   })
 
@@ -200,7 +222,7 @@ describe('memory plugin wiring', () => {
     await seedFile('memory', 'Compaction-safe memory fact')
     const c = await mount()
     const session = c.sessions.create(SessionId('compacted-memory'))
-    const agent = makeAgent(c, session)
+    const agent = await makeAgent(c, session)
     const signal = new AbortController().signal
     const initial = await agentEvents(c, agent).waterfall(
       'agent/pre-step', { messages: [], turn: 1, step: 1, signal },
@@ -210,8 +232,8 @@ describe('memory plugin wiring', () => {
     if (initial.kind !== 'enter') return
     const original = session.append('user/message', initial.messages[0]!, { surfaceOp: 'append' })
     session.append('user/message', createUserMessage({
-      content: [{ type: 'text', text: 'compressed context' }], source: { kind: 'plugin', plugin: 'compact' },
-    }), { surfaceOp: { op: 'replace', start: original.seq, end: original.seq }, sourceEventSeqs: [original.seq] })
+      content: [{ type: 'text', text: 'compressed context' }], source: { kind: 'compact-checkpoint' },
+    }), { surfaceOp: { op: 'replace', startSeq: original.seq, endSeq: original.seq }, sourceEventSeqs: [original.seq] })
     const afterCompaction = await agentEvents(c, agent).waterfall(
       'agent/pre-step', { messages: [], turn: 2, step: 1, signal },
       () => Promise.resolve({ kind: 'enter', messages: [] }),
@@ -219,7 +241,7 @@ describe('memory plugin wiring', () => {
     expect(afterCompaction).toMatchObject({ kind: 'enter' })
     if (afterCompaction.kind === 'enter') {
       expect(afterCompaction.messages).toContainEqual(expect.objectContaining({
-        source: { kind: 'plugin', plugin: 'memory' },
+        source: { kind: 'memory' },
       }))
     }
   })
@@ -238,14 +260,14 @@ describe('memory plugin wiring', () => {
     const session = c.sessions.create(SessionId('frozen-user-snapshot'))
     await settle()
     await callMemory(c, { action: 'add', target: 'memory', content: 'Written during the session' })
-    const agent = makeAgent(c, session)
+    const agent = await makeAgent(c, session)
     const decision = await agentEvents(c, agent).waterfall(
       'agent/pre-step', { messages: [], turn: 1, step: 1, signal: SIGNAL },
       () => Promise.resolve({ kind: 'enter', messages: [] }),
     )
     expect(decision).toMatchObject({ kind: 'enter' })
     if (decision.kind !== 'enter') return
-    const snapshot = decision.messages.find(message => message.source.kind === 'plugin' && message.source.plugin === 'memory')
+    const snapshot = decision.messages.find(message => message.source.kind === 'memory')
     expect(snapshot).toBeDefined()
     expect(snapshot?.content).toContainEqual({ type: 'text', text: expect.stringContaining('Before the session') })
     expect(snapshot?.content).not.toContainEqual({ type: 'text', text: expect.stringContaining('Written during the session') })
@@ -266,7 +288,13 @@ describe('memory plugin wiring', () => {
     expect('then' in parsed).toBe(false)
     if ('then' in parsed) throw new Error('unexpected async config validation')
     if ('issues' in parsed) throw new Error('unexpected config issues for an empty object')
-    expect(parsed.value).toEqual({
+    // `nudgeInterval` and `reviewEnabled` are volatile references; compare their values.
+    const value = parsed.value as memory.Config
+    expect({
+      ...value,
+      nudgeInterval: value.nudgeInterval.get(),
+      reviewEnabled: value.reviewEnabled.get(),
+    }).toEqual({
       memoryCharLimit: 2200,
       userCharLimit: 1375,
       nudgeInterval: 10,
@@ -308,7 +336,7 @@ describe('nudge gating', () => {
     const session = c.sessions.create(SessionId('already-live'))
     session.append('turn/start', { turn: 1 })
     appendUserMessage(session, 'in-flight first turn')
-    memoryFiber = await c.plugin(memory, { nudgeInterval: 5 } as memory.Config)
+    memoryFiber = await c.plugin(memory, { nudgeInterval: 5 })
     await vi.waitFor(async () => {
       await expect(memoryReviewProgress.get(String(session.id))).resolves.toEqual({
         reviewEnabled: true,
@@ -330,8 +358,9 @@ describe('nudge gating', () => {
     c.llm.registerAdapter(['mock'], adapter)
     // No pre-existing user message: the first counted turn must come from below.
     const session = c.sessions.create(SessionId('nudge-gate'))
+    session.append('system/message', { turn: 1, step: 1, message: createSystemMessage('You are helpful.') }, { surfaceOp: 'append' })
     session.append('request/header', {
-      header: { config: { provider: 'mock', model: 'mock-model' }, system: 'You are helpful.' },
+      header: { config: { provider: 'mock', model: 'mock-model' } },
       reason: 'initial',
     })
 
@@ -346,7 +375,7 @@ describe('nudge gating', () => {
     session.append('turn/start', { turn: 2 })
     session.append('user/message', createUserMessage({
       content: [{ type: 'text', text: 'system note' }],
-      source: { kind: 'plugin', plugin: 'elsewhere' },
+      source: { kind: 'plugin:elsewhere' },
     }), { surfaceOp: 'append' })
     session.append('turn/end', { turn: 2, reason: { kind: 'completed' } })
     await settle()
@@ -408,15 +437,14 @@ describe('nudge gating', () => {
   })
 
   it('counts only completed real-user turns after restoring injected messages and a settings override', async () => {
-    const c = await mount({ nudgeInterval: 10 })
-    let settings = { nudgeInterval: 5, reviewEnabled: true }
-    c.provide('settings', { get: (namespace: string) => namespace === 'memory' ? settings : undefined })
+    // The volatile `nudgeInterval` is the live settings value the harness edits.
+    const c = await mount({ nudgeInterval: 5 })
     const adapter = new ScriptedAdapter([textResponse('Nothing to save.')])
     c.llm.registerAdapter(['mock'], adapter)
     const seed: SessionEvent[] = [
       { type: 'user/message', seq: SessionSeq(0), time: 1, data: createUserMessage({ content: [{ type: 'text', text: 'old real user' }], source: { kind: 'user' } }), surfaceOp: 'append' },
       { type: 'turn/end', seq: SessionSeq(1), time: 2, data: { turn: 1, reason: { kind: 'completed' } } },
-      { type: 'user/message', seq: SessionSeq(2), time: 3, data: createUserMessage({ content: [{ type: 'text', text: 'injected' }], source: { kind: 'plugin', plugin: 'memory' } }), surfaceOp: 'append' },
+      { type: 'user/message', seq: SessionSeq(2), time: 3, data: createUserMessage({ content: [{ type: 'text', text: 'injected' }], source: { kind: 'plugin:memory' } }), surfaceOp: 'append' },
       { type: 'user/message', seq: SessionSeq(3), time: 4, data: createUserMessage({ content: [{ type: 'text', text: 'tool context' }], source: { kind: 'tool', callId: ToolCallId('context-call') } }), surfaceOp: 'append' },
     ]
     const session = c.sessions.create(SessionId('restored-settings'), { seed })
@@ -432,7 +460,6 @@ describe('nudge gating', () => {
     appendUserMessage(session, 'fifth completed real-user turn')
     session.append('turn/end', { turn: 5, reason: { kind: 'completed' } })
     await vi.waitFor(() => { expect(adapter.requests).toHaveLength(1) })
-    settings = { nudgeInterval: 5, reviewEnabled: true }
   })
 
   it('does not count interrupted user turns toward the review interval', async () => {
@@ -544,7 +571,7 @@ describe('background review spawning', () => {
     const adapter = new ScriptedAdapter([textResponse('Nothing to save.')])
     c.llm.registerAdapter(['mock'], adapter)
     const session = c.sessions.create(SessionId('agent-route'))
-    makeAgent(c, session, { provider: 'mock', model: 'agent-model' })
+    await makeAgent(c, session, { provider: 'mock', model: 'agent-model' })
     appendUserMessage(session, 'routed through the agent')
     session.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
     await vi.waitFor(() => { expect(adapter.requests).toHaveLength(1) })

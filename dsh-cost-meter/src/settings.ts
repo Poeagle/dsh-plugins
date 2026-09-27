@@ -1,19 +1,33 @@
-/** Host settings registration and pricing HTTP route for dsh-cost-meter. */
+/** Host settings bridge and pricing HTTP route for dsh-cost-meter. */
 
 import type { Context } from '@deepseek-ai/cordis'
-import { Config } from './index.js'
-import { assignmentWithManualMultiplier, normalizePricing, validatePricing, type PricingConfig } from './pricing.js'
-import { installUpstreamBillingProbes } from './upstream-billing-probe.js'
 
-interface SettingsScopeFace<T> {
-  get(): T
-  watch(callback: (next: T, prev: T) => void | Promise<void>): () => void
-  update(patch: object): Promise<void>
+declare module '@deepseek-ai/cordis' {
+  interface Events {
+    /** Volatile config values were committed into the running fiber without a remount. */
+    'loader/volatile-update'(paths: readonly (readonly string[])[]): void
+  }
 }
+import {
+  DEFAULT_PRICING,
+  assignmentWithManualMultiplier,
+  normalizePricing,
+  validatePricing,
+  type PricingConfig,
+} from './pricing.js'
+import { installUpstreamBillingProbes, type SettingsScopeFace } from './upstream-billing-probe.js'
 
-interface SettingsFace {
-  register<T>(namespace: string, schema: typeof Config, options: { base: T; validate(value: T): void }): SettingsScopeFace<T>
-  replace(namespace: string, section: object): Promise<void>
+/**
+ * The harness settings service face used by this row. The pre-`0.1.7`
+ * per-plugin `settings.register()`/`settings.get(ns)` API was removed; the
+ * live namespace is now the profile entry's own volatile Config and every
+ * read goes through `describe()`.
+ */
+interface SettingsFormsFace {
+  describe(): { ns: string; value: unknown }[]
+  update(ns: string, patch: object): Promise<void>
+  replace(ns: string, section: object): Promise<void>
+  mutate(ns: string, ops: readonly ({ op: 'set'; path: readonly string[]; value: unknown } | { op: 'unset'; path: readonly string[] })[]): Promise<void>
 }
 
 interface WebServerFace {
@@ -27,6 +41,12 @@ interface WebServerFace {
 
 const SETTINGS_NS = 'cost-meter'
 const ROUTE_PATH = '/cost-meter/pricing'
+
+/** Read the resolved value of one profile entry's settings namespace. */
+function settingsValue(ctx: Context, ns: string): unknown {
+  const settings = ctx.get('settings') as SettingsFormsFace | undefined
+  return settings?.describe?.().find(row => row.ns === ns)?.value
+}
 
 function mergeHistory(current: PricingConfig, incoming: PricingConfig): PricingConfig {
   const models = { ...incoming.models }
@@ -70,14 +90,13 @@ function isLoopbackHost(hostname: string): boolean {
 export const name = 'cost-meter-settings'
 export const inject = ['settings']
 
-/** Register the live pricing namespace and the browser settings-card route. */
-export function apply(ctx: Context, config: PricingConfig): void {
-  const settings = ctx.get('settings') as SettingsFace | undefined
-  if (settings === undefined) return
-  const scope = settings.register(SETTINGS_NS, Config, {
-    base: config,
-    validate: (value) => validatePricing(normalizePricing(value)),
-  })
+/** Bridge the live pricing namespace to the browser settings-card route. */
+export function apply(ctx: Context): void {
+  const scope: SettingsScopeFace<PricingConfig> = {
+    get: () => normalizePricing(settingsValue(ctx, SETTINGS_NS) ?? DEFAULT_PRICING),
+    update: patch => (ctx.get('settings') as SettingsFormsFace).update(SETTINGS_NS, patch),
+    watch: callback => ctx.on('loader/volatile-update', () => { void callback() }),
+  }
   ctx.effect(() => installUpstreamBillingProbes(ctx, scope), 'cost-meter upstream billing probes')
   ctx.inject(['webServer'], (webCtx) => {
     const webServer = (webCtx as Context & { webServer: WebServerFace }).webServer
@@ -92,6 +111,11 @@ export function apply(ctx: Context, config: PricingConfig): void {
         }
         if (!isTrustedRequest(req)) {
           send(403, { ok: false, error: 'request refused: this route answers same-origin loopback only' })
+          return
+        }
+        const settings = ctx.get('settings') as SettingsFormsFace | undefined
+        if (settings === undefined) {
+          send(503, { ok: false, error: 'settings service unavailable' })
           return
         }
         if (req.method === 'GET') {

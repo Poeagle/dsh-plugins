@@ -17,14 +17,17 @@ const MAX_RESPONSE_BYTES = 64 * 1024
 const MAX_SYNC_MULTIPLIER = 100
 const BASELINE_EFFECTIVE_AT = 0
 
-interface SettingsScopeFace<T> {
+/** Live settings reference handed to the billing probes by the settings row. */
+export interface SettingsScopeFace<T> {
   get(): T
-  watch(callback: (next: T, prev: T) => void | Promise<void>): () => void
+  /** Subscribe to live value changes. */
+  watch(callback: () => void | Promise<void>): () => void
   update(patch: object): Promise<void>
 }
 
+/** Settings face used for cross-namespace cleanup writes. */
 interface SettingsMutateFace {
-  get(namespace: string): unknown
+  describe(): { ns: string; value: unknown }[]
   mutate(namespace: string, ops: readonly { op: 'unset'; path: readonly string[] }[]): Promise<void>
 }
 
@@ -173,7 +176,7 @@ export function installUpstreamBillingProbes(ctx: Context, scope: SettingsScopeF
       if (billing?.enabled !== true) return
       const credentials = ctx.get('credentials') as CredentialsFace | undefined
       const settings = ctx.get('settings') as SettingsMutateFace | undefined
-      const providers = (settings?.get('llm-pi-ai') as { providers?: Record<string, ProviderSource> } | undefined)?.providers ?? {}
+      const providers = (settings?.describe?.().find(row => row.ns === 'llm-pi-ai')?.value as { providers?: Record<string, ProviderSource> } | undefined)?.providers ?? {}
       const now = Date.now()
       const allowed = billing.providers === undefined ? undefined : new Set(billing.providers)
       const targets = listProviderBalanceTargets(providers).filter(target => allowed === undefined || allowed.has(target.provider))

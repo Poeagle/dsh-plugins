@@ -11,6 +11,7 @@ import LlmRuntime, {
   type LlmResolvedModelInfo,
   type StreamChunk,
 } from '@deepseek-ai/dsh-llm'
+import { createSystemMessage } from '@deepseek-ai/dsh-llm'
 import { Session, SessionId } from '@deepseek-ai/dsh-session'
 import { MemoryStore } from '../src/store.ts'
 import { MEMORY_REVIEW_PROMPT, runMemoryReview } from '../src/review.ts'
@@ -101,8 +102,9 @@ function session(): Session {
     content: [{ type: 'text', text: 'I work the night shift.' }],
     source: { kind: 'user' },
   }), { surfaceOp: 'append' })
+  s.append('system/message', { turn: 1, step: 1, message: createSystemMessage('You are helpful.') }, { surfaceOp: 'append' })
   s.append('request/header', {
-    header: { config: { provider: 'mock', model: 'mock-model' }, system: 'You are helpful.' },
+    header: { config: { provider: 'mock', model: 'mock-model' } },
     reason: 'initial',
   })
   return s
@@ -284,7 +286,7 @@ describe('runMemoryReview', () => {
     expect(outcome).toMatchObject({ iterations: 1, saved: 0, reason: 'failed' })
   })
 
-  it('omits the system field when the session never sent a request header', async () => {
+  it('omits the system field when the session has no system message', async () => {
     const store = await freshStore()
     const adapter = new ScriptedAdapter([textResponse('Nothing to save.')])
     const c = await setup(adapter)
@@ -357,11 +359,11 @@ describe('runMemoryReview', () => {
     expect(outcome.reason).toBe('finished')
     // Both bad calls became error tool-result messages in the replay.
     const second = adapter.requests[1]!
-    expect(second.messages.some(m => m.content.some(b =>
-      b.type === 'tool-result' && b.content.some(inner => inner.type === 'text' && inner.text === 'Invalid tool arguments: not valid JSON.')))).toBe(true)
+    expect(second.messages.some(m => m.role === 'tool' && m.isError === true && m.content.some(b =>
+      b.type === 'text' && b.text === 'Invalid tool arguments: not valid JSON.'))).toBe(true)
     const third = adapter.requests[2]!
-    expect(third.messages.some(m => m.content.some(b =>
-      b.type === 'tool-result' && b.content.some(inner => inner.type === 'text' && inner.text === 'Invalid tool arguments: expected an object.')))).toBe(true)
+    expect(third.messages.some(m => m.role === 'tool' && m.isError === true && m.content.some(b =>
+      b.type === 'text' && b.text === 'Invalid tool arguments: expected an object.'))).toBe(true)
     expect(store.entriesFor('memory')).toHaveLength(0)
   })
 })

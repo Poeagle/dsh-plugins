@@ -2756,19 +2756,19 @@ window.__ModuleLoader__.load({
 							codec: {
 								mode: "strict",
 								typeSymbol: "dsh-cost-meter#sessionCost#sessionId",
-								schema: {
+								create: () => ({
 									_zod: true,
 									parse: (value) => value
-								}
+								})
 							}
 						}],
 						result: {
 							mode: "strict",
 							typeSymbol: "dsh-cost-meter#sessionCost#result",
-							schema: {
+							create: () => ({
 								_zod: true,
 								parse: (value) => value
-							}
+							})
 						}
 					},
 					{
@@ -2781,10 +2781,10 @@ window.__ModuleLoader__.load({
 						result: {
 							mode: "strict",
 							typeSymbol: "dsh-cost-meter#sessionCosts#result",
-							schema: {
+							create: () => ({
 								_zod: true,
 								parse: (value) => value
-							}
+							})
 						}
 					},
 					{
@@ -2797,10 +2797,10 @@ window.__ModuleLoader__.load({
 						result: {
 							mode: "strict",
 							typeSymbol: "dsh-cost-meter#providerBalances#result",
-							schema: {
+							create: () => ({
 								_zod: true,
 								parse: (value) => value
-							}
+							})
 						}
 					}
 				]

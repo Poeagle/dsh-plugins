@@ -16,14 +16,14 @@ const zString = z.string()
 const jsonResult = (method: string) => ({
   mode: 'strict' as const,
   typeSymbol: `${PKG}#${method}#result`,
-  schema: zUnknown,
+  create: () => zUnknown,
 })
 
 const strParam = (method: string, name: string) => ({
   name,
   wire: name,
   source: 'json' as const,
-  codec: { mode: 'strict' as const, typeSymbol: `${PKG}#${method}#${name}`, schema: zString },
+  codec: { mode: 'strict' as const, typeSymbol: `${PKG}#${method}#${name}`, create: () => zString },
 })
 
 const inv = (method: string, parameters: ReturnType<typeof strParam>[]) => ({

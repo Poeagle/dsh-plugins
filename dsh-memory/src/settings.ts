@@ -3,7 +3,7 @@
 import { readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
-import { Config, DEFAULT_NUDGE_INTERVAL } from './index.ts'
+import { DEFAULT_NUDGE_INTERVAL } from './index.ts'
 import { memoryReviewNotices } from './review-notices.ts'
 import { memoryReviewProgress, remainingTurnsUntilReview } from './review-progress.ts'
 import { MemoryStore } from './store.ts'
@@ -20,8 +20,15 @@ interface WebServerFace {
   }): unknown
 }
 
-interface SettingsFace {
-  register<T>(namespace: string, schema: any, options: { base: T; validate(value: T): void }): unknown
+/**
+ * The harness settings service face used by this row. The pre-`0.1.7`
+ * per-plugin `settings.register()`/`settings.get(ns)` API was removed; the
+ * live namespace is now the profile entry's own volatile Config and every read
+ * goes through `describe()`.
+ */
+interface SettingsFormsFace {
+  describe(): { ns: string; value: unknown }[]
+  update(ns: string, patch: object): Promise<void>
 }
 
 /** Same-origin loopback fence for the memory route. */
@@ -62,15 +69,6 @@ export const inject = ['settings']
 
 /** Register the settings namespace and memory HTTP route for browser settings management. */
 export function apply(ctx: Context): void {
-  // Register the settings namespace so the Configurable Plugins tab knows to
-  // dispatch our card key. The schema exposes the configurable fields.
-  const settings = ctx.get('settings') as SettingsFace | undefined
-  if (settings !== undefined) {
-    settings.register(SETTINGS_NS, Config, {
-      base: {},
-      validate: () => {},
-    })
-  }
   ctx.inject(['webServer'], (webCtx) => {
     const webServer = (webCtx as Context & { webServer: WebServerFace }).webServer
     const store = new MemoryStore({
@@ -156,8 +154,8 @@ export function apply(ctx: Context): void {
             send(res, 200, { ok: true, value: stored })
             return
           }
-          const settingsFace = ctx.get('settings') as { get?(ns: string): unknown } | undefined
-          const raw = settingsFace?.get?.('memory') as { nudgeInterval?: number; reviewEnabled?: boolean } | undefined
+          const settingsFace = ctx.get('settings') as SettingsFormsFace | undefined
+          const raw = settingsFace?.describe?.().find(row => row.ns === SETTINGS_NS)?.value as { nudgeInterval?: number; reviewEnabled?: boolean } | undefined
           const nudgeInterval = typeof raw?.nudgeInterval === 'number' ? raw.nudgeInterval : DEFAULT_NUDGE_INTERVAL
           const reviewEnabled = typeof raw?.reviewEnabled === 'boolean' ? raw.reviewEnabled : true
           send(res, 200, {
@@ -172,16 +170,11 @@ export function apply(ctx: Context): void {
 
         // GET /memory/api/config — return current memory settings
         if (method === 'GET' && url.pathname === '/memory/api/config') {
-          const settings = ctx.get('settings') as any
-          let nudgeInterval = 10
-          let reviewEnabled = true
-          if (settings?.get) {
-            const cfg = settings.get('memory') as any
-            if (cfg) {
-              nudgeInterval = cfg.nudgeInterval ?? 10
-              reviewEnabled = cfg.reviewEnabled ?? true
-            }
-          }
+          const settings = ctx.get('settings') as SettingsFormsFace | undefined
+          const cfg = settings?.describe?.().find(row => row.ns === SETTINGS_NS)?.value as
+            { nudgeInterval?: number; reviewEnabled?: boolean } | undefined
+          const nudgeInterval = typeof cfg?.nudgeInterval === 'number' ? cfg.nudgeInterval : DEFAULT_NUDGE_INTERVAL
+          const reviewEnabled = typeof cfg?.reviewEnabled === 'boolean' ? cfg.reviewEnabled : true
           send(res, 200, { ok: true, value: { nudgeInterval, reviewEnabled } })
           return
         }
@@ -192,12 +185,12 @@ export function apply(ctx: Context): void {
           for await (const chunk of req) body += chunk
           let parsed: { nudgeInterval?: number; reviewEnabled?: boolean }
           try { parsed = JSON.parse(body) } catch { parsed = {} }
-          const settings = ctx.get('settings') as any
-          if (settings?.update) {
+          const settings = ctx.get('settings') as SettingsFormsFace | undefined
+          if (settings?.update !== undefined) {
             const patch: Record<string, unknown> = {}
             if (parsed.nudgeInterval !== undefined) patch.nudgeInterval = parsed.nudgeInterval
             if (parsed.reviewEnabled !== undefined) patch.reviewEnabled = parsed.reviewEnabled
-            await settings.update('memory', patch)
+            await settings.update(SETTINGS_NS, patch)
             send(res, 200, { ok: true })
           } else {
             send(res, 200, { ok: true, note: 'Settings service not available; values will be used for this session only.' })

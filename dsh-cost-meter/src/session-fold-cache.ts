@@ -26,7 +26,9 @@ export function pricingFingerprint(config: PricingConfig): string {
 }
 
 function usageMix(event: CostEvent): number {
-  const usage = event.data.usage ?? (event.data.chunk?.type === 'usage' ? event.data.chunk.usage : undefined)
+  const usage = event.data.usage
+    ?? (event.data.chunk?.type === 'usage' ? event.data.chunk.usage : undefined)
+    ?? event.data.stream?.find(record => record.chunk?.type === 'usage')?.chunk?.usage
   if (usage === undefined) return 0
   let mix = 0
   for (const value of Object.values(usage)) {

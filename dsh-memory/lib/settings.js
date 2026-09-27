@@ -1,4 +1,4 @@
-import { d as memoryReviewNotices, f as MemoryStore, l as memoryReviewProgress, t as Config, u as remainingTurnsUntilReview } from "./src-D3nwv_5e.js";
+import { d as memoryReviewNotices, f as MemoryStore, l as memoryReviewProgress, u as remainingTurnsUntilReview } from "./src-B7cGwinS.js";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 //#region src/settings.ts
@@ -38,11 +38,6 @@ const name = "memory-settings";
 const inject = ["settings"];
 /** Register the settings namespace and memory HTTP route for browser settings management. */
 function apply(ctx) {
-	const settings = ctx.get("settings");
-	if (settings !== void 0) settings.register(SETTINGS_NS, Config, {
-		base: {},
-		validate: () => {}
-	});
 	ctx.inject(["webServer"], (webCtx) => {
 		const webServer = webCtx.webServer;
 		const store = new MemoryStore({
@@ -144,7 +139,7 @@ function apply(ctx) {
 						});
 						return;
 					}
-					const raw = ctx.get("settings")?.get?.("memory");
+					const raw = ctx.get("settings")?.describe?.().find((row) => row.ns === SETTINGS_NS)?.value;
 					const nudgeInterval = typeof raw?.nudgeInterval === "number" ? raw.nudgeInterval : 10;
 					const reviewEnabled = typeof raw?.reviewEnabled === "boolean" ? raw.reviewEnabled : true;
 					send(res, 200, {
@@ -157,16 +152,9 @@ function apply(ctx) {
 					return;
 				}
 				if (method === "GET" && url.pathname === "/memory/api/config") {
-					const settings = ctx.get("settings");
-					let nudgeInterval = 10;
-					let reviewEnabled = true;
-					if (settings?.get) {
-						const cfg = settings.get("memory");
-						if (cfg) {
-							nudgeInterval = cfg.nudgeInterval ?? 10;
-							reviewEnabled = cfg.reviewEnabled ?? true;
-						}
-					}
+					const cfg = ctx.get("settings")?.describe?.().find((row) => row.ns === SETTINGS_NS)?.value;
+					const nudgeInterval = typeof cfg?.nudgeInterval === "number" ? cfg.nudgeInterval : 10;
+					const reviewEnabled = typeof cfg?.reviewEnabled === "boolean" ? cfg.reviewEnabled : true;
 					send(res, 200, {
 						ok: true,
 						value: {
@@ -186,11 +174,11 @@ function apply(ctx) {
 						parsed = {};
 					}
 					const settings = ctx.get("settings");
-					if (settings?.update) {
+					if (settings?.update !== void 0) {
 						const patch = {};
 						if (parsed.nudgeInterval !== void 0) patch.nudgeInterval = parsed.nudgeInterval;
 						if (parsed.reviewEnabled !== void 0) patch.reviewEnabled = parsed.reviewEnabled;
-						await settings.update("memory", patch);
+						await settings.update(SETTINGS_NS, patch);
 						send(res, 200, { ok: true });
 					} else send(res, 200, {
 						ok: true,

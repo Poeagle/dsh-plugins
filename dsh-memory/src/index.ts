@@ -14,12 +14,21 @@
  * @module dsh-memory
  */
 
-import type { Context } from '@deepseek-ai/cordis'
+import type { Context, Volatile } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import type { ContentBlock } from '@deepseek-ai/dsh-llm'
+import type { ContentBlock, ContextFormed } from '@deepseek-ai/dsh-llm'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { PreStepDecision } from '@deepseek-ai/dsh-agent'
+
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    /** Frozen memory snapshot injected once per session. */
+    memory: { kind: 'memory' } & ContextFormed
+    /** Off-session review directive; never written to the session log. */
+    'dsh-memory': { kind: 'dsh-memory' } & ContextFormed
+  }
+}
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { JsonValue } from '@deepseek-ai/dsh-util-values'
@@ -52,21 +61,32 @@ export interface Config {
   /** Character budget of the `user` store. */
   userCharLimit: number
   /** Completed user turns between background memory reviews; 0 disables reviews. */
-  nudgeInterval: number
+  nudgeInterval: Volatile<number>
   /** Max model steps per background review fork. */
   reviewMaxIterations: number
   /** Run background memory reviews after gated completed turns. */
-  reviewEnabled: boolean
+  reviewEnabled: Volatile<boolean>
 }
 
-/** Schemastery configuration for the memory plugin. */
-export const Config: z<Config> = z.object({
+/**
+ * Schemastery configuration for the memory plugin.
+ *
+ * `nudgeInterval` and `reviewEnabled` are declared `volatile()` so the harness
+ * settings service projects them as this entry's live settings page (the
+ * namespace is the profile entry id, `memory`) and writes reach the running
+ * references without remounting the plugin. The character budgets and review
+ * step cap stay ordinary mount-time configuration.
+ */
+export const Config = z.object({
   memoryCharLimit: z.number().step(1).min(1).default(DEFAULT_MEMORY_CHAR_LIMIT),
   userCharLimit: z.number().step(1).min(1).default(DEFAULT_USER_CHAR_LIMIT),
-  nudgeInterval: z.number().step(1).min(0).default(DEFAULT_NUDGE_INTERVAL),
+  nudgeInterval: z.number().step(1).min(0).default(DEFAULT_NUDGE_INTERVAL).volatile(),
   reviewMaxIterations: z.number().step(1).min(1).default(DEFAULT_REVIEW_MAX_ITERATIONS),
-  reviewEnabled: z.boolean().default(true),
+  reviewEnabled: z.boolean().default(true).volatile(),
 })
+
+/** Plain options accepted by the memory plugin, with volatile values unwrapped. */
+export type Options = { [K in keyof Config]?: Config[K] extends Volatile<infer T> ? T : Config[K] }
 
 /** One live session's nudge bookkeeping. */
 interface SessionNudgeState {
@@ -155,17 +175,12 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
    * unavailable or the namespace is not registered.
    */
   function effectiveSettings(): { nudgeInterval: number; reviewEnabled: boolean } {
-    const settings = ctx.get('settings') as { get?(ns: string): unknown } | undefined
-    if (settings?.get) {
-      const raw = settings.get('memory') as Record<string, unknown> | undefined
-      if (raw !== undefined) {
-        return {
-          nudgeInterval: typeof raw.nudgeInterval === 'number' ? raw.nudgeInterval : config.nudgeInterval,
-          reviewEnabled: typeof raw.reviewEnabled === 'boolean' ? raw.reviewEnabled : config.reviewEnabled,
-        }
-      }
+    const nudgeInterval = config.nudgeInterval.get()
+    const reviewEnabled = config.reviewEnabled.get()
+    return {
+      nudgeInterval: typeof nudgeInterval === 'number' ? nudgeInterval : DEFAULT_NUDGE_INTERVAL,
+      reviewEnabled: typeof reviewEnabled === 'boolean' ? reviewEnabled : true,
     }
-    return { nudgeInterval: config.nudgeInterval, reviewEnabled: config.reviewEnabled }
   }
 
   ctx.tools.register(defineTool({
@@ -185,8 +200,9 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
 
   // ── Context injection ─────────────────────────────────────────────────
   // Inject the memory snapshot as a user-role message via the agent inbox
-  // on the first pre-step of each session. The UI renders inbox messages
-  // with source.kind === 'plugin' as expandable "上下文注入" cards.
+  // on the first pre-step of each session. The UI renders the `memory`
+  // source as an expandable context card. A session migrated from v3 carries
+  // the same injection as `plugin:memory`; both count as already injected.
   // The snapshot is refreshed at session creation so new sessions always
   // see the latest data; mid-session writes do NOT refresh the snapshot.
   ctx.on('session/created', (session: Session) => {
@@ -234,8 +250,9 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       const alreadyOnSurface = agent.session.surface.nodes.some(seq => {
         const event = agent.session.eventAt(seq)
         if (event?.type !== 'user/message') return false
-        const message = event.data as { source?: { kind?: string; plugin?: string } }
-        return message.source?.kind === 'plugin' && message.source?.plugin === name
+        const message = event.data as { source?: { kind?: string } }
+        const kind = message.source?.kind
+        return kind === name || kind === `plugin:${name}`
       })
       if (alreadyOnSurface) {
         injected.add(sid)
@@ -245,7 +262,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       injected.add(sid)
       const contextMessage = createUserMessage({
         content: [{ type: 'text', text }],
-        source: { kind: 'plugin', plugin: name },
+        source: { kind: 'memory' },
       })
       // Prepend the memory context at the same position as other context
       // injections (after the user's claimed batch).

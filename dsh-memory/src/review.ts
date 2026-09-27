@@ -23,6 +23,22 @@ import { MEMORY_TOOL_DESCRIPTION, MEMORY_TOOL_PARAMETERS, dispatchMemoryTool, to
 import type { MemoryStore } from './store.ts'
 import type { MemoryReviewChange } from './types.ts'
 
+/**
+ * Text of the latest system-role message in a derived history.
+ * v4 keeps the rendered prompt on `system/message`, not the request header,
+ * and a later system message replaces the one the model actually sees.
+ * @param messages - the session's derived history, in surface order.
+ * @returns the prompt text, or undefined when the history has none.
+ */
+function renderedSystemPrompt(messages: readonly Message[]): string | undefined {
+  let text: string | undefined
+  for (const message of messages) {
+    if (message.role !== 'system') continue
+    text = message.content.map(block => block.type === 'text' ? block.text : '').join('')
+  }
+  return text
+}
+
 /** The review directive appended after the replayed conversation. */
 export const MEMORY_REVIEW_PROMPT =
   'Review the conversation above and consider saving a durable fact if appropriate.\n\n'
@@ -100,14 +116,14 @@ export async function runMemoryReview(
   const { session, store, route, maxIterations, signal } = options
   // Reuse the parent's rendered system prompt when present: the fork targets
   // the same model, so the byte-exact prefix keeps the request cache warm.
-  const system = session.requestHeader()?.system
   const messages: Message[] = [
     ...session.deriveMessages(),
     createUserMessage({
-      source: { kind: 'plugin', plugin: 'dsh-memory' },
+      source: { kind: 'dsh-memory' },
       content: [{ type: 'text', text: MEMORY_REVIEW_PROMPT }],
     }),
   ]
+  const system = renderedSystemPrompt(messages)
   const tools = [memoryToolSchema()]
 
   let saved = 0
